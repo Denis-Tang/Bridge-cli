@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://brainctl.dev/schemas/merge-result.schema.json",
+  "title": "MergeResult",
+  "description": "分支合并结果",
+  "type": "object",
+  "required": ["taskId", "status", "sourceBranch", "targetBranch", "conflicts", "mergedAt"],
+  "properties": {
+    "taskId": { "type": "string" },
+    "status": { "type": "string", "enum": ["merged", "conflict", "failed", "skipped"] },
+    "sourceBranch": { "type": "string" },
+    "targetBranch": { "type": "string" },
+    "commitHash": { "type": "string" },
+    "mergeCommitHash": { "type": "string" },
+    "conflicts": { "type": "array", "items": { "type": "string" } },
+    "mergedAt": { "type": "string", "format": "date-time" }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://brainctl.dev/schemas/run-summary.schema.json",
+  "title": "RunSummary",
+  "description": "一次运行的总结报告",
+  "type": "object",
+  "required": ["jobId", "status", "summary", "tasksTotal", "tasksCompleted", "tasksFailed", "decisionsResolved", "mergedCommits", "qualityGateSummary", "knownLimitations", "finishedAt"],
+  "properties": {
+    "jobId": { "type": "string" },
+    "status": { "type": "string", "enum": ["planning", "running", "completed", "failed", "canceled"] },
+    "summary": { "type": "string" },
+    "tasksTotal": { "type": "integer", "minimum": 0 },
+    "tasksCompleted": { "type": "integer", "minimum": 0 },
+    "tasksFailed": { "type": "integer", "minimum": 0 },
+    "decisionsResolved": { "type": "integer", "minimum": 0 },
+    "mergedCommits": { "type": "array", "items": { "type": "string" } },
+    "qualityGateSummary": { "type": "string" },
+    "knownLimitations": { "type": "array", "items": { "type": "string" } },
+    "finishedAt": { "type": "string", "format": "date-time" }
+  }
+}

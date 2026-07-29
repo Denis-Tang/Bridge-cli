@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+
+# Build and test output
+dist/
+build/
+out/
+coverage/
+*.tsbuildinfo
+
+# Tool and package-manager caches
+.cache/
+.npm/
+.pnpm-store/
+.turbo/
+.vite/
+.vitest/
+.eslintcache
+
+# Bridge runtime state
+.brainctl/*.sqlite
+.brainctl/state/
+.brainctl/pi-sessions/
+.brainctl-dev/
+
+# Environment variables and local secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*.bak
+*.privacy-debug.log
+privacy-debug-*
+
+# IDE and editor files
+.idea/
+.vscode/
+*.code-workspace
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Windows reserved device name
+nul
+
+# Local generated configuration retained from the source baseline
+postcss.config.mjs

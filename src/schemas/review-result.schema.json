@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://brainctl.dev/schemas/review-result.schema.json",
+  "title": "ReviewResult",
+  "description": "Codex Brain 的审查结果",
+  "type": "object",
+  "required": ["taskId", "status", "reviewSummary", "findings", "requiredRework", "qualityGateStatus", "mergeAllowed"],
+  "properties": {
+    "taskId": { "type": "string" },
+    "status": { "type": "string", "enum": ["approved", "rework_required", "rejected", "needs_user_decision"] },
+    "reviewSummary": { "type": "string" },
+    "findings": { "type": "array", "items": { "type": "string" } },
+    "requiredRework": { "type": "array", "items": { "type": "string" } },
+    "qualityGateStatus": { "type": "string" },
+    "mergeAllowed": { "type": "boolean" }
+  }
+}

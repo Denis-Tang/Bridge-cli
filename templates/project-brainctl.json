@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "projectId": "",
+  "projectRoot": ".",
+  "defaultBaseBranch": "main",
+  "qualityGates": {},
+  "forbiddenPaths": [".env", ".env.*", "**/*secret*", "**/*key*"]
+}

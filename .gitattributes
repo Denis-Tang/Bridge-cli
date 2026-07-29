@@ -1,0 +1,11 @@
+# Keep repository text files consistent across Windows and Unix tooling.
+* text=auto eol=lf
+
+# Preserve binary files byte-for-byte.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary

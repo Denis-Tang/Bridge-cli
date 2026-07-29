@@ -1,0 +1,122 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://brainctl.dev/schemas/project-brainctl.schema.json",
+  "title": "ProjectBrainctlConfig",
+  "description": "brainctl 项目接入配置文件 schema",
+  "type": "object",
+  "required": ["schemaVersion", "projectId", "projectRoot", "defaultBaseBranch"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1,
+      "description": "配置文件 schema 版本，当前只能为 1"
+    },
+    "projectId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "项目唯一标识"
+    },
+    "projectRoot": {
+      "type": "string",
+      "minLength": 1,
+      "description": "项目根目录路径。支持 '.'（便携式，相对于配置文件目录解析）或绝对路径（向后兼容）。"
+    },
+    "defaultBaseBranch": {
+      "type": "string",
+      "description": "默认目标/基线分支；空字符串表示不预设，由运行时探测"
+    },
+    "qualityGates": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "task": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/qualityGateItem" }
+        },
+        "stage": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/qualityGateItem" }
+        }
+      }
+    },
+    "forbiddenPaths": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "sharedLocks": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "allowedPaths": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string", "enum": ["fake", "real-pi"] },
+        "command": { "type": "string" },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "model": { "type": "string" },
+        "timeoutMs": { "type": "integer", "minimum": 1 },
+        "maxConcurrency": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "reviewer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string", "enum": ["local-rule", "codex-cli"] },
+        "command": { "type": "string" },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "model": { "type": "string" },
+        "timeoutMs": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "resourceSampling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "intervalMs": { "type": "integer", "minimum": 100 },
+        "maxParallelTasks": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "artifactRetention": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "outputDir": { "type": "string" },
+        "logsDir": { "type": "string" },
+        "retentionDays": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "outputDir": { "type": "string" },
+        "logsDir": { "type": "string" },
+        "retentionDays": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "definitions": {
+    "qualityGateItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "command", "args"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "command": { "type": "string", "minLength": 1 },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "cwd": { "type": "string" },
+        "timeoutMs": { "type": "integer", "minimum": 1 },
+        "stopOnFail": { "type": "boolean" }
+      }
+    }
+  }
+}

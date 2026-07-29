@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://brainctl.dev/schemas/worker-result.schema.json",
+  "title": "WorkerResult",
+  "description": "Pi Worker 的执行结果",
+  "type": "object",
+  "required": ["taskId", "status", "summary", "filesChanged", "checks", "scopeViolations", "risks", "unresolvedQuestions", "productDecisionRequired", "tokenUsage"],
+  "properties": {
+    "taskId": { "type": "string" },
+    "status": { "type": "string", "enum": ["completed", "failed", "blocked", "needs_decision", "scope_violation"] },
+    "summary": { "type": "string" },
+    "filesChanged": { "type": "array", "items": { "type": "string" } },
+    "commitHash": { "type": "string" },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "status", "summary"],
+        "properties": {
+          "name": { "type": "string" },
+          "status": { "type": "string" },
+          "summary": { "type": "string" }
+        }
+      }
+    },
+    "scopeViolations": { "type": "array", "items": { "type": "string" } },
+    "risks": { "type": "array", "items": { "type": "string" } },
+    "unresolvedQuestions": { "type": "array", "items": { "type": "string" } },
+    "productDecisionRequired": { "type": "boolean" },
+    "tokenUsage": {
+      "type": "object",
+      "required": ["inputTokens", "outputTokens", "cacheHitTokens"],
+      "properties": {
+        "inputTokens": { "type": "integer", "minimum": 0 },
+        "outputTokens": { "type": "integer", "minimum": 0 },
+        "cacheHitTokens": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

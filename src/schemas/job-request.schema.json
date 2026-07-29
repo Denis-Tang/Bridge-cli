@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://brainctl.dev/schemas/job-request.schema.json",
+  "title": "JobRequest",
+  "description": "用户提交的施工需求请求",
+  "type": "object",
+  "required": ["jobId", "projectId", "projectRoot", "requestText", "createdAt"],
+  "properties": {
+    "jobId": { "type": "string", "description": "唯一任务 ID" },
+    "projectId": { "type": "string", "description": "项目标识符" },
+    "projectRoot": { "type": "string", "description": "项目根目录路径" },
+    "requestText": { "type": "string", "description": "用户自然语言需求" },
+    "submittedBy": { "type": "string", "description": "提交来源" },
+    "createdAt": { "type": "string", "format": "date-time", "description": "创建时间 (ISO 8601 UTC)" },
+    "constraints": {
+      "type": "object",
+      "properties": {
+        "productDecisionsLocked": { "type": "boolean" },
+        "allowHighRiskOperations": { "type": "boolean" }
+      }
+    }
+  }
+}

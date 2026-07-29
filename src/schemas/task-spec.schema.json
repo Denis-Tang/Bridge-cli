@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://brainctl.dev/schemas/task-spec.schema.json",
+  "title": "TaskSpec",
+  "description": "Pi Worker 的施工任务规范",
+  "type": "object",
+  "required": ["taskId", "title", "goal", "dependencies", "allowedPaths", "forbiddenPaths", "contextFiles", "acceptanceChecks", "allowedCommands", "riskLevel", "productDecisionsLocked", "expectedOutputs", "heavyCommandSlotsRequired", "timeoutSeconds"],
+  "properties": {
+    "taskId": { "type": "string" },
+    "title": { "type": "string" },
+    "goal": { "type": "string" },
+    "dependencies": { "type": "array", "items": { "type": "string" } },
+    "allowedPaths": { "type": "array", "items": { "type": "string" } },
+    "forbiddenPaths": { "type": "array", "items": { "type": "string" } },
+    "contextFiles": { "type": "array", "items": { "type": "string" } },
+    "acceptanceChecks": { "type": "array", "items": { "type": "string" } },
+    "allowedCommands": { "type": "array", "items": { "type": "string" } },
+    "riskLevel": { "type": "string", "enum": ["low", "medium", "high"] },
+    "productDecisionsLocked": { "type": "boolean" },
+    "expectedOutputs": { "type": "array", "items": { "type": "string" } },
+    "heavyCommandSlotsRequired": { "type": "integer", "minimum": 0 },
+    "timeoutSeconds": { "type": "integer", "minimum": 0 }
+  }
+}

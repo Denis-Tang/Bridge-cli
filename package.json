@@ -1,0 +1,27 @@
+{
+  "name": "codex-brain-pi-orchestrator",
+  "version": "0.1.0",
+  "description": "Codex Brain + Pi Worker 多代理施工调度系统 - 独立调度器",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "check": "npm run build && npm test",
+    "brainctl": "tsx src/cli/brainctl.ts"
+  },
+  "bin": {
+    "brainctl": "dist/cli/brainctl.js"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.0.5"
+  }
+}
