@@ -32,8 +32,7 @@ describe('cost and final-review scheduler integrity', () => {
       const config = (ctx.scheduler as any).config;
       config.piProcessRunner = undefined;
       config.costBudget = {
-        currency: 'CNY', limit: 1, maxPiCallCost: 2, maxCodexCallCost: 1,
-        pricingVersion: 'test-v1',
+        limit: 1, maxPiCallCost: 2, maxCodexCallCost: 1,
       };
 
       await ctx.scheduler.startRun(ctx.runId);

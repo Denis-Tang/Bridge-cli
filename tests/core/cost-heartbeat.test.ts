@@ -18,7 +18,7 @@ function intervalHandleCount(): number {
 
 function setCostBudget(ctx: BenchmarkContext, heartbeatMs: number): void {
   const config = (ctx.scheduler as unknown as { config: { costBudget: unknown; costReservationHeartbeatMs: number } }).config;
-  config.costBudget = { currency: 'CNY', limit: 100, maxPiCallCost: 5, maxCodexCallCost: 3, pricingVersion: 'test-v1' };
+  config.costBudget = { limit: 100, maxPiCallCost: 5, maxCodexCallCost: 3 };
   config.costReservationHeartbeatMs = heartbeatMs;
 }
 

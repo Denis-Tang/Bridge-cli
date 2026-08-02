@@ -7,6 +7,7 @@ import type { AttemptRecord, PathLockRecord, StageRecord, StructuredTaskSpec } f
 import type { WorkerResult, ReviewResult } from '../types/protocol.js';
 import type { ResourceSampler } from '../types/m3-types.js';
 import type { CostBudgetConfig, CallType } from '../types/m4-types.js';
+import { QUOTA_UNIT, QUOTA_PRICING_PLACEHOLDER } from '../types/m4-types.js';
 import { WorktreeManager } from '../git/worktree-manager.js';
 import { DiffScopeValidator } from '../git/diff-scope-validator.js';
 import type { QualityGateConfig } from '../quality/quality-gate-runner.js';
@@ -317,10 +318,10 @@ export class StageScheduler {
       attemptId: input.attemptId ?? null,
       callType: input.callType,
       callId: input.callId,
-      currency: budget.currency,
+      currency: QUOTA_UNIT,
       budgetLimit: budget.limit,
       reservedCost: worstCaseCost,
-      pricingVersion: budget.pricingVersion,
+      pricingVersion: QUOTA_PRICING_PLACEHOLDER,
       ownerId,
       heartbeatAt: now.toISOString(),
       leaseExpiresAt: new Date(now.getTime() + Math.max(this.config.workerTimeoutMs, 120_000) + 60_000).toISOString(),
@@ -1434,10 +1435,10 @@ export class StageScheduler {
                 attemptId: aid,
                 callType: 'pi_worker',
                 callId: `${runId}-guard-block-probe`,
-                currency: budget.currency,
+                currency: QUOTA_UNIT,
                 budgetLimit: budget.limit,
                 reservedCost: budget.maxPiCallCost,
-                pricingVersion: budget.pricingVersion,
+                pricingVersion: QUOTA_PRICING_PLACEHOLDER,
                 ownerId: `${runId}:${aid}:guard-block-probe`,
                 heartbeatAt: new Date().toISOString(),
               });

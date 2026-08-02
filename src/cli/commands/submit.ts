@@ -35,6 +35,7 @@ import { createExecutionConfigSnapshot } from '../../core/config-snapshot.js';
 import { detectBranch } from '../../adapters/project-adapter.js';
 import { qualityGatesToRunnerConfig } from '../../quality/quality-gate-config.js';
 import { normalizeStructuredPlanWriteConflicts, validateStructuredPlan } from '../../core/structured-plan-validator.js';
+import { QUOTA_UNIT, QUOTA_PRICING_PLACEHOLDER } from '../../types/m4-types.js';
 
 export const submitCommand = new Command('submit')
   .alias('plan')
@@ -149,7 +150,7 @@ export const submitCommand = new Command('submit')
         const worstCase = (workerType === 'real-pi' ? cost.maxPiCallCost : 0)
           + (reviewerType === 'codex-cli' ? cost.maxCodexCallCost : 0);
         if (worstCase > cost.limit) {
-          console.log(`  ✗ 单次本地链路最坏成本 ${worstCase} ${cost.currency} 超过预算 ${cost.limit} ${cost.currency}；未启动任何 Provider。`);
+          console.log(`  ✗ 单次本地链路最坏配额 ${worstCase} 超过调用配额上限 ${cost.limit}（无单位，非金额）；未启动任何 Provider。`);
           process.exit(1);
         }
       }
@@ -248,10 +249,10 @@ export const submitCommand = new Command('submit')
                     runId,
                     callType: 'pi_worker',
                     callId: `${runId}-guard-block-probe`,
-                    currency: cost.currency,
+                    currency: QUOTA_UNIT,
                     budgetLimit: cost.limit,
                     reservedCost: cost.maxPiCallCost,
-                    pricingVersion: cost.pricingVersion,
+                    pricingVersion: QUOTA_PRICING_PLACEHOLDER,
                     ownerId: `${runId}:guard-block-probe`,
                     heartbeatAt: new Date().toISOString(),
                   });
@@ -512,7 +513,7 @@ async function handleStructuredPlan(request: string, projectPath: string, option
     return;
   }
   if (!governanceEnabled) {
-    console.log('  x 真实 Codex 规划需要开启 governance.enabled，以便金额预算和用量状态写入 SQLite；未启动 Provider。');
+    console.log('  x 真实 Codex 规划需要开启 governance.enabled，以便调用配额和用量状态写入 SQLite；未启动 Provider。');
     console.log('  请先运行: brainctl config set governance.enabled true');
     return;
   }
@@ -537,15 +538,15 @@ async function handleStructuredPlan(request: string, projectPath: string, option
     const cost = runtime.resolved.costBudget;
     const costGate = await store.reserveCost!({
       id: runId + '-plan-cost', runId, callType: 'codex_plan', callId: runId + '-plan',
-      currency: cost.currency, budgetLimit: cost.limit, reservedCost: cost.maxCodexCallCost,
-      pricingVersion: cost.pricingVersion,
+      currency: QUOTA_UNIT, budgetLimit: cost.limit, reservedCost: cost.maxCodexCallCost,
+      pricingVersion: QUOTA_PRICING_PLACEHOLDER,
     });
     if (!costGate.allowed) {
-      console.log('  x Cost budget blocked planning: ' + costGate.reason);
-      console.log('  This is the AMOUNT (costBudget) gate, not the token budget.');
+      console.log('  x Call quota blocked planning: ' + costGate.reason);
+      console.log('  This is the CALL-QUOTA gate (unitless, not money), not the token budget.');
       console.log('  "--increase-budget" only raises TOKEN limits and will NOT unblock this.');
       console.log('  Edit .brainctl/project.json -> costBudget.limit (or run brainctl budget write-off for stale reservations), then retry.');
-      await store.createEvent({ id: runId + '-ev-plan-cost-exceeded', runId, eventType: 'cost_budget_exceeded', eventData: { remaining: costGate.remaining, currency: cost.currency } });
+      await store.createEvent({ id: runId + '-ev-plan-cost-exceeded', runId, eventType: 'cost_budget_exceeded', eventData: { remaining: costGate.remaining } });
       await store.close();
       return;
     }

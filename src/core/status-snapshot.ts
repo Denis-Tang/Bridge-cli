@@ -200,7 +200,9 @@ async function buildRunSnapshot(store: StateQueryStore, run: RunRecord, dbPath?:
       else if (e.status === 'written_off') breakdown.written_off += e.reservedCost;
       else breakdown.settled += (e.status === 'confirmed' && e.actualCost != null ? e.actualCost : 0);
     }
-    return { currency: latest.currency, limit: latest.budgetLimit, committed, remaining: Math.max(0, latest.budgetLimit - committed), unavailableCalls: costEntries.filter((entry) => entry.usageStatus === 'unavailable').length, breakdown };
+    // No `currency` field: quotas are unitless. Exposing a currency label here
+    // is what made the Dashboard render this counter as if it were money.
+    return { limit: latest.budgetLimit, committed, remaining: Math.max(0, latest.budgetLimit - committed), unavailableCalls: costEntries.filter((entry) => entry.usageStatus === 'unavailable').length, breakdown };
   })() : null;
   const nextAction = pausedReason || stages.some((stage) => stage.status === 'paused')
     ? `brainctl resume ${run.id} --allow-real-project${dbPath ? ` --db "${dbPath}"` : ''}`

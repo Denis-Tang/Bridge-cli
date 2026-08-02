@@ -154,12 +154,32 @@ export interface GovernanceStatus {
   pendingApprovals: number;
 }
 
+/**
+ * Fixed values written to the legacy `currency` / `pricing_version` columns of
+ * `cost_reservations`. The columns are retained (their CHECK constraint would
+ * need a table rebuild to drop) but carry no meaning: quotas are unitless.
+ * 'CNY' satisfies the existing CHECK(currency IN ('CNY','USD')) constraint.
+ */
+export const QUOTA_UNIT = 'CNY';
+export const QUOTA_PRICING_PLACEHOLDER = 'call-quota-no-price-table';
+
+/**
+ * Call-quota budget. These numbers are an abstract, UNITLESS quota — NOT money.
+ *
+ * There is no token→price table anywhere in Bridge, and no paid call path
+ * settles a reservation with provider-confirmed cost (all four settle as
+ * `unavailable`, which the ledger counts at the full worst-case reservation).
+ * So `limit` bounds "how many worst-case calls may still be started", not spend.
+ *
+ * `currency` and `pricingVersion` were removed deliberately: presenting a
+ * currency label on a counter that cannot track currency invites the operator
+ * to believe they have cost control. If a real price table is ever added, these
+ * become meaningful again and can return.
+ */
 export interface CostBudgetConfig {
-  currency: 'CNY' | 'USD';
   limit: number;
   maxPiCallCost: number;
   maxCodexCallCost: number;
-  pricingVersion: string;
 }
 
 export interface CostReservation {
@@ -170,11 +190,13 @@ export interface CostReservation {
   attemptId: string | null;
   callType: CallType;
   callId: string;
-  currency: CostBudgetConfig['currency'];
+  /** Legacy DB column, always QUOTA_UNIT. Quotas are unitless; see CostBudgetConfig. */
+  currency: string;
   budgetLimit: number;
   reservedCost: number;
   actualCost: number | null;
   status: 'reserved' | 'confirmed' | 'unavailable' | 'released' | 'written_off';
+  /** Legacy DB column, always QUOTA_PRICING_PLACEHOLDER. No price table exists. */
   pricingVersion: string;
   usageStatus: 'pending' | 'confirmed' | 'unavailable';
   phase: 'reserved' | 'spawned' | 'settled';

@@ -142,7 +142,16 @@ export interface RunSnapshot {
   stages: StageSnapshot[];
   pausedReason: string | null;
   nextAction: string | null;
-  cost: { currency: 'CNY' | 'USD'; limit: number; committed: number; remaining: number; unavailableCalls: number } | null;
+  /**
+   * Call quota, NOT money — unitless by design (no currency field). See
+   * CostBudgetConfig in m4-types.ts for why: there is no token→price table, and
+   * reservations settle as `unavailable` at full worst case, so these numbers
+   * bound "how many worst-case calls may still start", not spend.
+   */
+  cost: {
+    limit: number; committed: number; remaining: number; unavailableCalls: number;
+    breakdown?: { reserved: number; spawned: number; unavailable: number; written_off: number; settled: number };
+  } | null;
   events: EventSnapshot[];
 }
 

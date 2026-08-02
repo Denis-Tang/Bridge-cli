@@ -250,7 +250,7 @@ async function showRunDetail(store: SqliteStateStore, runId: string, dbPath: str
       .filter((e) => e.status === 'confirmed')
       .reduce((sum, e) => sum + (e.actualCost ?? 0), 0);
     const parts = [
-      `金额: ${committed}/${latest.budgetLimit} ${latest.currency}`,
+      `调用配额: ${committed}/${latest.budgetLimit}（无单位，非金额）`,
       `reserved ${byStatus('reserved', 'reserved')}`,
       `spawned ${byStatus('reserved', 'spawned')}`,
       `unavailable ${byStatus('unavailable')}`,

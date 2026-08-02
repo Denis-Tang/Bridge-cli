@@ -81,9 +81,9 @@ budgetCommand
           const mark = status === 'unavailable' ? '⚠ ' : status === 'written_off' ? '✎ ' : '  ';
           console.log(`  ${mark}${r.id}`);
           console.log(`      run=${r.run_id}  call=${r.call_type}  status=${status}  phase=${r.phase}`);
-          console.log(`      预留=${Number(r.reserved_cost)} ${r.currency}  实际=${r.actual_cost ?? '-'}  创建=${String(r.created_at).slice(0, 19).replace('T', ' ')}`);
+          console.log(`      预留配额=${Number(r.reserved_cost)}  实际=${r.actual_cost ?? '-'}  创建=${String(r.created_at).slice(0, 19).replace('T', ' ')}`);
         }
-        console.log(`\n  共 ${rows.length} 条 / 预留合计 ${total}`);
+        console.log(`\n  共 ${rows.length} 条 / 预留配额合计 ${total}（无单位，非金额）`);
         console.log(`  提示: 先看后销 — 用 --status unavailable 盘点后，再对每条执行 write-off。`);
         console.log('═'.repeat(60));
       }

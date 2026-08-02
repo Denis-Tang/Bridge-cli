@@ -64,15 +64,13 @@
     "costBudget": {
       "type": ["object", "null"],
       "additionalProperties": false,
-      "required": ["currency", "limit", "maxPiCallCost", "maxCodexCallCost", "pricingVersion"],
+      "required": ["limit", "maxPiCallCost", "maxCodexCallCost"],
       "properties": {
-        "currency": { "type": "string", "enum": ["CNY", "USD"] },
         "limit": { "type": "number", "exclusiveMinimum": 0 },
         "maxPiCallCost": { "type": "number", "exclusiveMinimum": 0 },
-        "maxCodexCallCost": { "type": "number", "exclusiveMinimum": 0 },
-        "pricingVersion": { "type": "string", "minLength": 1 }
+        "maxCodexCallCost": { "type": "number", "exclusiveMinimum": 0 }
       },
-      "description": "真实 Provider 的机器硬金额门。每次调用先按声明的最大单次成本预留；用量未知时保留预留额。"
+      "description": "真实 Provider 的调用配额硬门（无单位的抽象配额，不是货币）。每次调用先按声明的最坏单次配额预留；用量未知时保留预留额。注意：本系统没有 token→金额价目表，因此这些数字不代表真实花费，只限制'还能发起多少次最坏情况的调用'。"
     },
     "worker": {
       "type": "object",

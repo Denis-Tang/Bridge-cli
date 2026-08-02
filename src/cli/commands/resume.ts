@@ -132,7 +132,7 @@ export const resumeCommand = new Command('resume')
         // succeed silently without unblocking anything; reject it explicitly
         // with the correct remedy instead.
         if (options.increaseBudget !== undefined && isCostBudgetPauseReason(activePause?.reasonCode ?? null)) {
-          console.log('  ✗ 当前暂停是金额预算（costBudget）耗尽；--increase-budget 只提高 Token 限额，对金额预算无效。');
+          console.log('  ✗ 当前暂停是调用配额（costBudget，无单位、非金额）耗尽；--increase-budget 只提高 Token 限额，对调用配额无效。');
           console.log('  请编辑 .brainctl/project.json 的 costBudget.limit，然后重新 resume。');
           await store.close();
           process.exit(1);
