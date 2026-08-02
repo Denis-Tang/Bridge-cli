@@ -34,8 +34,10 @@ import { loadRuntimeProjectConfig } from '../../core/project-runtime-config.js';
 import { createExecutionConfigSnapshot } from '../../core/config-snapshot.js';
 import { detectBranch } from '../../adapters/project-adapter.js';
 import { qualityGatesToRunnerConfig } from '../../quality/quality-gate-config.js';
+import { normalizeStructuredPlanWriteConflicts, validateStructuredPlan } from '../../core/structured-plan-validator.js';
 
 export const submitCommand = new Command('submit')
+  .alias('plan')
   .description('提交自然语言需求给 Codex Brain 进行规划')
   .argument('<request>', '自然语言需求描述')
   .option('--dry-run', '仅验证输入并生成示例 JobRequest，不执行实际调度')
@@ -47,7 +49,8 @@ export const submitCommand = new Command('submit')
   .option('--worker <type>', 'Worker 类型: fake (默认) 或 real-pi', 'fake')
   .option('--worker-timeout-ms <ms>', 'Worker 超时毫秒数（仅 real-pi，默认 180000，最小 30000）')
   .option('--reviewer <type>', 'Reviewer 类型: local-rule (默认) 或 codex-cli', 'local-rule')
-  .action(async (request: string, options: { dryRun?: boolean; localRun?: boolean; project?: string; allowRealProject?: boolean; demoFixture?: boolean; demoFile?: string; worker?: string; workerTimeoutMs?: string; reviewer?: string }) => {
+  .option('--execution-mode <mode>', '执行模式: token-efficient (默认), simple 或 default')
+  .action(async (request: string, options: { dryRun?: boolean; localRun?: boolean; project?: string; allowRealProject?: boolean; demoFixture?: boolean; demoFile?: string; worker?: string; workerTimeoutMs?: string; reviewer?: string; executionMode?: string }) => {
     console.log('═'.repeat(50));
     console.log('  brainctl submit — 提交需求');
     console.log('═'.repeat(50));
@@ -135,8 +138,21 @@ export const submitCommand = new Command('submit')
       }
 
       const runtime = loadRuntimeProjectConfig(projectPath, {
-        cliOverrides: { worker: workerType, reviewer: reviewerType, workerTimeoutMs },
+        cliOverrides: { worker: workerType, reviewer: reviewerType, workerTimeoutMs, executionMode: options.executionMode },
       });
+      if (workerType === 'real-pi' || reviewerType === 'codex-cli') {
+        const cost = runtime.resolved.costBudget;
+        if (!cost) {
+          console.log('  ✗ 真实 Provider 需要在 .brainctl/project.json 配置 costBudget；未启动任何 Provider。');
+          process.exit(1);
+        }
+        const worstCase = (workerType === 'real-pi' ? cost.maxPiCallCost : 0)
+          + (reviewerType === 'codex-cli' ? cost.maxCodexCallCost : 0);
+        if (worstCase > cost.limit) {
+          console.log(`  ✗ 单次本地链路最坏成本 ${worstCase} ${cost.currency} 超过预算 ${cost.limit} ${cost.currency}；未启动任何 Provider。`);
+          process.exit(1);
+        }
+      }
       const localPrivacyService = PrivacyService.create({ projectRoot: projectPath });
       const targetBranch = runtime.resolved.targetBranch || detectBranch(projectPath);
       if (!targetBranch) {
@@ -176,6 +192,9 @@ export const submitCommand = new Command('submit')
         const fullWtPath = resolve(projectPath, worktreeRel);
         if (workerType === 'real-pi') {
           console.log('    使用真实 Pi Worker 执行...');
+          const selfCheckConfig = readSqliteConfigFromEnv(projectPath);
+          const selfCheckStore = SqliteStateStore.create(selfCheckConfig.path);
+          new SqliteMigrationRunner(selfCheckConfig, selfCheckStore.getDatabase()).applyPending();
           const piConfig: PiWorkerConfig = {
             workerId: `brainctl-${runId}`,
             command: runtime.resolved.worker.command,
@@ -194,6 +213,81 @@ export const submitCommand = new Command('submit')
               timeoutMs: runtime.resolved.reviewer.timeoutMs,
               env: localPrivacyService.buildProviderEnv('codex'),
             }),
+            // R3: guard self-check (zero-inference probe) — fail closed when the
+            // guard cannot be proven loaded. Aligned with stage-scheduler.ts.
+            guardSelfCheck: {
+              markerDir: resolve(projectPath, '.brainctl-dev/guard-selfcheck'),
+              verifiedPiVersion: runtime.resolved.worker.verifiedPiVersion ?? '0.82.1',
+              onResult: async (result) => {
+                try {
+                  await selfCheckStore.createEvent({
+                    id: `${runId}-ev-guard-selfcheck-${Date.now()}`,
+                    runId,
+                    eventType: 'pi_guard_selfcheck',
+                    eventData: {
+                      ok: result.ok,
+                      piVersion: result.piVersion,
+                      verifiedPiVersion: result.verifiedPiVersion,
+                      versionMismatch: result.versionMismatch,
+                      durationMs: result.durationMs,
+                      failureCategory: result.failureCategory,
+                      stderrHash: result.stderrHash,
+                    },
+                  });
+                } catch { /* audit sink failure is not fatal */ }
+              },
+              // B (authorized): one minimal inference, cost-gated, cached per Pi version.
+              inferenceProbe: {
+                enabled: runtime.resolved.worker.allowInferenceProbe === true,
+                model: runtime.resolved.worker.model || 'deepseek/deepseek-v4-flash',
+                reserveCost: async () => {
+                  const cost = runtime.resolved.costBudget;
+                  if (!cost || !selfCheckStore.reserveCost) return { allowed: false, reason: 'cost_budget_missing' };
+                  const result = await selfCheckStore.reserveCost({
+                    id: `${runId}-guard-block-probe-cost`,
+                    runId,
+                    callType: 'pi_worker',
+                    callId: `${runId}-guard-block-probe`,
+                    currency: cost.currency,
+                    budgetLimit: cost.limit,
+                    reservedCost: cost.maxPiCallCost,
+                    pricingVersion: cost.pricingVersion,
+                    ownerId: `${runId}:guard-block-probe`,
+                    heartbeatAt: new Date().toISOString(),
+                  });
+                  return { allowed: result.allowed, reason: result.reason };
+                },
+                settleCost: async (outcome, terminationEvidence) => {
+                  if (!selfCheckStore.finalizeCostReservation) return false;
+                  return selfCheckStore.finalizeCostReservation({
+                    id: `${runId}-guard-block-probe-cost`,
+                    outcome,
+                    ownerId: `${runId}:guard-block-probe`,
+                    terminationEvidence,
+                  });
+                },
+                cacheGet: async (piVersion) => selfCheckStore.getGuardProbeCache?.(piVersion) ?? null,
+                cacheSet: async (piVersion, outcome, failureCategory) =>
+                  selfCheckStore.setGuardProbeCache?.(piVersion, outcome, failureCategory, new Date().toISOString()),
+                onResult: async (result) => {
+                  try {
+                    await selfCheckStore.createEvent({
+                      id: `${runId}-ev-guard-block-probe-${Date.now()}`,
+                      runId,
+                      eventType: 'pi_guard_block_probe',
+                      eventData: {
+                        ok: result.ok,
+                        outcome: result.outcome,
+                        failureCategory: result.failureCategory,
+                        piVersion: result.piVersion,
+                        durationMs: result.durationMs,
+                        stderrHash: result.stderrHash,
+                      },
+                    });
+                  } catch { /* audit sink failure is not fatal */ }
+                },
+              },
+            },
           };
           const piWorker = new PiRpcWorker(piConfig);
           const taskSpec = {
@@ -217,6 +311,7 @@ export const submitCommand = new Command('submit')
             worktreePath: fullWtPath,
             runId,
           });
+          try { await selfCheckStore.close(); } catch { /* best-effort */ }
           if (piResult.workerResult && piResult.workerResult.status === 'completed') {
             console.log(`    Pi Worker 完成: ${piResult.workerResult.summary}`);
             if (piResult.providerUsage) {
@@ -390,7 +485,7 @@ export const submitCommand = new Command('submit')
   });
 
 // M2 Structured Plan helper
-async function handleStructuredPlan(request: string, projectPath: string, options: { worker?: string; reviewer?: string; workerTimeoutMs?: string }): Promise<void> {
+async function handleStructuredPlan(request: string, projectPath: string, options: { worker?: string; reviewer?: string; workerTimeoutMs?: string; executionMode?: string }): Promise<void> {
   const runId = 'run_' + Date.now();
   const config = readSqliteConfigFromEnv();
   const projectRoot = resolve(projectPath);
@@ -402,6 +497,7 @@ async function handleStructuredPlan(request: string, projectPath: string, option
       worker: options.worker,
       reviewer: options.reviewer,
       workerTimeoutMs: options.workerTimeoutMs ? Number(options.workerTimeoutMs) : undefined,
+      executionMode: options.executionMode,
     },
   });
   const executionConfigSnapshot = createExecutionConfigSnapshot(runtime.resolved);
@@ -410,6 +506,16 @@ async function handleStructuredPlan(request: string, projectPath: string, option
   resetGovernanceConfigCache();
   const govCfg = getGovernanceConfig(projectRoot);
   const governanceEnabled = govCfg.enabled;
+
+  if (!runtime.resolved.costBudget) {
+    console.log('  x 真实 Codex 规划需要在 .brainctl/project.json 配置 costBudget；未启动 Provider。');
+    return;
+  }
+  if (!governanceEnabled) {
+    console.log('  x 真实 Codex 规划需要开启 governance.enabled，以便金额预算和用量状态写入 SQLite；未启动 Provider。');
+    console.log('  请先运行: brainctl config set governance.enabled true');
+    return;
+  }
 
   console.log('  Calling Codex CLI for structured plan (project: ' + projectRoot + ')...');
   const planDir = resolve(projectRoot, '.brainctl-dev/plan-logs');
@@ -427,6 +533,19 @@ async function handleStructuredPlan(request: string, projectPath: string, option
     const runner = new SqliteMigrationRunner(config, store.getDatabase());
     runner.applyPending();
     await store.createRun({ id: runId, projectId: runtime.projectConfig.projectId, projectRoot, requestText: request, status: 'planning', executionConfigSnapshot, createdAt: now, updatedAt: now });
+
+    const cost = runtime.resolved.costBudget;
+    const costGate = await store.reserveCost!({
+      id: runId + '-plan-cost', runId, callType: 'codex_plan', callId: runId + '-plan',
+      currency: cost.currency, budgetLimit: cost.limit, reservedCost: cost.maxCodexCallCost,
+      pricingVersion: cost.pricingVersion,
+    });
+    if (!costGate.allowed) {
+      console.log('  x Cost budget blocked planning: ' + costGate.reason);
+      await store.createEvent({ id: runId + '-ev-plan-cost-exceeded', runId, eventType: 'cost_budget_exceeded', eventData: { remaining: costGate.remaining, currency: cost.currency } });
+      await store.close();
+      return;
+    }
 
     await ensureDefaultPolicies(store);
     const est = estimateForCallType('codex_plan', { requestText: request });
@@ -449,6 +568,7 @@ async function handleStructuredPlan(request: string, projectPath: string, option
       { ledgerSink: sink, invocationContext: planCtx },
     );
     const planResult = await brain.generatePlan(request, runId);
+    await store.settleCostReservation!(runId + '-plan-cost', null);
 
     // Post-check
     const pc = await postCheckBudget(store, runId, 'codex_plan', 0).catch(() => null);
@@ -471,6 +591,7 @@ async function handleStructuredPlan(request: string, projectPath: string, option
       return;
     }
 
+    const writeDependencyAdditions = normalizeStructuredPlanWriteConflicts(planResult.plan);
     const vErr = validateStructuredPlan(planResult.plan);
     if (vErr.length > 0) {
       writeFileSync(resolve(planDir, runId + '_plan-schema-errors.txt'), vErr.join('\n'), 'utf-8');
@@ -481,7 +602,10 @@ async function handleStructuredPlan(request: string, projectPath: string, option
       return;
     }
 
-    await persistPlanToStore(store, runId, projectRoot, request, planResult.plan, now, planDir, governanceEnabled);
+    if (writeDependencyAdditions.length > 0) {
+      writeFileSync(resolve(planDir, runId + '_write-dependencies.json'), JSON.stringify(writeDependencyAdditions, null, 2), 'utf-8');
+    }
+    await persistPlanToStore(store, runId, projectRoot, request, planResult.plan, now, planDir, governanceEnabled, writeDependencyAdditions);
     await store.close();
   } else {
     // ── M2 path: governance=false — call Brain first, only create store after valid plan ──
@@ -499,6 +623,7 @@ async function handleStructuredPlan(request: string, projectPath: string, option
       return;
     }
 
+    const writeDependencyAdditions = normalizeStructuredPlanWriteConflicts(planResult.plan);
     const vErr = validateStructuredPlan(planResult.plan);
     if (vErr.length > 0) {
       writeFileSync(resolve(planDir, runId + '_plan-schema-errors.txt'), vErr.join('\n'), 'utf-8');
@@ -509,13 +634,16 @@ async function handleStructuredPlan(request: string, projectPath: string, option
       return;
     }
 
+    if (writeDependencyAdditions.length > 0) {
+      writeFileSync(resolve(planDir, runId + '_write-dependencies.json'), JSON.stringify(writeDependencyAdditions, null, 2), 'utf-8');
+    }
     // Plan valid → now create store/run/stages/tasks
     const privacyService2 = PrivacyService.create({ projectRoot });
     const store = SqliteStateStore.create(config.path, privacyService2);
     const runner = new SqliteMigrationRunner(config, store.getDatabase());
     runner.applyPending();
     await store.createRun({ id: runId, projectId: runtime.projectConfig.projectId, projectRoot, requestText: request, status: 'planning', executionConfigSnapshot, createdAt: now, updatedAt: now });
-    await persistPlanToStore(store, runId, projectRoot, request, planResult.plan, now, planDir, governanceEnabled);
+    await persistPlanToStore(store, runId, projectRoot, request, planResult.plan, now, planDir, governanceEnabled, writeDependencyAdditions);
     await store.close();
   }
 }
@@ -530,6 +658,7 @@ function isSafeDemoFile(value: string): boolean {
 async function persistPlanToStore(
   store: SqliteStateStore, runId: string, projectRoot: string, request: string,
   plan: StructuredPlan, now: string, planDir: string, governanceEnabled: boolean,
+  writeDependencyAdditions: unknown[] = [],
 ): Promise<void> {
   // 为每个 task 生成 run-scoped 唯一 ID
   const taskIdMap = new Map<string, string>();
@@ -553,7 +682,10 @@ async function persistPlanToStore(
     }
   }
 
-  await store.createEvent({ id: runId + '-ev-plan', runId, eventType: 'plan_created', eventData: { request } });
+  await store.createEvent({
+    id: runId + '-ev-plan', runId, eventType: 'plan_created',
+    eventData: { request, automaticWriteDependencies: writeDependencyAdditions },
+  });
 
   // ── M4: G1 Decision Gate ──
   if (governanceEnabled) {
@@ -604,25 +736,4 @@ async function persistPlanToStore(
   console.log('');
   console.log('  Use "brainctl approve ' + runId + '" to start.');
   console.log('  Plan logs: ' + planDir);
-}
-
-function validateStructuredPlan(plan: StructuredPlan): string[] {
-  const e: string[] = [];
-  if (!plan.stages || plan.stages.length === 0) e.push('missing stages');
-  if (!plan.tasks || plan.tasks.length === 0) e.push('missing tasks');
-  const ids = new Set<string>();
-  for (const t of plan.tasks) {
-    if (!t.taskId) { e.push('task missing taskId'); continue; }
-    if (ids.has(t.taskId)) { e.push('duplicate taskId: ' + t.taskId); continue; }
-    ids.add(t.taskId);
-    if (typeof t.stageNumber !== 'number') e.push(t.taskId + ': missing stageNumber');
-    if (!t.title) e.push(t.taskId + ': missing title');
-    if (!t.goal) e.push(t.taskId + ': missing goal');
-    if (!t.estimatedWritePaths || t.estimatedWritePaths.length === 0) e.push(t.taskId + ': missing estimatedWritePaths');
-  }
-  for (const s of plan.stages) {
-    if (!s.tasks || s.tasks.length === 0) e.push('stage ' + s.stageNumber + ': no tasks');
-    for (const tid of (s.tasks || [])) if (!ids.has(tid)) e.push('stage ' + s.stageNumber + ' refs unknown task: ' + tid);
-  }
-  return e;
 }

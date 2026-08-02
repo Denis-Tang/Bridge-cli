@@ -1,5 +1,7 @@
 # Long Task Fake Acceptance — 长任务与同路径验收
 
+> 历史验收快照：下文测试数字描述 2026-07-28 当时运行，不是当前分支总数。当前最终 fake/disposable 结果以 `REAL-RUN-READINESS.md` 为准；本报告保留用于场景与证据链审计。
+
 更新日期：2026-07-28
 
 ## 结论

@@ -27,6 +27,12 @@
       "type": "string",
       "description": "默认目标/基线分支；空字符串表示不预设，由运行时探测"
     },
+    "executionMode": {
+      "type": "string",
+      "enum": ["default", "simple", "token-efficient"],
+      "default": "token-efficient",
+      "description": "执行模式；token-efficient 为推荐默认值，default 保留逐任务审查的兼容行为"
+    },
     "qualityGates": {
       "type": "object",
       "additionalProperties": false,
@@ -53,6 +59,19 @@
       "type": "array",
       "items": { "type": "string" }
     },
+    "costBudget": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["currency", "limit", "maxPiCallCost", "maxCodexCallCost", "pricingVersion"],
+      "properties": {
+        "currency": { "type": "string", "enum": ["CNY", "USD"] },
+        "limit": { "type": "number", "exclusiveMinimum": 0 },
+        "maxPiCallCost": { "type": "number", "exclusiveMinimum": 0 },
+        "maxCodexCallCost": { "type": "number", "exclusiveMinimum": 0 },
+        "pricingVersion": { "type": "string", "minLength": 1 }
+      },
+      "description": "真实 Provider 的机器硬金额门。每次调用先按声明的最大单次成本预留；用量未知时保留预留额。"
+    },
     "worker": {
       "type": "object",
       "additionalProperties": false,
@@ -62,7 +81,9 @@
         "args": { "type": "array", "items": { "type": "string" } },
         "model": { "type": "string" },
         "timeoutMs": { "type": "integer", "minimum": 1 },
-        "maxConcurrency": { "type": "integer", "minimum": 1 }
+        "maxConcurrency": { "type": "integer", "minimum": 1 },
+        "verifiedPiVersion": { "type": "string", "description": "已验证的 Pi CLI 版本（guard 扩展 tool_call 语义依赖）；版本不匹配时显著警告并强制 guard 自检通过才继续" },
+        "allowInferenceProbe": { "type": "boolean", "description": "B（已授权）：允许一次最小推理的阻断语义探针（按 Pi 版本持久化缓存，同版本已验证即复用不花钱；走成本预留硬门，默认 false）" }
       }
     },
     "reviewer": {

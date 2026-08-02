@@ -61,6 +61,11 @@ const TERMINAL_ATTEMPT_STATUSES = new Set([
   'approved', 'failed', 'interrupted', 'canceled',
 ]);
 
+/** Worker PID exit is expected while post-worker gates/review retain the lock. */
+const POST_WORKER_LOCK_STATUSES = new Set([
+  'worker_completed', 'validating', 'reviewing',
+]);
+
 /** Terminal stage statuses */
 const TERMINAL_STAGE_STATUSES = new Set([
   'completed', 'canceled',
@@ -348,11 +353,42 @@ function classifyRunningAttempt(
 
   // A4: piPid is null (no PID recorded)
   if (attempt.pidAlive === 'unknown' && attempt.pid === null) {
+    const now = Date.now();
+    const leaseExpiry = attempt.dispatchLeaseExpiresAt ? Date.parse(attempt.dispatchLeaseExpiresAt) : Number.NaN;
+    const updatedAt = Date.parse(attempt.attemptUpdatedAt);
+    if (Number.isFinite(leaseExpiry) && leaseExpiry > now) {
+      findings.push(makeFinding(
+        runId, 'attempt', attempt.attemptId,
+        'no_pid_active_window', 'info',
+        `Attempt ${attempt.attemptNumber} is inside an active dispatch lease while PID persistence is pending. No action.`,
+        ['running', 'no_pid', 'active_lease', attempt.attemptId, attempt.dispatchLeaseExpiresAt!],
+      ));
+      return;
+    }
+    if (attempt.spawnEventObserved) {
+      findings.push(makeFinding(
+        runId, 'attempt', attempt.attemptId,
+        'no_pid_recorded', 'blocking',
+        `Attempt ${attempt.attemptNumber} has spawn evidence but no persisted PID. Provider state is unknown; manual investigation required.`,
+        ['running', 'no_pid', 'spawn_observed', attempt.attemptId],
+      ));
+      return;
+    }
+    if (Number.isFinite(leaseExpiry) && leaseExpiry <= now
+      && Number.isFinite(updatedAt) && now - updatedAt >= 60_000) {
+      findings.push(makeFinding(
+        runId, 'attempt', attempt.attemptId,
+        'no_pid_stale', 'warning',
+        `Attempt ${attempt.attemptNumber} has an expired dispatch lease and no spawn evidence. Safe-apply will mark interrupted.`,
+        ['running', 'no_pid', 'expired_lease', attempt.attemptId, attempt.dispatchLeaseExpiresAt!],
+      ));
+      return;
+    }
     findings.push(makeFinding(
       runId, 'attempt', attempt.attemptId,
-      'no_pid_recorded', 'warning',
-      `Attempt ${attempt.attemptNumber} is running but has no PID recorded. Safe-apply will mark interrupted and release proven locks.`,
-      ['running', 'no_pid', attempt.attemptId],
+      'no_pid_recorded', 'blocking',
+      `Attempt ${attempt.attemptNumber} is running without PID or a provably expired dispatch lease. Keep state unchanged and investigate manually.`,
+      ['running', 'no_pid', 'insufficient_stale_evidence', attempt.attemptId],
     ));
   }
 }
@@ -605,7 +641,10 @@ function classifyLock(
   }
 
   // E2: Lock's attempt PID is confirmed gone → release lock + mark attempt interrupted
-  if (lock.ownerPidAlive === 'gone' && lock.ownerAttemptStatus !== null && !TERMINAL_ATTEMPT_STATUSES.has(lock.ownerAttemptStatus)) {
+  if (lock.ownerPidAlive === 'gone'
+    && lock.ownerAttemptStatus !== null
+    && !TERMINAL_ATTEMPT_STATUSES.has(lock.ownerAttemptStatus)
+    && !POST_WORKER_LOCK_STATUSES.has(lock.ownerAttemptStatus)) {
     findings.push(makeFinding(
       run.runId, 'lock', lock.lockId,
       'lock_owner_pid_gone', 'warning',
@@ -705,8 +744,8 @@ function mapFindingToSafeAction(f: Finding): SafeAction | null {
         metadata: { reason: 'pid_missing' },
       };
 
-    // A4: No PID recorded → mark interrupted
-    case 'no_pid_recorded':
+    // A4: No PID is safe only with an expired lease and no spawn evidence.
+    case 'no_pid_stale':
       return {
         actionType: 'mark_attempt_interrupted',
         targetEntityType: f.entityType,

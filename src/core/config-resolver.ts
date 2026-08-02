@@ -5,11 +5,14 @@ import type {
   ReviewerConfig,
   ResourceSamplingConfig,
 } from '../adapters/project-adapter.js';
+import type { ExecutionMode } from '../types/m2-types.js';
+import type { CostBudgetConfig } from '../types/m4-types.js';
 
 export interface SchedulerResolvedConfig {
   projectId: string;
   projectRoot: string;
   targetBranch: string;
+  executionMode: ExecutionMode;
   worker: WorkerConfig;
   reviewer: ReviewerConfig;
   qualityGatesTask: QualityGateItem[];
@@ -24,6 +27,7 @@ export interface SchedulerResolvedConfig {
   outputDir: string;
   logsDir: string;
   retentionDays: number;
+  costBudget: CostBudgetConfig | null;
 }
 
 export interface ConfigResolverOptions {
@@ -36,6 +40,7 @@ export interface ConfigResolverOptions {
     workerTimeoutMs?: number;
     reviewerTimeoutMs?: number;
     resourceSamplingEnabled?: boolean;
+    executionMode?: string;
   };
   snapshot?: Partial<SchedulerResolvedConfig> | null;
   detectedBranch?: string;
@@ -55,6 +60,12 @@ function pickReviewerType(value: string | undefined, fallback: ReviewerConfig['t
   throw new Error(`Unsupported reviewer type: ${value}. Supported: local-rule, codex-cli.`);
 }
 
+function pickExecutionMode(value: string | undefined, fallback: ExecutionMode): ExecutionMode {
+  if (!value) return fallback;
+  if (value === 'default' || value === 'simple' || value === 'token-efficient') return value;
+  throw new Error(`Unsupported execution mode: ${value}. Supported: default, simple, token-efficient.`);
+}
+
 function coalesce<T>(...values: Array<T | undefined | null>): T {
   for (const v of values) {
     if (v !== undefined && v !== null) return v;
@@ -69,6 +80,7 @@ export function resolveConfig(options: ConfigResolverOptions): SchedulerResolved
     projectId: projectConfig.projectId,
     projectRoot: projectConfig.projectRoot,
     targetBranch: projectConfig.defaultBaseBranch || detectedBranch || '',
+    executionMode: projectConfig.executionMode,
     worker: { ...projectConfig.worker },
     reviewer: { ...projectConfig.reviewer },
     qualityGatesTask: projectConfig.qualityGates.task ?? [],
@@ -83,11 +95,13 @@ export function resolveConfig(options: ConfigResolverOptions): SchedulerResolved
     outputDir: projectConfig.artifactRetention.outputDir ?? '.brainctl-dev/output',
     logsDir: projectConfig.artifactRetention.logsDir ?? '.brainctl-dev/logs',
     retentionDays: projectConfig.artifactRetention.retentionDays ?? 7,
+    costBudget: projectConfig.costBudget,
   };
 
   // Run snapshot layer: it wins over the current project file during resume.
   if (snapshot) {
     if (snapshot.targetBranch !== undefined) base.targetBranch = snapshot.targetBranch;
+    if (snapshot.executionMode !== undefined) base.executionMode = snapshot.executionMode;
     if (snapshot.worker) base.worker = { ...base.worker, ...snapshot.worker };
     if (snapshot.reviewer) base.reviewer = { ...base.reviewer, ...snapshot.reviewer };
     if (snapshot.qualityGatesTask) base.qualityGatesTask = snapshot.qualityGatesTask;
@@ -99,6 +113,7 @@ export function resolveConfig(options: ConfigResolverOptions): SchedulerResolved
     if (snapshot.maxParallelTasks !== undefined) base.maxParallelTasks = snapshot.maxParallelTasks;
     if (snapshot.workerTimeoutMs !== undefined) base.workerTimeoutMs = snapshot.workerTimeoutMs;
     if (snapshot.reviewerTimeoutMs !== undefined) base.reviewerTimeoutMs = snapshot.reviewerTimeoutMs;
+    if (snapshot.costBudget !== undefined) base.costBudget = snapshot.costBudget;
   }
 
   // CLI explicit parameters are the highest-priority layer.
@@ -125,6 +140,9 @@ export function resolveConfig(options: ConfigResolverOptions): SchedulerResolved
   }
   if (cliOverrides.resourceSamplingEnabled !== undefined) {
     base.resourceSampling.enabled = cliOverrides.resourceSamplingEnabled;
+  }
+  if (cliOverrides.executionMode !== undefined) {
+    base.executionMode = pickExecutionMode(cliOverrides.executionMode, base.executionMode);
   }
 
   // Final fallbacks: ensure targetBranch is never empty if we can help it

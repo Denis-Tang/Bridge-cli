@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import Ajv, { type ValidateFunction } from 'ajv';
 import addFormats from 'ajv-formats';
+import type { ExecutionMode } from '../types/m2-types.js';
+import type { CostBudgetConfig } from '../types/m4-types.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -28,6 +30,10 @@ export interface WorkerConfig {
   model: string;
   timeoutMs: number;
   maxConcurrency: number;
+  /** R3: verified Pi CLI version for the read-only guard; mismatch → warning + mandatory self-check. */
+  verifiedPiVersion?: string;
+  /** B (authorized): allow the ONE-inference block-semantics probe (persistently cached per Pi version). */
+  allowInferenceProbe?: boolean;
 }
 
 export interface ReviewerConfig {
@@ -56,6 +62,7 @@ export interface ProjectConfig {
   /** Project root — may be '.' (portable), relative, or absolute. Resolved at load time relative to config file location. */
   projectRoot: string;
   defaultBaseBranch: string;
+  executionMode: ExecutionMode;
   qualityGates: ProjectQualityGates;
   forbiddenPaths: string[];
   sharedLocks: string[];
@@ -64,6 +71,7 @@ export interface ProjectConfig {
   reviewer: ReviewerConfig;
   resourceSampling: ResourceSamplingConfig;
   artifactRetention: ArtifactRetentionConfig;
+  costBudget: CostBudgetConfig | null;
 }
 
 export interface ProjectConfigFile {
@@ -71,6 +79,7 @@ export interface ProjectConfigFile {
   projectId: string;
   projectRoot: string;
   defaultBaseBranch: string;
+  executionMode?: ExecutionMode;
   qualityGates?: ProjectQualityGates;
   forbiddenPaths?: string[];
   sharedLocks?: string[];
@@ -80,6 +89,7 @@ export interface ProjectConfigFile {
   resourceSampling?: Partial<ResourceSamplingConfig>;
   artifactRetention?: Partial<ArtifactRetentionConfig>;
   artifact?: Partial<ArtifactRetentionConfig>;
+  costBudget?: CostBudgetConfig | null;
 }
 
 export interface ProjectAdapterLoadError {
@@ -146,6 +156,7 @@ export function defaults(projectRoot: string): ProjectConfig {
     // Store '.' for portability — the loading path is resolved at load time
     projectRoot: '.',
     defaultBaseBranch: detectBranch(root),
+    executionMode: 'token-efficient',
     qualityGates: { task: [], stage: [] },
     forbiddenPaths: ['.env', '.env.*', '**/*secret*', '**/*key*'],
     sharedLocks: ['package.json', 'package-lock.json', 'tsconfig.json'],
@@ -157,6 +168,7 @@ export function defaults(projectRoot: string): ProjectConfig {
       model: '',
       timeoutMs: 180000,
       maxConcurrency: 4,
+      verifiedPiVersion: '0.82.1',
     },
     reviewer: {
       type: 'local-rule',
@@ -175,6 +187,7 @@ export function defaults(projectRoot: string): ProjectConfig {
       logsDir: '.brainctl-dev/logs',
       retentionDays: 7,
     },
+    costBudget: null,
   };
 }
 
@@ -192,6 +205,7 @@ function mergeDefaults(file: ProjectConfigFile, projectRoot: string, configFileD
     projectId: file.projectId ?? base.projectId,
     projectRoot: resolvedRoot,
     defaultBaseBranch: file.defaultBaseBranch ?? base.defaultBaseBranch,
+    executionMode: file.executionMode ?? base.executionMode,
     qualityGates: {
       task: file.qualityGates?.task ?? base.qualityGates.task,
       stage: file.qualityGates?.stage ?? base.qualityGates.stage,
@@ -203,6 +217,7 @@ function mergeDefaults(file: ProjectConfigFile, projectRoot: string, configFileD
     reviewer: { ...base.reviewer, ...file.reviewer },
     resourceSampling: { ...base.resourceSampling, ...file.resourceSampling },
     artifactRetention: { ...base.artifactRetention, ...(file.artifactRetention ?? file.artifact) },
+    costBudget: file.costBudget ?? base.costBudget,
   };
 }
 

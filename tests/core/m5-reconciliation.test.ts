@@ -12,6 +12,10 @@ import type { SqliteConfig } from '../../src/state/sqlite-config.js';
 import { converge } from '../../src/core/reconciliation/convergence-engine.js';
 import { applySafeActions } from '../../src/core/reconciliation/applicator.js';
 import { classifyFacts, deriveSafeActions } from '../../src/core/reconciliation/classifier.js';
+import {
+  isLockOwnerStatusOrphaned,
+  selectLatestAttemptForLock,
+} from '../../src/cli/commands/reconcile.js';
 import type {
   ReconciliationFactSnapshot,
 } from '../../src/types/m5-types.js';
@@ -40,6 +44,53 @@ describe('M5 Reconciliation Integration', () => {
   function uid(prefix: string): string {
     return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   }
+
+  it('M5-00: task-scoped recovery locks belong to the latest worker_completed attempt', () => {
+    const baseAttempt = {
+      taskId: 'task-lock-owner', stageId: 'stage-lock-owner',
+      pid: null, pidAlive: 'gone' as const,
+      worktreePath: null, worktreeExists: false, worktreeRegistered: false, worktreeDirty: false,
+      branchName: null, branchExists: false, branchHeadMatches: false,
+      workerResultExists: false, workerResultJson: null,
+      workerResultCompleted: false, workerCommitHash: null,
+      changedFiles: [], expectedWritePaths: [], expectedWriteEvidence: false,
+      reviewEvidenceTrusted: false,
+      locksHeld: 0, locksOrphaned: false,
+      reviewCompleted: false, reviewStatus: null,
+    };
+    const attempts = [
+      { ...baseAttempt, attemptId: 'a1', attemptNumber: 1, status: 'failed' },
+      { ...baseAttempt, attemptId: 'a6', attemptNumber: 6, status: 'worker_completed' },
+    ];
+
+    expect(selectLatestAttemptForLock(attempts)).toMatchObject({ attemptId: 'a6', attemptNumber: 6 });
+    expect(isLockOwnerStatusOrphaned('worker_completed')).toBe(false);
+    expect(isLockOwnerStatusOrphaned('failed')).toBe(true);
+
+    const facts: ReconciliationFactSnapshot = {
+      run: { runId: 'run-lock-owner', runStatus: 'running', projectRootHash: 'hash', governanceEnabled: false, gitHead: 'abc', gitHeadResolvable: true, mergeConflict: false, conflictFiles: [] },
+      stages: [{
+        stageId: 'stage-lock-owner', stageNumber: 1, status: 'pending', baseCommit: 'abc',
+        tasks: [{ taskId: 'task-lock-owner', title: 'T1', status: 'worker_completed', attempts: [{
+          ...attempts[1],
+          worktreeExists: true, worktreeRegistered: true,
+          branchName: 'brainctl/task-lock-owner/a6', branchExists: true,
+          workerResultExists: true, workerResultJson: '{"status":"completed"}', workerResultCompleted: true,
+          locksHeld: 1,
+        }] }],
+        integration: null,
+        activeLocks: [{
+          lockId: 'lock-1', filePathHash: 'path-hash', taskId: 'task-lock-owner',
+          lockType: 'exclusive', lockStatus: 'locked', ownerAttemptId: 'a6',
+          ownerAttemptStatus: 'worker_completed', ownerPidAlive: 'gone', ownerRunStatus: 'running',
+        }],
+      }],
+    };
+
+    const findings = classifyFacts(facts, false);
+    expect(findings.filter((finding) => finding.severity === 'blocking')).toEqual([]);
+    expect(findings.some((finding) => finding.kind === 'lock_owner_pid_gone')).toBe(false);
+  });
 
   // ══════════════════════════════════════════════════════════
   // M5-01: running attempt PID gone → interrupted + lock release

@@ -1,5 +1,6 @@
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 import type { ReviewResult } from '../types/protocol.js';
 import type { LedgerSink, InvocationContext } from '../core/token-telemetry.js';
 import { estimateForCallType } from '../core/token-telemetry.js';
@@ -23,6 +24,7 @@ export interface CodexCliReviewerConfig {
   args: string[];
   /** Optional environment variables to pass to the Codex CLI subprocess */
   env?: Record<string, string>;
+  signal?: AbortSignal;
 }
 
 export function parseCodexCliReviewOutput(output: string, taskId: string): ReviewResult {
@@ -190,6 +192,7 @@ export class CodexCliReviewer {
     }
 
     const startTime = Date.now();
+    let failureMetadata: ReviewResult['executionMetadata'] | undefined;
     try {
       const result = await this.processRunner.run(this.config.command, this.config.args, {
         cwd: this.config.workDir,
@@ -197,6 +200,7 @@ export class CodexCliReviewer {
         input: reviewPrompt,
         maxBuffer: 10 * 1024 * 1024,
         env: this.config.env,
+        signal: this.config.signal,
       });
 
       // Non-zero exit code → call failure, propagate as rejection
@@ -204,6 +208,12 @@ export class CodexCliReviewer {
         const failureReason = result.timedOut
           ? `Codex CLI timed out after ${this.config.timeoutMs}ms`
           : `Codex CLI exited with code ${result.exitCode}`;
+        failureMetadata = {
+          errorCategory: result.timedOut ? 'timeout' : 'nonzero_exit',
+          exitCode: result.exitCode,
+          durationMs: result.durationMs,
+          stderrHash: hashDiagnostic(result.stderr),
+        };
         writeFileSync(reviewLogPath, JSON.stringify({
           status: 'failed',
           reason: failureReason,
@@ -215,6 +225,11 @@ export class CodexCliReviewer {
       }
 
       const parsed = this.parseCodexReviewOutput(result.stdout, taskId);
+      parsed.executionMetadata = {
+        exitCode: result.exitCode,
+        durationMs: result.durationMs,
+        stderrHash: hashDiagnostic(result.stderr),
+      };
       writeFileSync(reviewLogPath, JSON.stringify({
         status: parsed.status,
         mergeAllowed: parsed.mergeAllowed,
@@ -270,6 +285,15 @@ export class CodexCliReviewer {
         qualityGateStatus: 'failed',
         mergeAllowed: false,
         reviewer: 'codex-cli',
+        reviewerUnavailable: true,
+        executionMetadata: failureMetadata ?? {
+          errorCategory: errMsg.includes('timed out') ? 'timeout'
+            : errMsg.includes('exited with code') ? 'nonzero_exit'
+              : 'unexpected',
+          exitCode: extractExitCode(errMsg),
+          durationMs: Date.now() - startTime,
+          stderrHash: null,
+        },
       };
     }
   }
@@ -280,4 +304,14 @@ export class CodexCliReviewer {
   private parseCodexReviewOutput(output: string, taskId: string): ReviewResult {
     return parseCodexCliReviewOutput(output, taskId);
   }
+}
+
+function hashDiagnostic(value: string): string | null {
+  if (!value) return null;
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function extractExitCode(message: string): number | null {
+  const match = message.match(/exited with code (\d+)/);
+  return match ? Number(match[1]) : null;
 }

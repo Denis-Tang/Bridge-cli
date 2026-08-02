@@ -21,12 +21,15 @@ import {
 } from './reconcile.js';
 
 export const approveCommand = new Command('approve')
+  .alias('run')
   .description('批准 run 的第 1 阶段，开始施工')
   .argument('<run-id>', 'run ID')
   .option('--adaptive-concurrency', '启用 M3 自适应并发（默认关闭，M2 行为）')
   .option('--max-parallel-tasks <n>', '最大并行任务数 (1-16，默认 4)', parseInt)
   .option('--allow-real-project', '允许对非 disposable 项目启动真实 Pi/Codex 施工')
   .option('--target-branch <branch>', '目标合并分支（默认当前分支）')
+  .option('--execution-mode <mode>', '执行模式覆盖: token-efficient, simple 或 default')
+  .option('--db <path>', 'SQLite 状态库路径；优先于 BRAINCTL_SQLITE_PATH')
   .option('--auto', '批量确认（仅 low-risk 且无待确认审批时有效）')
   .option('--approve <decision-id>', '逐项确认指定审批决策 ID')
   .action(async (runId: string, options: {
@@ -34,15 +37,17 @@ export const approveCommand = new Command('approve')
     maxParallelTasks?: number;
     allowRealProject?: boolean;
     targetBranch?: string;
+    executionMode?: string;
     auto?: boolean;
     approve?: string;
+    db?: string;
   }) => {
     console.log('═'.repeat(50));
     console.log('  brainctl approve');
     console.log('═'.repeat(50));
 
     try {
-      const config = readSqliteConfigFromEnv();
+      const config = readSqliteConfigFromEnv(undefined, options.db);
       const store = SqliteStateStore.create(config.path);
 
       const run = await store.getRun(runId);
@@ -71,6 +76,7 @@ export const approveCommand = new Command('approve')
           targetBranch: options.targetBranch,
           maxParallelTasks: options.maxParallelTasks,
           resourceSamplingEnabled: options.adaptiveConcurrency === true ? true : undefined,
+          executionMode: options.executionMode,
         },
       });
 
@@ -170,6 +176,7 @@ export const approveCommand = new Command('approve')
 
       const targetBranch = runtime.resolved.targetBranch || resolveTargetBranch(run.projectRoot, options.targetBranch);
       console.log(`  目标分支: ${targetBranch}`);
+      console.log(`  执行模式: ${runtime.resolved.executionMode}`);
 
       // Update run status to running
       const now = new Date().toISOString();
@@ -190,6 +197,9 @@ export const approveCommand = new Command('approve')
 
       const firstStage = stages[0] || await store.getStage(`${runId}-stage-1`);
       if (firstStage) {
+        if (firstStage.status === 'paused') {
+          throw new Error('暂停阶段不能通过 approve 直接恢复；请使用 resume --confirm-pause <pause-id>。');
+        }
         await store.updateStageStatus(firstStage.id, 'ready', now);
         console.log(`  ▶ 第 1 阶段已就绪: ${firstStage.title}`);
 

@@ -19,6 +19,24 @@ import {
   hasBlockingFindings,
   printPreflightBlocked,
 } from './reconcile.js';
+import { resolveStagePause } from '../../core/pause-service.js';
+import type { PauseRecord } from '../../types/pause-types.js';
+
+export function requireMatchingPauseConfirmation(
+  activePause: PauseRecord | null,
+  confirmation: string | undefined,
+): PauseRecord {
+  if (!activePause) {
+    throw new Error('暂停阶段缺少结构化暂停记录 PauseRecord；为避免误恢复已拒绝继续。');
+  }
+  if (!confirmation) {
+    throw new Error(`必须显式传入 --confirm-pause ${activePause.id} 才能恢复该暂停。`);
+  }
+  if (confirmation !== activePause.id) {
+    throw new Error(`pause id does not match active PauseRecord ${activePause.id}`);
+  }
+  return activePause;
+}
 
 export const resumeCommand = new Command('resume')
   .description('恢复暂停的 run。M4: --increase-budget 提高 Token 限额')
@@ -27,20 +45,26 @@ export const resumeCommand = new Command('resume')
   .option('--max-parallel-tasks <n>', '最大并行任务数 (1-16)', parseInt)
   .option('--allow-real-project', '允许对非 disposable 项目恢复真实 Pi/Codex 施工')
   .option('--target-branch <branch>', '目标合并分支（默认当前分支）')
+  .option('--execution-mode <mode>', '执行模式覆盖: token-efficient, simple 或 default')
+  .option('--db <path>', 'SQLite 状态库路径；优先于 BRAINCTL_SQLITE_PATH')
   .option('--increase-budget <n>', 'M4: 提高 Token 预算上限（token 数）', parseInt)
   .option('--policy-type <type>', 'M4: 预算类型 (codex_plan|codex_review_stage|pi_run|pi_task|pi_attempt)')
   .option('--approve <decision-id>', 'M4: 批准指定决策 ID 后恢复')
+  .option('--confirm-pause <pause-id>', '确认当前结构化暂停记录 ID 后恢复')
   .action(async (runId: string, options: {
     adaptiveConcurrency?: boolean; maxParallelTasks?: number;
     allowRealProject?: boolean; targetBranch?: string;
+    executionMode?: string;
     increaseBudget?: number; policyType?: string; approve?: string;
+    confirmPause?: string;
+    db?: string;
   }) => {
     console.log('═'.repeat(50));
     console.log('  brainctl resume');
     console.log('═'.repeat(50));
 
     try {
-      const config = readSqliteConfigFromEnv();
+      const config = readSqliteConfigFromEnv(undefined, options.db);
       const store = SqliteStateStore.create(config.path);
 
       const run = await store.getRun(runId);
@@ -63,6 +87,7 @@ export const resumeCommand = new Command('resume')
           targetBranch: options.targetBranch,
           maxParallelTasks: options.maxParallelTasks,
           resourceSamplingEnabled: options.adaptiveConcurrency === true ? true : undefined,
+          executionMode: options.executionMode,
         },
       });
 
@@ -77,6 +102,19 @@ export const resumeCommand = new Command('resume')
       // Now safe to apply migrations and proceed
       const runner = new SqliteMigrationRunner(config, store.getDatabase());
       runner.applyPending();
+
+      const stagesBeforeResume = await store.listStages(runId);
+      const pausedStages = stagesBeforeResume.filter((stage) => stage.status === 'paused');
+      if (pausedStages.length > 1) {
+        throw new Error(`Run ${runId} 同时存在 ${pausedStages.length} 个暂停阶段；一次只能精确恢复一个 PauseRecord。`);
+      }
+      const pausedStage = pausedStages[0] ?? null;
+      const activePause = pausedStage
+        ? requireMatchingPauseConfirmation(
+            await store.getActivePauseForStage(pausedStage.id),
+            options.confirmPause,
+          )
+        : null;
 
       // ── M4: Handle token budget resume ──
       if (options.increaseBudget !== undefined || options.approve || options.policyType) {
@@ -144,8 +182,6 @@ export const resumeCommand = new Command('resume')
 
       // ── Check run state ──
       if (run.status !== 'waiting_decision' && run.status !== 'running') {
-        const stages = await store.listStages(runId);
-        const pausedStage = stages.find((s) => s.status === 'paused');
         if (!pausedStage) {
           console.log(`  ✗ Run ${runId} 没有暂停的阶段。状态: "${run.status}"`);
           await store.close();
@@ -170,6 +206,29 @@ export const resumeCommand = new Command('resume')
 
       const targetBranch = runtime.resolved.targetBranch || resolveTargetBranch(run.projectRoot, options.targetBranch);
       console.log(`  目标分支: ${targetBranch}`);
+      console.log(`  执行模式: ${runtime.resolved.executionMode}`);
+
+      if (pausedStage && activePause) {
+        const { g1, g2, g3 } = await getAllPendingApprovals(store, runId);
+        const pendingApprovals = [...g1, ...g2, ...g3];
+        if (pendingApprovals.length > 0) {
+          throw new Error(
+            `PauseRecord ${activePause.id} 仍有 ${pendingApprovals.length} 个专门批准待处理；Stage 保持 paused。`,
+          );
+        }
+        const resolved = await resolveStagePause(store, {
+          pauseId: activePause.id,
+          stageId: pausedStage.id,
+          resolutionNote: `Confirmed by brainctl resume --confirm-pause ${activePause.id}`,
+          approvalDecisionId: activePause.decisionId,
+        });
+        if (!resolved) {
+          throw new Error(
+            `PauseRecord ${activePause.id} 无法恢复：阶段状态已变化，或专用批准尚未生效/已经过期。`,
+          );
+        }
+        console.log(`  ✓ 已原子解决暂停: ${activePause.id}`);
+      }
 
       const now = new Date().toISOString();
       await store.updateRunStatus(runId, 'running', now);

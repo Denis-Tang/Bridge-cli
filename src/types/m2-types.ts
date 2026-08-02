@@ -23,6 +23,9 @@ export interface MinimalTaskPacket {
   dependencyHash: string;
   dependencySummary: string;
   acceptanceCommands: string[];
+  allowedCommands: string[];
+  productDecisionsLocked: boolean;
+  expectedOutputs: string[];
   outputFormat: 'worker_result_json';
   riskLevel: 'low' | 'medium' | 'high';
   heavyCommandSlotsRequired: number;
@@ -36,6 +39,11 @@ export interface RetryPacket {
   findings: string[];
   diffDelta: string;
   repairGoal: string;
+  allowedPaths: string[];
+  forbiddenPaths: string[];
+  acceptanceCommands: string[];
+  allowedCommands: string[];
+  productDecisionsLocked: boolean;
 }
 
 export interface StageReviewInput {
@@ -217,6 +225,9 @@ export interface AttemptRecord {
   exitReason: string | null;
   logPath: string | null;
   rawLogPath: string | null;
+  resultSource: 'pi' | 'manual' | 'codex_recovery';
+  adoptedCommit: string | null;
+  adoptionMetadataJson: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -249,6 +260,33 @@ export interface CreatePathLockInput {
   lockType?: LockType;
 }
 
+export interface ActualPathClaimRecord {
+  id: string;
+  runId: string;
+  stageId: string;
+  taskId: string;
+  attemptId: string;
+  filePath: string;
+  normalizedPath: string;
+  createdAt: string;
+  releasedAt: string | null;
+}
+
+export interface AttemptProvenanceRecord {
+  attemptId: string;
+  runId: string;
+  stageId: string;
+  taskId: string;
+  baseCommit: string;
+  expectedBranch: string;
+  expectedWorktree: string;
+  taskPacketHash: string;
+  implementationPromptHash: string;
+  workerId: string;
+  sessionId: string;
+  createdAt: string;
+}
+
 // ── Review Record ────────────────────────────────────────────────────────
 export interface ReviewRecord {
   id: string;
@@ -263,6 +301,14 @@ export interface ReviewRecord {
   mergeAllowed: boolean;
   startedAt: string | null;
   finishedAt: string | null;
+  reviewedThroughCommit: string | null;
+  finalCommit: string | null;
+  coverageStatus: 'partial' | 'complete';
+  reviewerUnavailable: boolean;
+  errorCategory: string | null;
+  exitCode: number | null;
+  durationMs: number | null;
+  stderrHash: string | null;
   createdAt: string;
 }
 
@@ -288,6 +334,11 @@ export interface IntegrationBatchRecord {
   conflictsJson: string | null;
   createdAt: string;
   finishedAt: string | null;
+  reviewedThroughCommit: string | null;
+  finalCommit: string | null;
+  reviewCoverageStatus: 'partial' | 'complete';
+  reviewerUnavailable: boolean;
+  reviewMetadataJson: string | null;
 }
 
 export interface CreateIntegrationBatchInput {

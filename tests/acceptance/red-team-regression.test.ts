@@ -201,8 +201,11 @@ describe('ACCEPTANCE-RED-TEAM — Stage Paused Invariants', () => {
       expect(attempts, 'pre-spawn conflict must create no attempts').toHaveLength(0);
       expect(ctx.piRunner.calls, 'pre-spawn conflict must call no worker').toBe(0);
       expect(tasks.filter((task) => task.status === 'merge_blocked'), 'nothing reached integration').toHaveLength(0);
+      expect(await ctx.store.getActivePauseForStage(pausedStages[0].id)).toMatchObject({
+        reasonCode: 'declared_write_conflict_missing_dependency',
+      });
       const pausedEvents = await ctx.store.listEvents(ctx.runId, 'stage_paused');
-      expect(pausedEvents.some((event) => event.eventDataJson?.includes('undeclared_same_path_conflict')))
+      expect(pausedEvents.some((event) => event.eventDataJson?.includes('declared_preventable')))
         .toBe(true);
     } finally {
       await teardownBenchmark(ctx);

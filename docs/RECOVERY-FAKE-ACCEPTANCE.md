@@ -1,5 +1,7 @@
 # Recovery Fake Acceptance — 崩溃恢复与孤儿资源验收
 
+> 历史验收快照：下文数字和 GAP 描述保留当时事实，不是当前问题清单。2026-08-02 已由 PauseRecord、取消 CAS、Windows 进程树终止、保守 reconcile、不可变 provenance 和 actual-path claim 后续修复覆盖；当前最终 fake/disposable 结果以 `REAL-RUN-READINESS.md` 为准。
+
 **创建日期**: 2026-07-28  
 **并行任务**: `16-崩溃恢复与孤儿资源验收并行提示词.md`  
 **Handoff**: `17-崩溃恢复与孤儿资源验收handoff.md`  

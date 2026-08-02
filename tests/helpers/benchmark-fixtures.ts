@@ -16,6 +16,7 @@ import { FakeProcessRunner } from '../../src/adapters/pi-rpc-worker.js';
 import type { ProcessRunInput, ProcessRunResult } from '../../src/adapters/pi-worker-types.js';
 import { FakeCodexProcessRunner, type CodexProcessRunResult } from '../../src/adapters/codex-process-runner.js';
 import type { StructuredTaskSpec } from '../../src/types/m2-types.js';
+import type { ExecutionMode } from '../../src/types/m2-types.js';
 import type { WorkerResult } from '../../src/types/protocol.js';
 
 // ══════════════════════════════════════════════════════════════
@@ -128,6 +129,13 @@ export class BenchPiRunner extends FakeProcessRunner {
     this.taskIds.push(taskId);
     const startTime = Date.now();
     this.callStartTimes.set(taskId, startTime);
+
+    // R2: real spawns surface an onSpawn callback at process START (before the
+    // run); the fake runner must mimic that so scheduler spawn hooks
+    // (markCostReservationSpawned + heartbeat) are exercised during the delay.
+    if (input.onSpawn) {
+      await Promise.resolve(input.onSpawn(4400 + callIndex));
+    }
 
     // REAL delay — not synthetic
     await new Promise((r) => setTimeout(r, this.delayMs));
@@ -293,7 +301,7 @@ export async function setupBenchmark(
   dag: TaskDef[],
   maxParallel: number,
   label: string,
-  opts?: { governanceEnabled?: boolean; piDelayMs?: number; codexDelayMs?: number },
+  opts?: { governanceEnabled?: boolean; piDelayMs?: number; codexDelayMs?: number; executionMode?: ExecutionMode },
 ): Promise<BenchmarkContext> {
   const governanceEnabled = opts?.governanceEnabled ?? true;
   const piDelayMs = opts?.piDelayMs ?? PI_DELAY_MS;
@@ -333,6 +341,7 @@ export async function setupBenchmark(
     qualityGates: [{ name: 'noop', command: 'node', args: ['-e', 'process.exit(0)'], timeoutMs: 5000 }],
     governanceEnabled: governanceEnabled, allowRealWorker: true, allowRealReviewer: true,
     piProcessRunner: piRunner, codexProcessRunner: codexRunner,
+    ...(opts?.executionMode ? { executionMode: opts.executionMode } : {}),
   });
 
   return { tmp, projectRoot, store, runId, stageId, piRunner, codexRunner, scheduler };
@@ -551,7 +560,11 @@ export async function runOrchestratedBaseline(
   piCalls: number;
   codexCalls: number;
 }> {
-  const ctx = await setupBenchmark(dag, maxParallel, `orch-${Date.now()}`, { piDelayMs, codexDelayMs });
+  const ctx = await setupBenchmark(dag, maxParallel, `orch-${Date.now()}`, {
+    piDelayMs,
+    codexDelayMs,
+    executionMode: 'token-efficient',
+  });
   const start = Date.now();
   try {
     await ctx.scheduler.startRun(ctx.runId);

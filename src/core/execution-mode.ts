@@ -1,6 +1,6 @@
 // ── Execution Mode — Mode selection & configuration ────────────────────
-// Default mode is fully backward-compatible. Token-efficient and simple
-// modes reduce Codex review calls without lowering quality gates.
+// Explicit "default" mode is fully backward-compatible. Project configuration
+// defaults to token-efficient; both token-efficient and simple preserve gates.
 
 import type { ExecutionMode } from '../types/m2-types.js';
 import type { StructuredPlan } from '../types/m2-types.js';
@@ -61,7 +61,7 @@ export function selectExecutionMode(plan: StructuredPlan): ExecutionModeConfig {
     return {
       mode: 'simple',
       autoSelected: true,
-      selectionReason: `小任务（${taskCount} tasks, ${writePaths} write paths, risk=${maxRiskAny}），绕过编排以避免额外 Codex 开销`,
+      selectionReason: `小任务（${taskCount} tasks, ${writePaths} write paths, risk=${maxRiskAny}），精简逐任务审查以避免额外 Codex 开销`,
     };
   }
 
@@ -90,7 +90,7 @@ export function resolveExecutionMode(
   config: Partial<SchedulerConfig>,
   plan?: StructuredPlan,
 ): ExecutionModeConfig {
-  if (config.executionMode && config.executionMode !== 'default') {
+  if (config.executionMode) {
     return {
       mode: config.executionMode,
       autoSelected: false,
@@ -103,9 +103,9 @@ export function resolveExecutionMode(
   }
 
   return {
-    mode: 'default',
+    mode: 'token-efficient',
     autoSelected: true,
-    selectionReason: '无计划可用，回退到 default 模式',
+    selectionReason: '无显式模式或计划，使用 token-efficient 安全默认值',
   };
 }
 

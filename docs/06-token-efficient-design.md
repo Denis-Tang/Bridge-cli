@@ -1,6 +1,8 @@
 # Token-Efficient Execution Mode — Design Contract
 
-版本：0.1.0 | 日期：2026-07-27 | 状态：Draft
+版本：0.1.0 | 日期：2026-07-27 | 状态：历史 Draft（仅设计参考）
+
+> 当前可审计行为以 `TOKEN-EFFICIENT-CONTRACT.md`、源码和测试为准。本文件保留最初设计思路，不维护源码行号、当前测试总数或最终运行准入结论。
 
 ## 1. 概述
 

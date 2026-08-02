@@ -3,6 +3,8 @@
   "projectId": "",
   "projectRoot": ".",
   "defaultBaseBranch": "main",
+  "executionMode": "token-efficient",
+  "costBudget": null,
   "qualityGates": {},
   "forbiddenPaths": [".env", ".env.*", "**/*secret*", "**/*key*"]
 }

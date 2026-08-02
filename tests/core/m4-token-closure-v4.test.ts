@@ -197,13 +197,13 @@ describe('M4 v4 — Hard Pause & Governance Regression', () => {
         id: runId + '-ev-pre-block', runId, stageId, eventType: 'token_budget_exceeded',
         eventData: { policyType: 'pi_attempt', remaining: pre.remaining, limit: pre.limit },
       });
-      await store.createEvent({
-        id: runId + '-ev-pre-pause', runId, stageId, eventType: 'stage_paused',
-        eventData: { reason: 'token_budget_exceeded', policyType: 'pi_attempt' },
+      // Pause the stage through the same atomic PauseRecord path used by the scheduler.
+      const pauseId = runId + '-pause-budget';
+      await store.createStagePause({
+        id: pauseId, eventId: runId + '-ev-pre-pause', runId, stageId,
+        reasonCode: 'token_budget_exceeded', category: 'budget', recoverable: true,
+        evidenceSummary: 'synthetic-budget-test', eventData: { policyType: 'pi_attempt' }, createdAt: now,
       });
-
-      // Pause the stage (simulating scheduler pause), then resume
-      await store.updateStageStatus(stageId, 'paused', now);
 
       const pausedBefore = await store.listEvents(runId, 'stage_paused');
       expect(pausedBefore.length).toBeGreaterThanOrEqual(1);
@@ -232,8 +232,10 @@ describe('M4 v4 — Hard Pause & Governance Regression', () => {
         eventData: { policyType: 'pi_attempt', newLimit: 50000 },
       });
 
-      // Unpause stage
-      await store.updateStageStatus(stageId, 'pending', now);
+      // Unpause stage through exact pause confirmation semantics.
+      await expect(store.resolveStagePause({
+        pauseId, stageId, resolutionNote: 'test budget raised', resolvedAt: new Date().toISOString(),
+      })).resolves.toBe(true);
 
       // Re-run scheduler — should now dispatch
       await scheduler.startRun(runId);

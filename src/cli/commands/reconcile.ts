@@ -43,7 +43,9 @@ export const reconcileCommand = new Command('reconcile')
   .argument('[run-id]', 'Run ID (omit for all non-terminal runs)')
   .option('--apply', 'Apply safe, provable state convergence (write SQLite)')
   .option('--json', 'Output reconciliation report as JSON')
-  .action(async (runIdArg?: string, options?: { apply?: boolean; json?: boolean }) => {
+  .option('--project <path>', 'Project root used to resolve the default database path')
+  .option('--db <path>', 'SQLite state database path; overrides BRAINCTL_SQLITE_PATH')
+  .action(async (runIdArg?: string, options?: { apply?: boolean; json?: boolean; project?: string; db?: string }) => {
     const isApply = options?.apply === true;
     const isJson = options?.json === true;
     const phase: ReconciliationPhase = isApply ? 'applied' : 'dry_run';
@@ -56,7 +58,7 @@ export const reconcileCommand = new Command('reconcile')
     }
 
     try {
-      const config = readSqliteConfigFromEnv();
+      const config = readSqliteConfigFromEnv(options?.project, options?.db);
       const store = SqliteStateStore.create(config.path);
 
       // ── Schema readiness check (read-only) ──
@@ -113,6 +115,9 @@ export const reconcileCommand = new Command('reconcile')
       }
 
       for (const runId of runIds) {
+        if (isApply && store.reconcileStaleCostReservations) {
+          await store.reconcileStaleCostReservations(runId, new Date().toISOString());
+        }
         // Gather facts for this run
         const facts = await gatherRunFacts(store, gatherer, runId);
 
@@ -199,6 +204,8 @@ async function gatherRunFacts(
   // Stage facts
   const stages = await store.listStages(runId);
   const events = await store.listEvents(runId);
+  const activeRunLocks = (await store.getActiveLocksForRun(runId))
+    .filter((lock) => lock.status === 'locked');
   const governance = runFacts.governanceEnabled
     ? await gatherGovernanceFacts(store, runId)
     : undefined;
@@ -211,6 +218,11 @@ async function gatherRunFacts(
     for (const task of tasks) {
       const attempts = await store.listAttempts(task.id);
       const attemptFacts: AttemptFacts[] = [];
+      const latestAttemptId = attempts.reduce<string | null>((latestId, candidate) => {
+        if (!latestId) return candidate.id;
+        const latest = attempts.find((attempt) => attempt.id === latestId);
+        return !latest || candidate.attemptNumber > latest.attemptNumber ? candidate.id : latestId;
+      }, null);
 
       for (const attempt of attempts) {
         // PID check
@@ -284,18 +296,15 @@ async function gatherRunFacts(
           changedPath === expectedPath || changedPath.startsWith(expectedPath.endsWith('/') ? expectedPath : expectedPath + '/'),
         ));
 
-        // Locks held by this attempt's task
-        const locks = await store.getActiveLocksForRun(runId);
-        const taskLocks = locks.filter((l) => l.taskId === attempt.taskId && l.status === 'locked');
-        const locksHeld = taskLocks.length;
-
-        // Lock orphan check: are all of this task's locks safely releasable?
-        const locksOrphaned = taskLocks.some((l) => {
-          // Check if the owning attempt (if identifiable) is terminal
-          // Since locks use deterministic IDs based on run/task/path,
-          // we consider them orphaned if the current attempt is not running
-          return attempt.status !== 'running';
-        });
+        // Locks are task-scoped in SQLite and reused across attempts. Attribute
+        // them only to the latest attempt; older failed/interrupted attempts do
+        // not become owners merely because they share the same task id.
+        const taskLocks = activeRunLocks.filter((lock) => lock.taskId === attempt.taskId);
+        const ownsTaskLocks = attempt.id === latestAttemptId;
+        const locksHeld = ownsTaskLocks ? taskLocks.length : 0;
+        const locksOrphaned = ownsTaskLocks
+          && taskLocks.length > 0
+          && isLockOwnerStatusOrphaned(attempt.status);
 
         // Review check
         const reviews = await store.listReviewsByTask(attempt.taskId);
@@ -314,6 +323,10 @@ async function gatherRunFacts(
           stageId: attempt.stageId,
           pid: attempt.piPid,
           pidAlive,
+          dispatchLeaseExpiresAt: findAttemptLeaseExpiry(events, attempt.id),
+          spawnEventObserved: events.some((event) => event.attemptId === attempt.id && event.eventType === 'attempt_started'
+            && parseEventReason(event.eventDataJson) !== 'retry_scheduled'),
+          attemptUpdatedAt: attempt.updatedAt,
           worktreePath,
           worktreeExists,
           worktreeRegistered,
@@ -374,37 +387,6 @@ async function gatherRunFacts(
         targetMergeCommit: batch.targetMergeCommit,
       };
     }
-    const locks = await store.getActiveLocksForRun(runId);
-    const lockFacts: LockFacts[] = [];
-    for (const lock of locks) {
-      if (lock.status !== 'locked') continue;
-      // Find owning attempt
-      let ownerAttemptId: string | null = null;
-      let ownerAttemptStatus: string | null = null;
-      let ownerPidAlive: 'alive' | 'gone' | 'unknown' | 'n/a' = 'n/a';
-
-      // Try to find attempt by task
-      const taskAttempts = taskFacts.flatMap((t) => t.attempts);
-      const matchingAttempt = taskAttempts.find((a) => a.taskId === lock.taskId);
-      if (matchingAttempt) {
-        ownerAttemptId = matchingAttempt.attemptId;
-        ownerAttemptStatus = matchingAttempt.status;
-        ownerPidAlive = matchingAttempt.pidAlive;
-      }
-
-      lockFacts.push({
-        lockId: lock.id,
-        filePathHash: hashProjectRoot(lock.filePath),
-        taskId: lock.taskId,
-        lockType: lock.lockType,
-        lockStatus: lock.status,
-        ownerAttemptId,
-        ownerAttemptStatus,
-        ownerPidAlive,
-        ownerRunStatus: runFacts.runStatus,
-      });
-    }
-
     stageFacts.push({
       stageId: stage.id,
       stageNumber: stage.stageNumber,
@@ -412,7 +394,30 @@ async function gatherRunFacts(
       baseCommit: stage.baseCommit,
       tasks: taskFacts,
       integration: integrationFacts,
-      activeLocks: lockFacts,
+      activeLocks: [],
+    });
+  }
+
+  // A task-scoped lock belongs to exactly one stage. Attach it to the stage
+  // containing that task and select the latest attempt as its current owner.
+  // Unknown task ownership remains fail-closed, but is reported only once.
+  for (const lock of activeRunLocks) {
+    const ownerStage = stageFacts.find((stage) =>
+      stage.tasks.some((task) => task.taskId === lock.taskId));
+    const reportStage = ownerStage ?? stageFacts[0];
+    if (!reportStage) continue;
+    const ownerTask = ownerStage?.tasks.find((task) => task.taskId === lock.taskId);
+    const matchingAttempt = selectLatestAttemptForLock(ownerTask?.attempts ?? []);
+    reportStage.activeLocks.push({
+      lockId: lock.id,
+      filePathHash: hashProjectRoot(lock.filePath),
+      taskId: lock.taskId,
+      lockType: lock.lockType,
+      lockStatus: lock.status,
+      ownerAttemptId: matchingAttempt?.attemptId ?? null,
+      ownerAttemptStatus: matchingAttempt?.status ?? null,
+      ownerPidAlive: matchingAttempt?.pidAlive ?? 'n/a',
+      ownerRunStatus: runFacts.runStatus,
     });
   }
 
@@ -421,6 +426,43 @@ async function gatherRunFacts(
     stages: stageFacts,
     governance,
   };
+}
+
+function findAttemptLeaseExpiry(events: Awaited<ReturnType<SqliteStateStore['listEvents']>>, attemptId: string): string | null {
+  const lease = events.filter((event) => event.attemptId === attemptId && event.eventType === 'attempt_dispatch_lease').at(-1);
+  if (!lease?.eventDataJson) return null;
+  try {
+    const parsed = JSON.parse(lease.eventDataJson) as { leaseExpiresAt?: unknown };
+    return typeof parsed.leaseExpiresAt === 'string' ? parsed.leaseExpiresAt : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseEventReason(eventDataJson: string | null): string | null {
+  if (!eventDataJson) return null;
+  try {
+    const parsed = JSON.parse(eventDataJson) as { reason?: unknown };
+    return typeof parsed.reason === 'string' ? parsed.reason : null;
+  } catch {
+    return null;
+  }
+}
+
+const INTENTIONAL_LOCK_OWNER_STATUSES = new Set([
+  'running',
+  'worker_completed',
+  'validating',
+  'reviewing',
+]);
+
+export function isLockOwnerStatusOrphaned(status: string): boolean {
+  return !INTENTIONAL_LOCK_OWNER_STATUSES.has(status);
+}
+
+export function selectLatestAttemptForLock(attempts: AttemptFacts[]): AttemptFacts | null {
+  return attempts.reduce<AttemptFacts | null>((latest, candidate) =>
+    !latest || candidate.attemptNumber > latest.attemptNumber ? candidate : latest, null);
 }
 
 function getChangedFiles(projectRoot: string, baseCommit: string, branchName: string): string[] {
@@ -535,6 +577,24 @@ export async function runPreflightReconciliation(
 
   const { findings } = converge(facts, govEnabled, 'dry_run', initiatedBy);
   return findings;
+}
+
+export async function runAutomaticReconciliation(
+  store: SqliteStateStore,
+  runId: string,
+): Promise<{ findings: Finding[]; appliedCount: number }> {
+  const staleCostSettled = store.reconcileStaleCostReservations
+    ? await store.reconcileStaleCostReservations(runId, new Date().toISOString())
+    : 0;
+  const gatherer = new DefaultFactGatherer();
+  const facts = await gatherRunFacts(store, gatherer, runId);
+  const run = await store.getRun(runId);
+  resetGovernanceConfigCache();
+  const govEnabled = run ? getGovernanceConfig(run.projectRoot).enabled : false;
+  const { findings, safeActions, report } = converge(facts, govEnabled, 'dry_run', 'scheduler');
+  if (safeActions.length === 0) return { findings, appliedCount: staleCostSettled };
+  const applied = await applySafeActions(store, report, findings, safeActions);
+  return { findings: applied.report.findings, appliedCount: applied.atomicResult.appliedCount + staleCostSettled };
 }
 
 /**

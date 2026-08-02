@@ -9,7 +9,7 @@ import {
   type BenchmarkContext,
 } from '../helpers/benchmark-fixtures.js';
 import { selectExecutionMode, resolveExecutionMode } from '../../src/core/execution-mode.js';
-import { shouldDoTaskLevelReview, shouldDoStageLevelReview, isUpgradeNeeded } from '../../src/core/review-granularity.js';
+import { shouldDoTaskLevelReview } from '../../src/core/review-granularity.js';
 import { ReviewResultCache, computeReviewCacheKey, ReviewCacheKey } from '../../src/core/review-cache.js';
 import type { StructuredTaskSpec, StructuredPlan } from '../../src/types/m2-types.js';
 
@@ -23,6 +23,7 @@ describe('06-MODE — Token-Efficient Core', () => {
     const ctx = await setupBenchmark(CORRECT_DAG, 4, 'mode01', {
       piDelayMs: 100,
       codexDelayMs: 30,
+      executionMode: 'token-efficient',
     });
     try {
       // Override the scheduler's mode — inject token-efficient
@@ -34,10 +35,7 @@ describe('06-MODE — Token-Efficient Core', () => {
 
       console.log(`[MODE-01] Tasks: ${tasks.length}, Codex review calls: ${codexReviewCalls}`);
 
-      // In default mode (which is what default config uses), all tasks get per-task review
-      // = 8 per-task reviews. This test documents the baseline.
-      // When we inject token-efficient mode, we expect fewer.
-      expect(codexReviewCalls).toBeGreaterThan(0);
+      expect(codexReviewCalls).toBe(1);
     } finally {
       await teardownBenchmark(ctx);
     }
@@ -49,10 +47,9 @@ describe('06-MODE — Token-Efficient Core', () => {
     const ctx = await setupBenchmark(CORRECT_DAG, 4, 'mode02', {
       piDelayMs: 100,
       codexDelayMs: 30,
+      executionMode: 'token-efficient',
     });
     try {
-      // Note: setupBenchmark uses default mode. To test token-efficient explicitly,
-      // we'd need to inject executionMode. For now, test with default and document.
       await ctx.scheduler.startRun(ctx.runId);
 
       const events = await ctx.store.listEvents(ctx.runId);
@@ -63,9 +60,9 @@ describe('06-MODE — Token-Efficient Core', () => {
       console.log(`[MODE-02] stage_review events: ${stageReviewEvents.length}`);
       console.log(`[MODE-02] Codex review calls: ${ctx.codexRunner.calls}`);
 
-      // In default mode, no skipped reviews expected yet
-      // This test validates the event system is working
-      expect(skippedEvents.length).toBeGreaterThanOrEqual(0);
+      expect(skippedEvents.length).toBe(CORRECT_DAG.length);
+      expect(stageReviewEvents.length).toBe(2);
+      expect(ctx.codexRunner.calls).toBe(1);
     } finally {
       await teardownBenchmark(ctx);
     }
@@ -87,15 +84,54 @@ describe('06-MODE — Token-Efficient Core', () => {
     expect(result, 'high risk should get per-task review').toBe(true);
   });
 
-  it('MODE-04: stage review failure triggers upgrade', { timeout: 10000 }, async () => {
-    const needsUpgrade = isUpgradeNeeded(false, 3);
-    expect(needsUpgrade, 'failed stage review with skipped tasks needs upgrade').toBe(true);
+  it('MODE-04: failed final review blocks the next stage and leaves skipped tasks retryable', { timeout: 60000 }, async () => {
+    const ctx = await setupBenchmark(CORRECT_DAG, 4, 'mode04b', {
+      piDelayMs: 20,
+      codexDelayMs: 1,
+      executionMode: 'token-efficient',
+    });
+    try {
+      const now = new Date().toISOString();
+      const stage2Id = `${ctx.runId}-s2`;
+      await ctx.store.createStage({ id: stage2Id, runId: ctx.runId, stageNumber: 2, title: 'S2', status: 'pending' });
+      const stage2Spec: StructuredTaskSpec = {
+        taskId: 'T9', stageNumber: 2, title: 'Must not start', goal: 'Must not start before stage 1 passes',
+        dependencies: [], estimatedWritePaths: ['src/stage2.ts'], allowedPaths: ['src/'], forbiddenPaths: [],
+        contextFiles: [], acceptanceChecks: ['noop'], allowedCommands: ['node -e process.exit(0)'],
+        riskLevel: 'low', productDecisionsLocked: true, expectedOutputs: ['src/stage2.ts'],
+        heavyCommandSlotsRequired: 0, timeoutSeconds: 60,
+      };
+      await ctx.store.createTask({ id: 'T9', runId: ctx.runId, title: stage2Spec.title, status: 'pending', specJson: stage2Spec, createdAt: now, updatedAt: now });
 
-    const noUpgrade = isUpgradeNeeded(true, 3);
-    expect(noUpgrade, 'passed stage review needs no upgrade').toBe(false);
+      ctx.codexRunner.run = async () => {
+        ctx.codexRunner.calls++;
+        return {
+          stdout: '- issue: integrated behavior is incorrect and must be fixed',
+          stderr: '', exitCode: 0, durationMs: 1,
+          tokenUsage: { inputTokens: 200, outputTokens: 80, cacheHitTokens: 0 },
+        };
+      };
 
-    const noSkipped = isUpgradeNeeded(false, 0);
-    expect(noSkipped, 'no skipped tasks needs no upgrade').toBe(false);
+      await ctx.scheduler.startRun(ctx.runId);
+
+      const stages = await ctx.store.listStages(ctx.runId);
+      expect(stages.find((stage) => stage.id === ctx.stageId)?.status).toBe('paused');
+      expect(stages.find((stage) => stage.id === stage2Id)?.status).toBe('pending');
+      expect(ctx.piRunner.taskIds).not.toContain('T9');
+
+      const attempts = await ctx.store.listAttemptsByStage(ctx.stageId);
+      expect(attempts).toHaveLength(CORRECT_DAG.length);
+      expect(attempts.every((attempt) => attempt.status === 'rework_required')).toBe(true);
+      expect(attempts.every((attempt) => attempt.exitReason?.startsWith('stage_review_failed:'))).toBe(true);
+
+      const batches = await ctx.store.listIntegrationBatches(ctx.stageId);
+      expect(batches).toHaveLength(1);
+      expect(batches[0].status).toBe('failed');
+      expect(batches[0].targetMergeCommit).toBeNull();
+      expect((await ctx.store.getRun(ctx.runId))?.status).not.toBe('completed');
+    } finally {
+      await teardownBenchmark(ctx);
+    }
   });
 });
 
@@ -108,6 +144,7 @@ describe('06-MODE — Resume & Retry', () => {
     const ctx = await setupBenchmark(CORRECT_DAG, 4, 'mode05', {
       piDelayMs: 100,
       codexDelayMs: 30,
+      executionMode: 'token-efficient',
     });
     try {
       await ctx.scheduler.startRun(ctx.runId);
@@ -121,6 +158,7 @@ describe('06-MODE — Resume & Retry', () => {
 
       // In default mode, all tasks should merge (CORRECT_DAG has no conflicts)
       expect(mergedTasks.length, 'all tasks should merge in correct DAG').toBe(CORRECT_DAG.length);
+      expect(ctx.codexRunner.calls).toBe(1);
     } finally {
       await teardownBenchmark(ctx);
     }
@@ -329,7 +367,7 @@ describe('06-BENCH — A/B Token Comparison', () => {
     expect(results.length).toBe(3);
   });
 
-  it('BENCH-03: A/B comparison — Codex calls and wall time', { timeout: 30000 }, async () => {
+  it('BENCH-03: A/B comparison — Codex calls and wall time', { timeout: 60000 }, async () => {
     const seq = await runSequentialBaseline(CORRECT_DAG);
     const seqPi = seq.piCalls;
     const seqCodex = seq.codexCalls;
@@ -350,32 +388,23 @@ describe('06-BENCH — A/B Token Comparison', () => {
     // Orchestrated wall time should be lower (parallel execution)
     expect(orchWall, 'orchestrated wall time should be less than sequential').toBeLessThan(seqWall);
 
-    // Pi calls should be same (same tasks) or slightly different
-    expect(orchPi, 'orchestrated Pi calls').toBeGreaterThanOrEqual(CORRECT_DAG.length);
+    // Same fake workload: only the review structure changes.
+    expect(orchPi, 'orchestrated Pi calls').toBe(seqPi);
+    expect(orchCodex, 'token-efficient Codex calls').toBeLessThan(seqCodex);
 
     await teardownBenchmark(orch.ctx);
   });
 
-  it('BENCH-04: Codex token efficiency report', { timeout: 30000 }, () => {
-    // Document the expected savings for the real A/B test.
-    // In token-efficient mode, Codex input should drop by ≥30% for low-risk DAGs.
-    // This test captures the framework for the real measurement.
+  it('BENCH-04: synthetic call-structure calculator is not Provider token evidence', { timeout: 30000 }, () => {
+    const syntheticStructure = {
+      synthetic: true as const,
+      defaultPerTaskReviews: CORRECT_DAG.length,
+      tokenEfficientStageReviews: 1,
+    };
 
-    const targetReduction = 0.30; // 30% reduction target
-    const mockBaselineCodexInput = 1600; // 8 tasks × 200 input tokens
-    const mockTokenEfficientCodexInput = 400; // 1 stage review × 200 + overhead
-
-    const actualReduction = (mockBaselineCodexInput - mockTokenEfficientCodexInput) / mockBaselineCodexInput;
-    console.log(`[BENCH-04] Codex input reduction: ${(actualReduction * 100).toFixed(1)}%`);
-
-    if (actualReduction >= targetReduction) {
-      console.log('[BENCH-04] PASS: Codex input reduction ≥ 30%');
-    } else {
-      console.log('[BENCH-04] FAIL: Codex input reduction < 30%');
-    }
-
-    // The actual measurement must come from real or fake A/B runs
-    expect(actualReduction).toBeGreaterThanOrEqual(targetReduction);
+    console.log('[BENCH-04] synthetic scheduling structure only; no Provider token percentage is claimed');
+    expect(syntheticStructure.synthetic).toBe(true);
+    expect(syntheticStructure.tokenEfficientStageReviews).toBeLessThan(syntheticStructure.defaultPerTaskReviews);
   });
 });
 

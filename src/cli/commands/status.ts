@@ -15,8 +15,10 @@ export const statusCommand = new Command('status')
   .description('查看当前运行状态')
   .argument('[run-id]', '可选的 run ID，查看指定 run 的详情')
   .option('--json', '以 JSON 格式输出状态快照')
-  .action(async (runId?: string, options?: { json?: boolean }) => {
-    const config = readSqliteConfigFromEnv();
+  .option('--project <path>', '项目根目录；用于解析默认数据库路径')
+  .option('--db <path>', 'SQLite 状态库路径；优先于 BRAINCTL_SQLITE_PATH')
+  .action(async (runId?: string, options?: { json?: boolean; project?: string; db?: string }) => {
+    const config = readSqliteConfigFromEnv(options?.project, options?.db);
 
     if (!existsSync(config.path)) {
       if (options?.json) {
@@ -39,14 +41,14 @@ export const statusCommand = new Command('status')
         // ── JSON mode: build full StatusSnapshot ──
         const sampler = createSafeSampler();
         const snapshot = await buildStatusSnapshot(
-          { store, sampler, userMaxParallel: 4 },
+          { store, sampler, userMaxParallel: 4, dbPath: config.path },
           runId || null,
         );
         console.log(JSON.stringify(snapshot, null, 2));
       } else if (runId) {
         // ── Human mode: run detail with resource line ──
         await showResourceLineSafely();
-        await showRunDetail(store, runId);
+        await showRunDetail(store, runId, config.path);
       } else {
         // ── Human mode: summary with resource line ──
         await showResourceLineSafely();
@@ -162,7 +164,7 @@ async function showSummary(store: SqliteStateStore): Promise<void> {
 
 // ── Run detail (M2 compatible, extended with event timeline) ──────────
 
-async function showRunDetail(store: SqliteStateStore, runId: string): Promise<void> {
+async function showRunDetail(store: SqliteStateStore, runId: string, dbPath: string): Promise<void> {
   const run = await store.getRun(runId);
   if (!run) {
     console.log('  x Run ' + runId + ' 不存在。');
@@ -205,6 +207,7 @@ async function showRunDetail(store: SqliteStateStore, runId: string): Promise<vo
           }
           if (att.worktreePath) console.log('         worktree: ' + att.worktreePath);
           if (att.exitReason) console.log('         exit: ' + att.exitReason);
+          if (att.resultSource !== 'pi') console.log('         source: ' + att.resultSource + (att.adoptedCommit ? ' (' + att.adoptedCommit + ')' : ''));
           if (att.startedAt) console.log('         started: ' + att.startedAt);
           if (att.stoppedAt) console.log('         stopped: ' + att.stoppedAt);
         }
@@ -229,8 +232,54 @@ async function showRunDetail(store: SqliteStateStore, runId: string): Promise<vo
           console.log('       integration: ' + batch.status + ' (branch: ' + batch.integrationBranch + ')');
           if (batch.mergeCommitHash) console.log('         commit: ' + batch.mergeCommitHash);
           if (batch.conflictsJson) console.log('         conflicts: ' + batch.conflictsJson);
+          console.log('         review coverage: ' + batch.reviewCoverageStatus + (batch.reviewedThroughCommit ? ' through ' + batch.reviewedThroughCommit : ''));
         }
       }
+    }
+  }
+
+  const costEntries = await store.listCostReservations(runId);
+  if (costEntries.length > 0) {
+    const latest = costEntries[costEntries.length - 1];
+    // written_off is an explicit budget release — it must NOT count as committed.
+    const committed = costEntries.reduce((sum, entry) => sum + (entry.status === 'confirmed' && entry.actualCost != null ? entry.actualCost : entry.status === 'released' || entry.status === 'written_off' ? 0 : entry.reservedCost), 0);
+    const byStatus = (status: string, phase?: string) => costEntries
+      .filter((e) => e.status === status && (phase === undefined || e.phase === phase))
+      .reduce((sum, e) => sum + e.reservedCost, 0);
+    const settledCost = costEntries
+      .filter((e) => e.status === 'confirmed')
+      .reduce((sum, e) => sum + (e.actualCost ?? 0), 0);
+    const parts = [
+      `金额: ${committed}/${latest.budgetLimit} ${latest.currency}`,
+      `reserved ${byStatus('reserved', 'reserved')}`,
+      `spawned ${byStatus('reserved', 'spawned')}`,
+      `unavailable ${byStatus('unavailable')}`,
+      `written_off ${byStatus('written_off')}`,
+      `settled ${settledCost}`,
+    ];
+    console.log(`  ${parts.join(' ｜ ')}`);
+  }
+  // R3: guard self-check audit — latest outcome for this run.
+  const selfChecks = (await store.listEvents(runId, 'pi_guard_selfcheck')).slice(-1);
+  if (selfChecks.length > 0) {
+    try {
+      const data = JSON.parse(selfChecks[0].eventDataJson || '{}') as Record<string, unknown>;
+      const ok = data.ok === true;
+      const version = data.piVersion ?? 'unknown';
+      const verified = data.verifiedPiVersion ?? 'unknown';
+      const drift = data.versionMismatch === true;
+      const cat = data.failureCategory ? `（${data.failureCategory}）` : '';
+      console.log(`  guard 自检: ${ok ? '通过' : 'FAILED'} · pi ${version}${drift ? ` ≠ 已验证 ${verified}（版本漂移）` : ''}${cat}`);
+    } catch { /* unparsable event is not fatal */ }
+  }
+
+  const pausedForResume = stages.find((stage) => stage.status === 'paused');
+  if (pausedForResume) {
+    const activePause = await store.getActivePauseForStage(pausedForResume.id);
+    const confirmation = activePause ? ` --confirm-pause ${activePause.id}` : '';
+    console.log(`  下一步: brainctl resume ${runId}${confirmation} --allow-real-project --db "${dbPath}"`);
+    if (!activePause) {
+      console.log('  ! 该暂停阶段缺少活动 PauseRecord；resume 将 fail closed，请先执行 reconcile 诊断。');
     }
   }
 

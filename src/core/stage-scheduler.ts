@@ -1,23 +1,25 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, relative, isAbsolute } from 'node:path';
 import type { StateStore } from '../state/state-store.js';
-import type { PathLockRecord, StageRecord, StructuredTaskSpec } from '../types/m2-types.js';
+import type { AttemptRecord, PathLockRecord, StageRecord, StructuredTaskSpec } from '../types/m2-types.js';
 import type { WorkerResult, ReviewResult } from '../types/protocol.js';
-import type { ResourceSampler, ResourceSample, BudgetState } from '../types/m3-types.js';
-import { computeBudget, deriveHardCap } from '../types/m3-types.js';
-import { canTransitionStage } from './state-machine.js';
+import type { ResourceSampler } from '../types/m3-types.js';
+import type { CostBudgetConfig, CallType } from '../types/m4-types.js';
 import { WorktreeManager } from '../git/worktree-manager.js';
 import { DiffScopeValidator } from '../git/diff-scope-validator.js';
-import { QualityGateRunner, type QualityGateConfig } from '../quality/quality-gate-runner.js';
+import type { QualityGateConfig } from '../quality/quality-gate-runner.js';
 import { PiRpcWorker } from '../adapters/pi-rpc-worker.js';
-import { CodexCliReviewer } from '../adapters/codex-cli-reviewer.js';
 import { CodexTechnicalClarifier } from '../adapters/codex-technical-clarifier.js';
-import { LocalRuleReviewer } from '../adapters/local-rule-reviewer.js';
 import { PrivacyService } from '../privacy/privacy-service.js';
 import type { PiWorkerConfig } from '../adapters/pi-worker-types.js';
 import { NoopResourceSampler } from './resource-sampler.js';
+import { BudgetTracker } from './budget-tracker.js';
+export { ConvergenceTimeoutError } from './budget-tracker.js';
+import { StageIntegrationCoordinator } from './stage-integration.js';
+import { PostWorkerHandler } from './post-worker-handler.js';
+import { startCostReservationHeartbeat, stopCostReservationHeartbeat } from './cost-heartbeat.js';
 import type { WorkerConfig, ReviewerConfig } from '../adapters/project-adapter.js';
 // ── M4 Governance imports ──
 import { getGovernanceConfig, resetGovernanceConfigCache } from './decision-gate.js';
@@ -26,12 +28,30 @@ import { checkScopeExpansion } from './scope-guard.js';
 import { checkRetryBudget, shouldRetry, maxAllowedAttempts } from './retry-policy.js';
 import { estimatePiWorkerTokens } from './token-ledger.js';
 import { resolveExecutionMode, isTokenEfficientMode, type ExecutionModeConfig } from './execution-mode.js';
-import { shouldDoTaskLevelReview } from './review-granularity.js';
 import { ReviewResultCache } from './review-cache.js';
-import { runStageReview, prepareStageReviewInput } from './stage-review.js';
+import { assessStageReviewInputCoverage, runStageReview, prepareStageReviewInput, type StageReviewInputLimits } from './stage-review.js';
 import { preCheckBudget, postCheckBudget, isBudgetPaused } from './token-budget.js';
 import { ensureDefaultPolicies } from './budget-policy-store.js';
 import { SqliteLedgerSink } from './token-telemetry.js';
+import { buildMinimalTaskPacket, buildRetryPacket } from '../adapters/task-packet-builder.js';
+import { buildPiWorkerMinimalPrompt, buildPiWorkerRetryPrompt, buildPiWorkerPrompt } from '../adapters/pi-worker-prompt.js';
+import { pauseStage } from './pause-service.js';
+import type { PauseCategory, PauseRecord } from '../types/pause-types.js';
+import { runAutomaticReconciliation } from '../cli/commands/reconcile.js';
+import { tasksHaveSerialOwnership } from './path-ownership.js';
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, nested]) => `${JSON.stringify(key)}:${canonicalJson(nested)}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
 
 function git(cwd: string, args: string[]): string {
   return execFileSync('git', args, {
@@ -41,466 +61,47 @@ function git(cwd: string, args: string[]): string {
   }).trim();
 }
 
-// ══════════════════════════════════════════════════════════════
-// Convergence timeout — structured error for fail-closed propagation
-// ══════════════════════════════════════════════════════════════
-
-export class ConvergenceTimeoutError extends Error {
-  public readonly details: {
-    pendingCount: number;
-    runId: string;
-    stageId?: string;
-    totalElapsedMs: number;
-  };
-
-  constructor(message: string, details: { pendingCount: number; runId: string; stageId?: string; totalElapsedMs: number }) {
-    super(message);
-    this.name = 'ConvergenceTimeoutError';
-    this.details = details;
+function classifyPauseReason(
+  reasonCode: string,
+  eventData: Record<string, unknown> | undefined,
+): { category: PauseCategory; requiredApprovalType: string | null } {
+  const failureCategory = String(eventData?.failureCategory ?? '');
+  if (reasonCode.includes('scope') || failureCategory === 'scope') {
+    return { category: 'scope', requiredApprovalType: 'scope_expansion' };
   }
+  if (reasonCode.includes('privacy') || failureCategory === 'privacy') {
+    return { category: 'privacy', requiredApprovalType: 'privacy_override' };
+  }
+  if (reasonCode.includes('security') || failureCategory === 'security') {
+    return { category: 'security', requiredApprovalType: 'security_override' };
+  }
+  if (reasonCode.includes('product_decision') || failureCategory === 'product_decision') {
+    return { category: 'product_decision', requiredApprovalType: 'product_decision' };
+  }
+  if (reasonCode.includes('requirement') || failureCategory === 'requirement_choice') {
+    return { category: 'requirement_choice', requiredApprovalType: 'requirement_choice' };
+  }
+  if (reasonCode.includes('budget') || reasonCode.includes('cost')) {
+    return { category: 'budget', requiredApprovalType: 'run_budget' };
+  }
+  if (reasonCode.includes('reviewer') || reasonCode.includes('review_')) {
+    return { category: 'reviewer', requiredApprovalType: null };
+  }
+  if (reasonCode.includes('integration') || reasonCode.includes('merge') || reasonCode.includes('conflict')) {
+    return { category: 'integration', requiredApprovalType: null };
+  }
+  if (reasonCode.includes('recovery') || reasonCode.includes('resume_')) {
+    return { category: 'recovery', requiredApprovalType: null };
+  }
+  if (reasonCode.includes('quality') || reasonCode.includes('gate')) {
+    return { category: 'quality', requiredApprovalType: null };
+  }
+  if (reasonCode.includes('retry') || reasonCode.includes('exhausted')) {
+    return { category: 'retry', requiredApprovalType: null };
+  }
+  return { category: 'transient', requiredApprovalType: null };
 }
 
-// ══════════════════════════════════════════════════════════════
-// M3 Budget Tracker — non-blocking, hysteresis-based dispatch
-// ══════════════════════════════════════════════════════════════
-
-class BudgetTracker {
-  // ── Cached budget: sync-read by dispatch loop ──
-  private cache: BudgetState;
-
-  // ── Hysteresis counters ──
-  private consecutiveCpuElevated = 0;  // cpuPressure > 0.85
-  private consecutiveCpuHigh = 0;      // cpuPressure > 0.92
-  private consecutiveSafe = 0;
-  private consecutiveLowPi = 0;
-  private dispatchPaused = false;
-  private pauseReason: string | undefined;
-  private firstSampleDone = false;     // allow initial ramp-up before hysteresis
-
-  // ── Background refresh ──
-  private sampler: ResourceSampler;
-  private store: StateStore;
-  private userMax: number;
-  private hardCap: number;
-  private samplingIntervalMs: number;
-  private refreshPromise: Promise<void> | null = null;
-  private refreshTimer: ReturnType<typeof setTimeout> | null = null;
-  private runId: string;
-  private stageId: string;
-  private aborted = false;
-  private stopped = false;
-
-  // ── Pending write tracking: makes fire-and-forget DB ops awaitable for lifecycle convergence ──
-  private pendingWrites: Set<Promise<void>> = new Set();
-  private diagnosticErrors: Array<{ ts: string; kind: string; message: string }> = [];
-
-  constructor(
-    sampler: ResourceSampler,
-    store: StateStore,
-    userMax: number,
-    hardCap: number,
-    samplingIntervalMs: number,
-    runId: string,
-    stageId: string,
-  ) {
-    this.sampler = sampler;
-    this.store = store;
-    this.userMax = userMax;
-    this.hardCap = hardCap;
-    this.samplingIntervalMs = samplingIntervalMs;
-    this.runId = runId;
-    this.stageId = stageId;
-
-    // Safe initial budget: 1 until first sample completes
-    this.cache = {
-      current: 1,
-      userMax,
-      hardCap,
-      dispatchPaused: false,
-    };
-  }
-
-  /** Synchronous — dispatch loop reads this without blocking */
-  getBudget(): BudgetState {
-    return this.cache;
-  }
-
-  /** Start background refresh loop */
-  start(runId: string, stageId: string): void {
-    this.runId = runId;
-    this.stageId = stageId;
-    this.stopped = false;
-    // Kick off the self-scheduling loop
-    this.scheduleNextRefresh();
-  }
-
-  /** Stop background refresh (graceful: allows in-flight refresh to complete) */
-  stop(): void {
-    this.stopped = true;
-    if (this.refreshTimer) {
-      clearTimeout(this.refreshTimer);
-      this.refreshTimer = null;
-    }
-  }
-
-  isPaused(): boolean { return this.dispatchPaused; }
-  getPauseReason(): string | undefined { return this.pauseReason; }
-  hasFirstSample(): boolean { return this.firstSampleDone; }
-
-  /** Update stageId as we move through stages */
-  setStageId(stageId: string): void { this.stageId = stageId; }
-
-  /**
-   * Track a fire-and-forget DB write so lifecycle boundaries can await it.
-   * The promise is removed from the set when it settles (success or failure).
-   * Public so that startRun() can track cleanupResourceSamples.
-   */
-  trackWrite(p: Promise<unknown>): void {
-    const voidP = p.then(() => {});
-    this.pendingWrites.add(voidP);
-    voidP.finally(() => { this.pendingWrites.delete(voidP); });
-  }
-
-  /**
-   * Wait for all currently-pending fire-and-forget DB writes to settle.
-   * Called at lifecycle boundaries (shutdown, fixture close, pre-assertion).
-   *
-   * Uses a proper timeout (default 5000ms). Loops until all pending writes
-   * settle or the deadline is reached — tolerates new writes being added
-   * during convergence (continuous background sampling).
-   * On timeout, throws ConvergenceTimeoutError with diagnostic info.
-   */
-  async awaitIdle(timeoutMs = 5000): Promise<void> {
-    if (this.pendingWrites.size === 0) return;
-
-    const deadline = Date.now() + timeoutMs;
-
-    while (this.pendingWrites.size > 0) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        const pending = [...this.pendingWrites].length;
-        throw new ConvergenceTimeoutError(
-          `BudgetTracker convergence timeout after ${timeoutMs}ms: ${pending} pending writes remain`,
-          { pendingCount: pending, runId: this.runId, stageId: this.stageId || undefined, totalElapsedMs: timeoutMs },
-        );
-      }
-
-      const batch = [...this.pendingWrites];
-      // Race this batch against the remaining time budget.
-      // If the batch completes, loop again (new writes may have been added).
-      // If the batch times out, writes are truly stuck → throw.
-      const result = await Promise.race([
-        Promise.allSettled(batch).then(() => 'settled' as const),
-        new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), remaining)),
-      ]);
-
-      if (result === 'timeout') {
-        const pending = [...this.pendingWrites].length;
-        throw new ConvergenceTimeoutError(
-          `BudgetTracker single-batch timeout after ${timeoutMs}ms: ${pending} writes stuck`,
-          { pendingCount: pending, runId: this.runId, stageId: this.stageId || undefined, totalElapsedMs: timeoutMs },
-        );
-      }
-      // Batch settled — some writes may have resolved, loop to drain remainder
-    }
-  }
-
-  /**
-   * Return a snapshot of buffered diagnostic errors (sampling failures, write errors).
-   * Cleared on read so each caller sees only new entries.
-   */
-  drainDiagnosticErrors(): Array<{ ts: string; kind: string; message: string }> {
-    const copy = [...this.diagnosticErrors];
-    this.diagnosticErrors.length = 0;
-    return copy;
-  }
-
-  // ── Internal ──────────────────────────────────────────────────────
-
-  private scheduleNextRefresh(): void {
-    if (this.stopped) return;
-    // First refresh fires immediately; subsequent ones use samplingIntervalMs
-    const delay = this.firstSampleDone ? this.samplingIntervalMs : 0;
-    this.refreshTimer = setTimeout(() => {
-      this.refreshTimer = null;
-      if (this.stopped) return;
-      this.doRefresh()
-        .catch((err) => {
-          this.diagnosticErrors.push({
-            ts: new Date().toISOString(),
-            kind: 'refresh_exception',
-            message: err instanceof Error ? err.message : String(err),
-          });
-        })
-        .finally(() => {
-          // Self-schedule next refresh
-          this.scheduleNextRefresh();
-        });
-    }, delay);
-  }
-
-  private async doRefresh(): Promise<void> {
-    // 1. Sample (may be slow — but this is the async path, not blocking dispatch)
-    let sample: ResourceSample;
-    try {
-      sample = await this.sampler.sample();
-    } catch {
-      this.applyDegrade('sampling_exception');
-      return;
-    }
-
-    // 2. Record sample to SQLite asynchronously (best-effort, don't await)
-    this.recordSample(sample);
-
-    if (sample.degraded) {
-      this.applyDegrade(sample.degradeReason || 'degraded');
-      return;
-    }
-
-    // 3. Recompute hardCap
-    const hc = deriveHardCap(sample.cpu.cores);
-    if (hc !== this.hardCap) this.hardCap = hc;
-
-    // 4. Compute raw (candidate) budget
-    const raw = computeBudget(sample, this.userMax, this.hardCap);
-
-    // 5. Update hysteresis counters
-    const cpuPressure = sample.cpu.usagePercent / 100;
-    const memPressure = sample.memory.totalMb > 0 ? sample.memory.usagePercent / 100 : 0;
-
-    if (cpuPressure > 0.92) {
-      this.consecutiveCpuHigh++;
-      this.consecutiveCpuElevated++;
-      this.consecutiveSafe = 0;
-      this.consecutiveLowPi = 0;
-    } else if (cpuPressure > 0.85) {
-      this.consecutiveCpuHigh = 0;
-      this.consecutiveCpuElevated++;
-      this.consecutiveSafe = 0;
-      this.consecutiveLowPi = 0;
-    } else {
-      this.consecutiveCpuHigh = 0;
-      this.consecutiveCpuElevated = 0;
-    }
-
-    const isPressured = cpuPressure > 0.80 || memPressure > 0.85
-      || sample.piCount >= this.hardCap * 0.75;
-
-    if (!isPressured) {
-      this.consecutiveSafe++;
-      if (sample.piCount < this.hardCap * 0.5) {
-        this.consecutiveLowPi++;
-      } else {
-        this.consecutiveLowPi = 0;
-      }
-    } else {
-      this.consecutiveSafe = 0;
-      this.consecutiveLowPi = 0;
-    }
-
-    // 6. Apply hysteresis decisions — raw.current is a candidate
-    const prevCached = this.dispatchPaused ? 0 : this.cache.current;
-    let effectiveBudget = this.dispatchPaused ? 0 : this.cache.current;
-    let decisionType: string | undefined;
-    let decisionReason: string | undefined;
-
-    // First successful sample: ramp up from safe budget=1 to raw budget immediately
-    if (!this.firstSampleDone && !this.dispatchPaused) {
-      this.firstSampleDone = true;
-      effectiveBudget = raw.current;
-      if (effectiveBudget !== prevCached) {
-        decisionType = effectiveBudget > prevCached ? 'scale_up' : 'scale_down';
-        decisionReason = 'initial_ramp';
-      }
-    }
-
-    // Pause decisions
-    if (!this.dispatchPaused) {
-      if (this.consecutiveCpuHigh >= 2) {
-        this.dispatchPaused = true;
-        this.pauseReason = `cpu_critical:${(cpuPressure * 100).toFixed(0)}%`;
-        effectiveBudget = 0;
-        decisionType = 'pause';
-        decisionReason = this.pauseReason;
-      } else if (memPressure > 0.90) {
-        this.dispatchPaused = true;
-        this.pauseReason = `mem_critical:${(memPressure * 100).toFixed(0)}%`;
-        effectiveBudget = 0;
-        decisionType = 'pause';
-        decisionReason = this.pauseReason;
-      } else if (sample.piCount >= this.hardCap) {
-        this.dispatchPaused = true;
-        this.pauseReason = `pi_cap:${sample.piCount}/${this.hardCap}`;
-        effectiveBudget = 0;
-        decisionType = 'pause';
-        decisionReason = this.pauseReason;
-      } else if (raw.dispatchPaused) {
-        this.dispatchPaused = true;
-        this.pauseReason = raw.pauseReason || 'budget_paused';
-        effectiveBudget = 0;
-        decisionType = 'pause';
-        decisionReason = this.pauseReason;
-      }
-    }
-
-    // Resume: 2 consecutive safe cycles
-    if (this.dispatchPaused && this.consecutiveSafe >= 2) {
-      this.dispatchPaused = false;
-      this.pauseReason = undefined;
-      this.consecutiveSafe = 0;
-      this.firstSampleDone = false; // allow ramp-up after resume
-      effectiveBudget = raw.current;
-      decisionType = 'resume';
-      decisionReason = 'pressures_normalized';
-    }
-
-    // Scale down: cpu >85% for 3 consecutive cycles → apply raw budget
-    if (!this.dispatchPaused && this.consecutiveCpuElevated >= 3 && !decisionType) {
-      if (raw.current < prevCached && prevCached > 1) {
-        effectiveBudget = raw.current;
-        decisionType = 'scale_down';
-        decisionReason = raw.pauseReason || `cpu_elevated:${(cpuPressure * 100).toFixed(0)}%`;
-      }
-    }
-
-    // Scale up: low Pi + no pressure for 2 cycles → apply raw budget
-    if (!this.dispatchPaused && this.consecutiveLowPi >= 2 && !decisionType) {
-      if (raw.current > prevCached) {
-        effectiveBudget = raw.current;
-        decisionType = 'scale_up';
-        decisionReason = `low_pi:${sample.piCount}/${this.hardCap}`;
-      }
-    }
-
-    // 7. Update cache
-    this.cache = {
-      current: this.dispatchPaused ? 0 : effectiveBudget,
-      userMax: this.userMax,
-      hardCap: this.hardCap,
-      dispatchPaused: this.dispatchPaused,
-      pauseReason: this.dispatchPaused ? this.pauseReason : undefined,
-    };
-
-    // 8. Record decision on change (async, best-effort)
-    if (decisionType) {
-      this.recordDecision(decisionType, decisionReason || '', prevCached, effectiveBudget, sample);
-    }
-  }
-
-  private applyDegrade(reason: string): void {
-    const prev = this.dispatchPaused ? 0 : this.cache.current;
-    if (!this.dispatchPaused || this.cache.current !== 1) {
-      this.recordDecision('degrade', reason, prev, 1, null);
-      this.trackWrite(
-        this.store.createEvent({
-          id: `${this.runId}-ev-degrade-${Date.now()}`,
-          runId: this.runId,
-          stageId: this.stageId,
-          eventType: 'resource_sampling_degraded',
-          eventData: { reason, previousBudget: prev, newBudget: 1 },
-        }).catch((err) => {
-          this.diagnosticErrors.push({
-            ts: new Date().toISOString(),
-            kind: 'degrade_event_write_error',
-            message: err instanceof Error ? err.message : String(err),
-          });
-        }),
-      );
-    }
-
-    this.dispatchPaused = false;
-    this.pauseReason = `degraded: ${reason}`;
-    this.consecutiveCpuElevated = 0;
-    this.consecutiveCpuHigh = 0;
-    this.consecutiveSafe = 0;
-    this.consecutiveLowPi = 0;
-    this.firstSampleDone = false; // allow re-ramp after recovery
-
-    this.cache = {
-      current: 1,
-      userMax: this.userMax,
-      hardCap: this.hardCap,
-      dispatchPaused: false,
-      pauseReason: this.pauseReason,
-    };
-  }
-
-  // ── Async best-effort DB writes (fire-and-forget with pending tracking) ──
-
-  private recordSample(sample: ResourceSample): void {
-    this.trackWrite(
-      this.store.insertResourceSample({
-        id: `${this.runId}-rs-${Date.now()}`,
-        runId: this.runId,
-        timestamp: new Date().toISOString(),
-        cpuPct: sample.cpu.usagePercent,
-        memTotalMb: sample.memory.totalMb,
-        memUsedMb: sample.memory.usedMb,
-        memPct: sample.memory.usagePercent,
-        piActive: sample.piCount,
-        budget: this.dispatchPaused ? 0 : this.cache.current,
-        dispatchPaused: this.dispatchPaused ? 1 : 0,
-        pauseReason: this.pauseReason || null,
-        degraded: sample.degraded ? 1 : 0,
-        degradeReason: sample.degradeReason || null,
-        source: sample.source,
-      }).catch((err) => {
-        this.diagnosticErrors.push({
-          ts: new Date().toISOString(),
-          kind: 'record_sample_write_error',
-          message: err instanceof Error ? err.message : String(err),
-        });
-      }),
-    );
-  }
-
-  private recordDecision(
-    decisionType: string,
-    reason: string,
-    previousBudget: number,
-    newBudget: number,
-    sample: ResourceSample | null,
-  ): void {
-    this.trackWrite(
-      this.store.insertDispatchDecision({
-        id: `${this.runId}-dd-${Date.now()}`,
-        runId: this.runId,
-        timestamp: new Date().toISOString(),
-        decisionType,
-        reason,
-        previousBudget,
-        newBudget,
-        sampleJson: sample ? JSON.stringify(sample) : null,
-      }).catch((err) => {
-        this.diagnosticErrors.push({
-          ts: new Date().toISOString(),
-          kind: 'record_decision_write_error',
-          message: err instanceof Error ? err.message : String(err),
-        });
-      }),
-    );
-
-    this.trackWrite(
-      this.store.createEvent({
-        id: `${this.runId}-ev-budget-${Date.now()}`,
-        runId: this.runId,
-        stageId: this.stageId,
-        eventType: decisionType === 'pause' ? 'dispatch_paused'
-          : decisionType === 'resume' ? 'dispatch_resumed'
-          : decisionType === 'scale_down' ? 'budget_scaled_down'
-          : decisionType === 'scale_up' ? 'budget_scaled_up'
-          : 'resource_sampling_degraded',
-        eventData: { decisionType, reason, previousBudget, newBudget },
-      }).catch((err) => {
-        this.diagnosticErrors.push({
-          ts: new Date().toISOString(),
-          kind: 'record_decision_event_write_error',
-          message: err instanceof Error ? err.message : String(err),
-        });
-      }),
-    );
-  }
-}
 
 // ══════════════════════════════════════════════════════════════
 // SchedulerConfig
@@ -532,6 +133,8 @@ export interface SchedulerConfig {
   samplingIntervalMs?: number;
   // ── M4: Governance ──
   governanceEnabled?: boolean;
+  /** Required whenever a real Provider is enabled. Calls reserve their declared worst-case cost before spawn. */
+  costBudget?: CostBudgetConfig | null;
   // ── M4 v3: Injectable process runners for testing ──
   piProcessRunner?: import('../adapters/pi-worker-types.js').ProcessRunner;
   codexProcessRunner?: import('../adapters/codex-process-runner.js').CodexProcessRunner;
@@ -546,6 +149,10 @@ export interface SchedulerConfig {
   reviewCacheEnabled?: boolean;
   taskPacketMaxContextFiles?: number;
   taskPacketMaxContextChars?: number;
+  /** Operational byte/line proxy ceilings; never reported as Provider tokens. */
+  stageReviewInputLimits?: Partial<StageReviewInputLimits>;
+  /** R2: cost reservation heartbeat interval (ms). Default: lease window / 3. Test-injectable. */
+  costReservationHeartbeatMs?: number;
 }
 
 const DEFAULT_CONFIG: SchedulerConfig = {
@@ -559,6 +166,8 @@ const DEFAULT_CONFIG: SchedulerConfig = {
   samplingIntervalMs: 5000,
   cleanupMergedWorktrees: false,
   privacyService: undefined,
+  executionMode: 'default',
+  costBudget: null,
 };
 
 // ══════════════════════════════════════════════════════════════
@@ -575,6 +184,8 @@ export class StageScheduler {
   private eventSeq = 0;
   private modeConfig: ExecutionModeConfig;
   private reviewCache: ReviewResultCache;
+  private integrationCoordinator: StageIntegrationCoordinator;
+  private postWorkerHandler: PostWorkerHandler;
 
   constructor(store: StateStore, config: Partial<SchedulerConfig>) {
     this.store = store;
@@ -584,10 +195,153 @@ export class StageScheduler {
     this.reviewCache = new ReviewResultCache({
       enabled: this.config.reviewCacheEnabled !== false,
     });
+    this.integrationCoordinator = new StageIntegrationCoordinator(
+      this.store,
+      this.config,
+      this.reviewCache,
+      {
+        nextEventId: (runId, prefix) => this.nextEventId(runId, prefix),
+        recordStagePause: (input) => this.recordStagePause(input),
+        reserveProviderCost: (input) => this.reserveProviderCost(input),
+        stopIfCanceled: (runId, stageId, taskId, attemptId, checkpoint) =>
+          this.stopIfCanceled(runId, stageId, taskId, attemptId, checkpoint),
+        tasksForStage: (stage, runId) => this.tasksForStage(stage, runId),
+        getAttemptDiffBase: (runId, attemptId, fallback) => this.getAttemptDiffBase(runId, attemptId, fallback),
+        pathsOverlap: (left, right) => this.pathsOverlap(left, right),
+        getAbortSignal: () => this.abortController?.signal,
+      },
+    );
+    this.postWorkerHandler = new PostWorkerHandler(
+      this.store,
+      this.config,
+      this.modeConfig,
+      {
+        nextEventId: (runId, prefix) => this.nextEventId(runId, prefix),
+        recordStagePause: (input) => this.recordStagePause(input),
+        reserveProviderCost: (input) => this.reserveProviderCost(input),
+        recordCostPause: (input) => this.recordCostPause(input),
+        retryReviewFromWorkerCompleted: (input) => this.retryReviewFromWorkerCompleted(input),
+        claimActualPathsOrPause: (runId, stageId, taskId, attemptId, changedFiles) =>
+          this.claimActualPathsOrPause(runId, stageId, taskId, attemptId, changedFiles),
+        stopIfCanceled: (runId, stageId, taskId, attemptId, checkpoint) =>
+          this.stopIfCanceled(runId, stageId, taskId, attemptId, checkpoint),
+        releaseLocks: (taskId, runId) => this.releaseLocks(taskId, runId),
+        getAbortSignal: () => this.abortController?.signal,
+      },
+    );
   }
 
   private nextEventId(runId: string, prefix: string): string {
     return `${runId}-${prefix}-${Date.now()}-${++this.eventSeq}`;
+  }
+
+  private async recordStagePause(input: {
+    runId: string;
+    stageId: string;
+    reasonCode: string;
+    category?: PauseCategory;
+    recoverable?: boolean;
+    requiredApprovalType?: string | null;
+    decisionId?: string | null;
+    taskId?: string | null;
+    attemptId?: string | null;
+    eventData?: Record<string, unknown>;
+    createdAt?: string;
+  }): Promise<PauseRecord> {
+    const active = await this.store.getActivePauseForStage(input.stageId);
+    if (active) return active;
+
+    const classified = classifyPauseReason(input.reasonCode, input.eventData);
+    let decisionId = input.decisionId ?? null;
+    const requiredApprovalType = input.requiredApprovalType !== undefined
+      ? input.requiredApprovalType
+      : input.category !== undefined
+        ? null
+        : classified.requiredApprovalType;
+    if (requiredApprovalType && !decisionId) {
+      const decisions = await this.store.listApprovalDecisions(input.runId);
+      const matching = decisions.filter((decision) =>
+        decision.decisionType === requiredApprovalType
+        && (decision.status === 'pending' || decision.status === 'approved')
+        && ((decision.metadata as { stageId?: string }).stageId === input.stageId
+          || (input.taskId != null && (decision.metadata as { taskId?: string }).taskId === input.taskId)),
+      );
+      decisionId = matching.at(-1)?.id ?? null;
+    }
+
+    const evidence = {
+      reasonCode: input.reasonCode,
+      category: input.category ?? classified.category,
+      taskId: input.taskId ?? null,
+      attemptId: input.attemptId ?? null,
+      ...(input.eventData ?? {}),
+    };
+    const evidenceSummary = `sha256:${createHash('sha256').update(JSON.stringify(evidence)).digest('hex')}`;
+    const pauseId = this.nextEventId(input.runId, 'pause');
+    return pauseStage(this.store, {
+      id: pauseId,
+      eventId: this.nextEventId(input.runId, 'ev-stage-pause'),
+      runId: input.runId,
+      stageId: input.stageId,
+      reasonCode: input.reasonCode,
+      category: input.category ?? classified.category,
+      recoverable: input.recoverable ?? true,
+      requiredApprovalType,
+      decisionId,
+      evidenceSummary,
+      taskId: input.taskId,
+      attemptId: input.attemptId,
+      eventData: input.eventData,
+      createdAt: input.createdAt,
+    });
+  }
+
+  private async reserveProviderCost(input: {
+    runId: string; stageId?: string | null; taskId?: string | null; attemptId?: string | null;
+    callType: CallType; callId: string; provider: 'pi' | 'codex';
+  }): Promise<{ allowed: boolean; reservationId: string | null; ownerId: string | null; reason?: string; remaining?: number }> {
+    const budget = this.config.costBudget;
+    if (!budget) return { allowed: false, reservationId: null, ownerId: null, reason: 'cost_budget_missing' };
+    if (!this.store.reserveCost) return { allowed: false, reservationId: null, ownerId: null, reason: 'cost_ledger_unavailable' };
+    const reservationId = `${input.callId}-cost`;
+    const ownerId = `${input.runId}:${input.attemptId ?? input.stageId ?? input.callId}`;
+    const now = new Date();
+    const worstCaseCost = input.callType === 'pi_worker'
+      ? budget.maxPiCallCost * 4 + budget.maxCodexCallCost * 2
+      : input.provider === 'pi' ? budget.maxPiCallCost : budget.maxCodexCallCost;
+    const result = await this.store.reserveCost({
+      id: reservationId,
+      runId: input.runId,
+      stageId: input.stageId ?? null,
+      taskId: input.taskId ?? null,
+      attemptId: input.attemptId ?? null,
+      callType: input.callType,
+      callId: input.callId,
+      currency: budget.currency,
+      budgetLimit: budget.limit,
+      reservedCost: worstCaseCost,
+      pricingVersion: budget.pricingVersion,
+      ownerId,
+      heartbeatAt: now.toISOString(),
+      leaseExpiresAt: new Date(now.getTime() + Math.max(this.config.workerTimeoutMs, 120_000) + 60_000).toISOString(),
+    });
+    return { allowed: result.allowed, reservationId: result.reservation?.id ?? null, ownerId: result.allowed ? ownerId : null, reason: result.reason, remaining: result.remaining };
+  }
+
+  private async recordCostPause(input: {
+    runId: string; stageId: string; taskId?: string | null; attemptId?: string | null;
+    provider: 'pi' | 'codex'; reason: string; remaining?: number;
+  }): Promise<void> {
+    await this.recordStagePause({
+      runId: input.runId,
+      stageId: input.stageId,
+      taskId: input.taskId,
+      attemptId: input.attemptId,
+      reasonCode: input.reason,
+      category: 'budget',
+      requiredApprovalType: 'run_budget',
+      eventData: { provider: input.provider, remaining: input.remaining ?? null },
+    });
   }
 
   getSampler(): ResourceSampler { return this.sampler; }
@@ -627,6 +381,36 @@ export class StageScheduler {
     try {
       const run = await this.store.getRun(runId);
       if (!run || run.status === 'completed' || run.status === 'canceled' || run.status === 'failed') { return; }
+
+      // A production Pi worker must never be accepted through a local/fake
+      // reviewer. Injected runners remain available for disposable tests.
+      if (this.config.allowRealWorker && !this.config.piProcessRunner
+        && (!this.config.allowRealReviewer || this.config.reviewerConfig?.type === 'local-rule')) {
+        const stages = await this.store.listStages(runId);
+        const stage = stages.find((candidate) => !['completed', 'canceled', 'failed'].includes(candidate.status));
+        if (stage) {
+          await this.recordStagePause({
+            runId,
+            stageId: stage.id,
+            reasonCode: 'real_worker_requires_real_codex_reviewer',
+            category: 'reviewer',
+          });
+        }
+        console.error('[Scheduler] Real Pi spawn blocked: a real codex-cli reviewer is required.');
+        return;
+      }
+
+      await this.store.createEvent({
+        id: this.nextEventId(runId, 'ev-mode-selection'),
+        runId,
+        eventType: 'mode_selection',
+        eventData: {
+          mode: this.modeConfig.mode,
+          autoSelected: this.modeConfig.autoSelected,
+          reason: this.modeConfig.selectionReason,
+        },
+      });
+      console.log('[Scheduler] Execution mode: ' + this.modeConfig.mode + ' — ' + this.modeConfig.selectionReason);
 
       // ── M4: Initialize governance ──
       if (this.config.governanceEnabled) {
@@ -679,53 +463,47 @@ export class StageScheduler {
    */
   private async failRunSafely(runId: string, reason: string): Promise<void> {
     try {
-      const run = await this.store.getRun(runId);
-      if (!run) return;
-      // Never overwrite explicitly canceled runs
-      if (run.status === 'canceled') return;
-      // Already failed — no-op
-      if (run.status === 'failed') return;
-
       const now = new Date().toISOString();
-      await this.store.updateRunStatus(runId, 'failed', now);
-      await this.store.updateRunFinishedAt(runId, now);
-      await this.store.createEvent({
-        id: `${runId}-ev-convergence-fail-${Date.now()}`,
-        runId,
-        eventType: 'error',
-        eventData: { reason: 'convergence_failure', detail: reason },
-      }).catch(() => {});
+      await this.store.failRunForConvergenceAtomically({ runId, reason, failedAt: now });
     } catch {
       // Must never throw — cleanup is best-effort
     }
   }
 
+  private async retryReviewFromWorkerCompleted(input: {
+    runId: string;
+    stageId: string;
+    taskId: string;
+    attemptId: string;
+    reason: string;
+    updatedAt: string;
+  }): Promise<void> {
+    const reset = await this.store.retryReviewAtomically(input);
+    if (!reset) {
+      throw new Error(`Review retry CAS rejected for attempt ${input.attemptId}`);
+    }
+  }
+
+  private async beginTaskAttempt(taskId: string, updatedAt: string): Promise<void> {
+    let task = await this.store.getTask(taskId);
+    if (!task) throw new Error(`Task ${taskId} not found before attempt dispatch`);
+    if (task.status === 'pending' || task.status === 'rework_required') {
+      const readied = await this.store.updateTaskStatus(taskId, 'ready', updatedAt);
+      if (!readied) throw new Error(`Task ${taskId} could not transition to ready`);
+      task = await this.store.getTask(taskId);
+    }
+    if (task?.status === 'running') return;
+    if (task?.status !== 'ready' && task?.status !== 'waiting_decision') {
+      throw new Error(`Task ${taskId} cannot start an attempt from ${String(task?.status ?? 'missing')}`);
+    }
+    const started = await this.store.updateTaskStatus(taskId, 'running', updatedAt);
+    if (!started) throw new Error(`Task ${taskId} attempt dispatch lost status CAS`);
+  }
+
   private async reconcile(runId: string): Promise<void> {
-    const now = new Date().toISOString();
-    const stages = await this.store.listStages(runId);
-    for (const stage of stages) {
-      if (stage.status === 'completed' || stage.status === 'canceled') continue;
-      const attempts = await this.store.listAttemptsByStage(stage.id);
-      for (const attempt of attempts) {
-        if (attempt.status !== 'running' || attempt.piPid == null) continue;
-        let alive = false;
-        try {
-          if (process.platform === 'win32') {
-            const out = execFileSync('tasklist', ['/FI', `PID eq ${attempt.piPid}`, '/FO', 'CSV', '/NH'], { stdio: 'pipe', encoding: 'utf-8' });
-            alive = out.includes('"' + attempt.piPid + '"');
-          } else {
-            process.kill(attempt.piPid, 0);
-            alive = true;
-          }
-        } catch { alive = false; }
-        if (!alive) {
-          await this.store.updateAttemptStatus(attempt.id, 'interrupted', now);
-          await this.store.updateAttemptResult(attempt.id, { exitReason: 'reconciled: PID ' + attempt.piPid + ' missing', stoppedAt: now });
-          await this.store.createEvent({ id: runId + '-ev-rec-' + Date.now(), runId, stageId: stage.id, taskId: attempt.taskId, attemptId: attempt.id, eventType: 'attempt_interrupted', eventData: { reason: 'reconciled', pid: attempt.piPid } });
-          for (const l of await this.store.getActiveLocksForRun(runId)) { if (l.taskId === attempt.taskId) await this.store.releasePathLock(l.id, now); }
-          console.log('[Scheduler] Reconciled: attempt ' + attempt.id + ' (PID ' + attempt.piPid + ') marked interrupted.');
-        }
-      }
+    const result = await runAutomaticReconciliation(this.store as import('../state/sqlite-store.js').SqliteStateStore, runId);
+    if (result.appliedCount > 0) {
+      console.log('[Scheduler] Shared reconciliation applied ' + result.appliedCount + ' safe action(s).');
     }
   }
 
@@ -740,11 +518,12 @@ export class StageScheduler {
       const stage = await this.store.getStage(_s.id);
       if (!stage || stage.status === 'completed' || stage.status === 'canceled' || stage.status === 'failed') continue;
       if (stage.status === 'paused') { console.log('[Scheduler] Stage ' + stage.stageNumber + ' paused.'); return; }
+      if (stage.status === 'pending') {
+        await this.store.updateStageStatus(stage.id, 'ready', now);
+      }
       if (stage.status === 'pending' || stage.status === 'ready') {
-        if (canTransitionStage(stage.status as any, 'running')) {
-          await this.store.updateStageStatus(stage.id, 'running', now);
-          await this.store.createEvent({ id: runId + '-ev-stage-' + Date.now(), runId, stageId: stage.id, eventType: 'stage_started', eventData: { stageNumber: stage.stageNumber } });
-        }
+        await this.store.updateStageStatus(stage.id, 'running', now);
+        await this.store.createEvent({ id: runId + '-ev-stage-' + Date.now(), runId, stageId: stage.id, eventType: 'stage_started', eventData: { stageNumber: stage.stageNumber } });
       }
       // Update budget tracker's stage context
       if (this.budgetTracker) this.budgetTracker.setStageId(stage.id);
@@ -787,7 +566,8 @@ export class StageScheduler {
     const p = stages.find((s) => s.stageNumber === stage.stageNumber - 1);
     if (p) {
       const bs = await this.store.listIntegrationBatches(p.id);
-      if (bs.length > 0 && bs[bs.length - 1].mergeCommitHash) return bs[bs.length - 1].mergeCommitHash!;
+      const completed = bs.filter((batch) => batch.status === 'completed' && batch.targetMergeCommit);
+      if (completed.length > 0) return completed[completed.length - 1].targetMergeCommit!;
     }
     return null;
   }
@@ -804,95 +584,6 @@ export class StageScheduler {
       tasks = all.filter((task) => taskIds.has(task.id));
     }
     return tasks;
-  }
-
-  /**
-   * Real execution may only proceed when the completed WorkerResult is backed
-   * by an actual branch diff touching an expected path. Fake-only scheduler
-   * tests remain a state-machine simulation and are intentionally excluded.
-   */
-  private async verifyCompletionEvidence(
-    attemptId: string,
-    taskId: string,
-    stage: StageRecord,
-    runId: string,
-    workerResult: WorkerResult,
-    branchName: string,
-    changedFiles: string[],
-    spec: StructuredTaskSpec,
-    timestamp: string,
-    worktreePath?: string,
-  ): Promise<boolean> {
-    if (!this.config.allowRealWorker && !this.config.allowRealReviewer) return true;
-
-    const expected = spec.estimatedWritePaths || [];
-    const touchesExpectedPath = expected.some((expectedPath) => changedFiles.some((changedPath) =>
-      changedPath === expectedPath || changedPath.startsWith(expectedPath.endsWith('/') ? expectedPath : expectedPath + '/'),
-    ));
-    // Primary check: worker did write files matching estimated paths
-    const hasExpectedPath = workerResult.status === 'completed'
-      && Boolean(branchName)
-      && changedFiles.length > 0
-      && touchesExpectedPath;
-    if (hasExpectedPath) return true;
-
-    // Fallback check (P0-BENCH-02): git diff confirms files were written,
-    // but estimatedWritePaths didn't capture them. Verify file existence in worktree
-    // as a backup signal instead of blindly rejecting.
-    if (workerResult.status === 'completed' && Boolean(branchName) && changedFiles.length > 0 && !touchesExpectedPath) {
-      const wp = worktreePath;
-      if (wp) {
-        const { existsSync } = await import('node:fs');
-        const filesExist = changedFiles.every((f) =>
-          existsSync(resolve(wp, f))
-        );
-        if (filesExist) {
-          console.log('[Scheduler] Completion evidence accepted via file-existence fallback (P0-BENCH-02).');
-          return true;
-        }
-      }
-      // Still reject if files don't actually exist or worktree path unknown
-    }
-
-    const reason = workerResult.status !== 'completed'
-      ? 'worker_result_not_completed'
-      : changedFiles.length === 0
-        ? 'worker_completed_without_verifiable_diff'
-        : !touchesExpectedPath
-          ? 'expected_write_missing'
-          : 'worker_completion_evidence_missing';
-    await this.blockUnverifiableCompletion(attemptId, taskId, stage, runId, timestamp, reason, {
-      branchName: Boolean(branchName),
-      changedFileCount: changedFiles.length,
-      expectedWritePathCount: expected.length,
-    });
-    return false;
-  }
-
-  private async blockUnverifiableCompletion(
-    attemptId: string,
-    taskId: string,
-    stage: StageRecord,
-    runId: string,
-    timestamp: string,
-    reason: string,
-    detail: Record<string, unknown> = {},
-  ): Promise<void> {
-    await this.store.updateAttemptStatus(attemptId, 'failed', timestamp);
-    await this.store.updateTaskStatus(taskId, 'failed', timestamp);
-    await this.store.updateAttemptResult(attemptId, { exitReason: reason, stoppedAt: timestamp });
-    await this.store.updateStageStatus(stage.id, 'paused', timestamp);
-    await this.store.createEvent({
-      id: this.nextEventId(runId, 'ev-unverifiable-completion'), runId, stageId: stage.id, taskId, attemptId,
-      eventType: 'attempt_failed',
-      eventData: { reason, ...detail },
-    });
-    await this.store.createEvent({
-      id: this.nextEventId(runId, 'ev-unverifiable-pause'), runId, stageId: stage.id,
-      eventType: 'stage_paused',
-      eventData: { reason, taskId, attemptId },
-    });
-    console.log('[Scheduler] Completion evidence rejected for attempt ' + attemptId + ': ' + reason + '.');
   }
 
   private async stopIfCanceled(
@@ -931,6 +622,135 @@ export class StageScheduler {
     const a = this.normalizeLockPath(left);
     const b = this.normalizeLockPath(right);
     return a === b || a.startsWith(b + '/') || b.startsWith(a + '/');
+  }
+
+  private lockPathsFor(spec: StructuredTaskSpec, observedPaths: string[] = []): string[] {
+    const estimated = spec.estimatedWritePaths?.length > 0 ? spec.estimatedWritePaths : ['src/'];
+    const compared = [...estimated, ...observedPaths];
+    const overlappingProtected = this.config.defaultLockedPaths.filter((protectedPath) =>
+      compared.some((candidatePath) => this.pathsOverlap(protectedPath, candidatePath)),
+    );
+    return [...new Set([...compared, ...overlappingProtected])];
+  }
+
+  private async claimActualPathsOrPause(
+    runId: string, stageId: string, taskId: string, attemptId: string, changedFiles: string[],
+  ): Promise<boolean> {
+    // Synthetic fixtures may intentionally exercise lifecycle behavior without
+    // a diff. Real completion evidence rejects an empty diff before this point.
+    if (changedFiles.length === 0) return true;
+    const result = await this.store.claimActualPathsAtomic({ runId, stageId, taskId, attemptId, filePaths: changedFiles });
+    if (result.claimed) return true;
+    const now = new Date().toISOString();
+    await this.store.updateAttemptResult(attemptId, {
+      exitReason: result.violations.length > 0
+        ? `actual_path_claim_invalid:${result.violations.join(';')}`
+        : 'runtime_undeclared_actual_path_conflict',
+    });
+    await this.recordStagePause({
+      runId, stageId, taskId, attemptId,
+      reasonCode: result.violations.length > 0 ? 'actual_path_claim_invalid' : 'runtime_undeclared_actual_path_conflict',
+      category: 'integration',
+      eventData: { conflictLayer: 'runtime_undeclared', conflicts: result.conflicts, violations: result.violations },
+      createdAt: now,
+    });
+    return false;
+  }
+
+  private readBoundedContextFiles(spec: StructuredTaskSpec, worktreePath: string): Map<string, string> {
+    const contents = new Map<string, string>();
+    for (const contextFile of spec.contextFiles || []) {
+      const normalized = contextFile.replace(/\\/g, '/');
+      const segments = normalized.toLowerCase().split('/');
+      const sensitive = segments.some((segment) =>
+        segment === '.env' || segment.startsWith('.env.') || segment.endsWith('.pem') || segment.endsWith('.key')
+        || segment.includes('secret') || segment.includes('credential') || segment.includes('token'),
+      );
+      if (!normalized || isAbsolute(contextFile) || normalized.split('/').includes('..') || sensitive) continue;
+      const filePath = resolve(worktreePath, contextFile);
+      const rel = relative(worktreePath, filePath);
+      if (!rel || rel.startsWith('..') || isAbsolute(rel) || !existsSync(filePath)) continue;
+      try {
+        if (statSync(filePath).size > 1_048_576) continue;
+        contents.set(contextFile, readFileSync(filePath, 'utf8'));
+      } catch {
+        // Missing, binary, or unreadable context is omitted; Pi can request bounded clarification.
+      }
+    }
+    return contents;
+  }
+
+  private parseStringArray(value: string | null | undefined): string[] {
+    if (!value) return [];
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private async buildImplementationPrompt(
+    spec: StructuredTaskSpec,
+    worktreePath: string,
+    previousAttempt: import('../types/m2-types.js').AttemptRecord | null,
+    diffBaseCommit: string,
+    runId: string,
+    stageId: string,
+    attemptId: string,
+  ): Promise<{ prompt: string; taskPacketHash: string }> {
+    if (!isTokenEfficientMode(this.modeConfig.mode)) {
+      return { prompt: buildPiWorkerPrompt({ taskSpec: spec }), taskPacketHash: sha256(canonicalJson(spec)) };
+    }
+
+    if (previousAttempt && ['failed', 'rework_required'].includes(previousAttempt.status)) {
+      const reviews = await this.store.listReviewsByAttempt(previousAttempt.id);
+      const latestReview = reviews.at(-1);
+      const findings = [
+        ...this.parseStringArray(latestReview?.findingsJson),
+        ...this.parseStringArray(latestReview?.requiredReworkJson),
+      ].slice(0, 12).map((finding) => finding.slice(0, 600));
+      let diffDelta = '';
+      try {
+        diffDelta = git(worktreePath, ['diff', `${diffBaseCommit}..HEAD`, '--']);
+      } catch {
+        diffDelta = '(无法读取上次累计 diff；请先检查当前 worktree)';
+      }
+      if (diffDelta.length > 12_000) diffDelta = diffDelta.slice(0, 12_000) + '\n... [diff truncated by brainctl]';
+      const requiredRework = this.parseStringArray(latestReview?.requiredReworkJson);
+      const packet = buildRetryPacket(
+        previousAttempt,
+        (previousAttempt.exitReason || '上次 attempt 未通过').slice(0, 1_200),
+        findings,
+        diffDelta,
+        requiredRework.length > 0 ? requiredRework.join('; ') : `修复上次失败并完成目标: ${spec.goal}`,
+        spec,
+      );
+      const prompt = buildPiWorkerRetryPrompt(packet);
+      await this.store.createEvent({
+        id: this.nextEventId(runId, 'ev-retry-packet'), runId, stageId, taskId: spec.taskId, attemptId,
+        eventType: 'retry_packet_built',
+        eventData: { previousAttemptId: previousAttempt.id, findingsCount: findings.length, diffChars: diffDelta.length, promptChars: prompt.length },
+      });
+      return { prompt, taskPacketHash: sha256(canonicalJson(packet)) };
+    }
+
+    const { packet, overflow } = buildMinimalTaskPacket(
+      spec,
+      this.readBoundedContextFiles(spec, worktreePath),
+      {
+        maxContextFiles: this.config.taskPacketMaxContextFiles ?? 5,
+        maxContextFileChars: this.config.taskPacketMaxContextChars ?? 500,
+        allowContextExpansion: false,
+      },
+    );
+    const prompt = buildPiWorkerMinimalPrompt(packet);
+    await this.store.createEvent({
+      id: this.nextEventId(runId, 'ev-minimal-packet'), runId, stageId, taskId: spec.taskId, attemptId,
+      eventType: 'minimal_task_packet_built',
+      eventData: { contextFiles: packet.contextFilesSummary.length, overflowCount: overflow.length, promptChars: prompt.length },
+    });
+    return { prompt, taskPacketHash: sha256(canonicalJson(packet)) };
   }
 
   private dependsOn(
@@ -977,10 +797,10 @@ export class StageScheduler {
         await this.store.updateAttemptStatus(attemptId, 'failed', now);
         await this.store.updateTaskStatus(taskId, 'waiting_decision', now);
         await this.store.updateAttemptResult(attemptId, { exitReason: `dependency_baseline_unavailable:${dependencyId}`, stoppedAt: now });
-        await this.store.updateStageStatus(stage.id, 'paused', now);
-        await this.store.createEvent({
-          id: this.nextEventId(runId, 'ev-dependency-baseline-missing'), runId, stageId: stage.id, taskId, attemptId,
-          eventType: 'stage_paused', eventData: { reason: 'dependency_baseline_unavailable', dependencyId },
+        await this.recordStagePause({
+          runId, stageId: stage.id, taskId, attemptId,
+          reasonCode: 'dependency_baseline_unavailable',
+          eventData: { dependencyId }, createdAt: now,
         });
         return false;
       }
@@ -991,10 +811,10 @@ export class StageScheduler {
         await this.store.updateAttemptStatus(attemptId, 'failed', now);
         await this.store.updateTaskStatus(taskId, 'waiting_decision', now);
         await this.store.updateAttemptResult(attemptId, { exitReason: `dependency_baseline_conflict:${dependencyId}`, stoppedAt: now });
-        await this.store.updateStageStatus(stage.id, 'paused', now);
-        await this.store.createEvent({
-          id: this.nextEventId(runId, 'ev-dependency-baseline-conflict'), runId, stageId: stage.id, taskId, attemptId,
-          eventType: 'stage_paused', eventData: { reason: 'dependency_baseline_conflict', dependencyId, message: error?.message || String(error) },
+        await this.recordStagePause({
+          runId, stageId: stage.id, taskId, attemptId,
+          reasonCode: 'dependency_baseline_conflict', category: 'integration',
+          eventData: { dependencyId, message: error?.message || String(error) }, createdAt: now,
         });
         return false;
       }
@@ -1044,10 +864,9 @@ export class StageScheduler {
     const undeclaredSamePathConflicts = this.findUndeclaredSamePathConflicts(specs);
     if (undeclaredSamePathConflicts.length > 0) {
       const now = new Date().toISOString();
-      await this.store.updateStageStatus(stage.id, 'paused', now);
-      await this.store.createEvent({
-        id: this.nextEventId(runId, 'ev-undeclared-same-path'), runId, stageId: stage.id,
-        eventType: 'stage_paused', eventData: { reason: 'undeclared_same_path_conflict', conflicts: undeclaredSamePathConflicts },
+      await this.recordStagePause({
+        runId, stageId: stage.id, reasonCode: 'declared_write_conflict_missing_dependency',
+        category: 'integration', eventData: { conflictLayer: 'declared_preventable', conflicts: undeclaredSamePathConflicts }, createdAt: now,
       });
       console.log('[Scheduler] Stage ' + stage.stageNumber + ' paused: same-path tasks require a dependency edge.');
       return false;
@@ -1058,27 +877,37 @@ export class StageScheduler {
     let fail = false;
     const wtm = new WorktreeManager(this.config.projectRoot, { worktreeBaseDir: this.config.worktreeBaseDir });
     const dv = new DiffScopeValidator();
+    const active = new Map<string, Promise<{ taskId: string; error?: string }>>();
 
     while (done.size + exhausted.size < tasks.length && !fail) {
-      if (await this.aborted()) return false;
+      if (await this.aborted()) {
+        if (active.size > 0) await Promise.allSettled([...active.values()]);
+        return false;
+      }
       // A run can be canceled externally while a worker/reviewer promise is in
       // flight. Do not schedule another attempt after that promise returns:
       // canceled work must not satisfy dependencies or consume retry budget.
       const currentRun = await this.store.getRun(runId);
-      if (!currentRun || currentRun.status === 'canceled') return false;
+      if (!currentRun || currentRun.status === 'canceled') {
+        if (active.size > 0) await Promise.allSettled([...active.values()]);
+        return false;
+      }
       const cur = await this.store.getStage(stage.id);
-      if (!cur || cur.status === 'paused' || cur.status === 'canceled') return false;
+      if (!cur || cur.status === 'paused' || cur.status === 'canceled') {
+        if (active.size > 0) await Promise.allSettled([...active.values()]);
+        return false;
+      }
 
       const runnable: Array<{ task: typeof tasks[0]; spec: StructuredTaskSpec }> = [];
       for (const t of tasks) {
-        if (done.has(t.id) || exhausted.has(t.id)) continue;
+        if (done.has(t.id) || exhausted.has(t.id) || active.has(t.id)) continue;
         const sp = specs.get(t.id);
         if (!sp) continue;
         if (!sp.dependencies.every((d) => done.has(d))) continue;
         const lat = await this.store.getLatestAttempt(t.id);
-        const paths = [...new Set([...(sp.estimatedWritePaths || ['src/']), ...this.config.defaultLockedPaths])];
+        const paths = this.lockPathsFor(sp);
         if ((!lat || lat.status !== 'worker_completed') && (await this.store.getConflictingLocks(t.id, paths, runId)).length > 0) continue;
-        if (lat && lat.status === 'approved') { done.add(t.id); continue; }
+        if (lat && (lat.status === 'approved' || lat.status === 'review_skipped')) { done.add(t.id); continue; }
 
         // ── P0-3: Retry budget check using actual attempt count ──
         if (lat && (lat.status === 'failed' || lat.status === 'rework_required')) {
@@ -1109,22 +938,19 @@ export class StageScheduler {
             exhausted.add(t.id);
             if (budget.exhausted) {
               // Retry budget exhausted → pause stage for human decision
-              await this.store.updateStageStatus(stage.id, 'paused', now);
-              await this.store.createEvent({
-                id: this.nextEventId(runId, 'ev-retry-exhausted-pause'),
-                runId, stageId: stage.id,
-                eventType: 'stage_paused',
-                eventData: { reason: 'retry_budget_exhausted', taskId: t.id, maxReworkCount: this.config.maxReworkCount },
+              await this.recordStagePause({
+                runId, stageId: stage.id, taskId: t.id,
+                reasonCode: 'retry_budget_exhausted', category: 'retry',
+                eventData: { maxReworkCount: this.config.maxReworkCount }, createdAt: now,
               });
               fail = true; break;
             }
             // Non-retriable (scope/security/privacy/product-decision/unverifiable) → pause stage for human decision
-            await this.store.updateStageStatus(stage.id, 'paused', now);
-            await this.store.createEvent({
-              id: this.nextEventId(runId, 'ev-non-retriable-pause'),
+            await this.recordStagePause({
               runId, stageId: stage.id, taskId: t.id,
-              eventType: 'stage_paused',
-              eventData: { reason: 'non_retriable_failure', taskId: t.id, failureCategory: budget.failureCategory || 'unknown', detail: budget.reason },
+              reasonCode: 'non_retriable_failure',
+              eventData: { failureCategory: budget.failureCategory || 'unknown', detail: budget.reason },
+              createdAt: now,
             });
             fail = true; break;
           }
@@ -1145,9 +971,16 @@ export class StageScheduler {
 
         runnable.push({ task: t, spec: sp });
       }
-      if (fail) break;
+      if (fail) {
+        if (active.size > 0) await Promise.allSettled([...active.values()]);
+        break;
+      }
       if (runnable.length === 0) {
         if (done.size === tasks.length) break;
+        if (active.size > 0) {
+          await Promise.race([...active.values()]);
+          continue;
+        }
         let running = false;
         for (const t of tasks) {
           if (done.has(t.id)) continue;
@@ -1168,7 +1001,7 @@ export class StageScheduler {
               continue;
             }
             const lat = await this.store.getLatestAttempt(t.id);
-            const paths = [...new Set([...(sp.estimatedWritePaths || ['src/']), ...this.config.defaultLockedPaths])];
+            const paths = this.lockPathsFor(sp);
             const conflicts = (lat && lat.status !== 'worker_completed') ? await this.store.getConflictingLocks(t.id, paths, runId) : [];
             if (conflicts.length > 0) {
               blockedTasks.push({ taskId: t.id, reason: 'path_lock_conflict', missingDeps: [], lockConflicts: conflicts.length });
@@ -1176,12 +1009,9 @@ export class StageScheduler {
             }
             blockedTasks.push({ taskId: t.id, reason: 'unknown_deadlock', missingDeps: [], lockConflicts: 0 });
           }
-          await this.store.updateStageStatus(stage.id, 'paused', now);
-          await this.store.createEvent({
-            id: this.nextEventId(runId, 'ev-deadlock'),
-            runId, stageId: stage.id,
-            eventType: 'stage_paused',
-            eventData: { reason: 'stage_deadlock', blockedTasks, stageNumber: stage.stageNumber },
+          await this.recordStagePause({
+            runId, stageId: stage.id, reasonCode: 'stage_deadlock',
+            eventData: { blockedTasks, stageNumber: stage.stageNumber }, createdAt: now,
           });
           return false;
         }
@@ -1217,10 +1047,10 @@ export class StageScheduler {
       }
 
       const dispatchLimit = Math.min(effectiveMax, this.config.maxParallelTasks);
-      const pool: Promise<void>[] = [];
+      let dispatched = 0;
       let blockedByGovernance = 0;
-      for (const { task, spec } of runnable.slice(0, dispatchLimit)) {
-        if (pool.length >= dispatchLimit) break;
+      for (const { task, spec } of runnable) {
+        if (active.size >= dispatchLimit) break;
 
         // ── M4: G2 Execution Gate (only when governance enabled) ──
         if (this.config.governanceEnabled) {
@@ -1247,27 +1077,32 @@ export class StageScheduler {
 
         const latest = await this.store.getLatestAttempt(task.id);
         if (!latest || latest.status !== 'worker_completed') {
-          const lockPaths = [...new Set([...(spec.estimatedWritePaths || ['src/']), ...this.config.defaultLockedPaths])];
+          const lockPaths = this.lockPathsFor(spec);
           const lockResult = await this.store.acquirePathLocksAtomic({ runId, taskId: task.id, filePaths: lockPaths, lockType: 'exclusive' });
           if (!lockResult.acquired) {
             await this.store.createEvent({
               id: this.nextEventId(runId, 'ev-lock-blocked'), runId, stageId: stage.id, taskId: task.id,
-              eventType: 'stage_paused',
+              eventType: 'path_lock_blocked',
               eventData: { reason: 'path_lock_unavailable', conflicts: lockResult.conflicts.length, violations: lockResult.violations },
             }).catch(() => {});
             continue;
           }
         }
-        // Wrap execTask with catch to handle unhandled rejections with task context
+        // Rolling pool: refill the freed slot as soon as any task settles.
         const taskRef = task;
-        pool.push(
-          this.execTask(task, spec, stage, runId, base, wtm, dv).catch(async (err) => {
+        const taskPromise = this.execTask(task, spec, stage, runId, base, wtm, dv)
+          .then(() => ({ taskId: taskRef.id }))
+          .catch(async (err) => {
             const errMsg = err instanceof Error ? err.message : String(err);
             console.error('[Scheduler] execTask unhandled rejection for task ' + taskRef.id + ': ' + errMsg);
             const errNow = new Date().toISOString();
             try {
-              await this.store.updateTaskStatus(taskRef.id, 'failed', errNow);
-              await this.store.updateStageStatus(stage.id, 'paused', errNow);
+              await this.store.updateTaskStatus(taskRef.id, 'rework_required', errNow);
+              await this.recordStagePause({
+                runId, stageId: stage.id, taskId: taskRef.id,
+                reasonCode: 'exec_task_pool_rejection',
+                eventData: { message: errMsg }, createdAt: errNow,
+              });
               await this.store.createEvent({
                 id: this.nextEventId(runId, 'ev-pool-rejection-task'),
                 runId, stageId: stage.id, taskId: taskRef.id,
@@ -1276,34 +1111,36 @@ export class StageScheduler {
               });
               await this.releaseLocks(taskRef.id, runId);
             } catch { /* best-effort */ }
-            throw err; // re-throw so allSettled still sees it
-          }),
-        );
+            return { taskId: taskRef.id, error: errMsg };
+          });
+        const tracked = taskPromise.finally(() => { active.delete(taskRef.id); });
+        active.set(taskRef.id, tracked);
+        dispatched++;
       }
 
       // If all runnable tasks are blocked by governance, pause stage and exit
-      if (blockedByGovernance > 0 && pool.length === 0) {
+      if (blockedByGovernance > 0 && dispatched === 0 && active.size === 0) {
         console.log('[Scheduler] All tasks blocked by governance. Pausing stage ' + stage.stageNumber + '.');
-        await this.store.updateStageStatus(stage.id, 'paused', new Date().toISOString());
-        await this.store.createEvent({
-          id: this.nextEventId(runId, 'ev-gov-pause'), runId, stageId: stage.id,
-          eventType: 'stage_paused',
-          eventData: { reason: 'governance_blocked', blockedTasks: blockedByGovernance },
+        const pending = await this.store.getPendingApprovals(runId);
+        const dedicated = pending[0] ?? null;
+        await this.recordStagePause({
+          runId, stageId: stage.id, reasonCode: 'governance_blocked',
+          category: dedicated?.decisionType === 'run_budget' ? 'budget' : 'product_decision',
+          requiredApprovalType: dedicated?.decisionType ?? 'product_decision',
+          decisionId: dedicated?.id ?? null,
+          eventData: { blockedTasks: blockedByGovernance },
         });
         return false;
       }
 
-      const settled = await Promise.allSettled(pool);
-      // P0-3: Log any rejections that would otherwise be silently swallowed
-      for (const result of settled) {
-        if (result.status === 'rejected') {
-          const errMsg = result.reason instanceof Error ? result.reason.message : String(result.reason);
-          console.error('[Scheduler] execTask rejection: ' + errMsg);
+      if (active.size > 0) {
+        const result = await Promise.race([...active.values()]);
+        if (result.error) {
           await this.store.createEvent({
             id: this.nextEventId(runId, 'ev-pool-rejection'),
             runId, stageId: stage.id,
             eventType: 'error',
-            eventData: { reason: 'exec_task_rejection', message: errMsg },
+            eventData: { reason: 'exec_task_rejection', message: result.error, taskId: result.taskId },
           }).catch(() => {});
         }
       }
@@ -1314,24 +1151,19 @@ export class StageScheduler {
       if (exhausted.size > 0) {
         console.log('[Scheduler] Stage has ' + exhausted.size + ' exhausted task(s); integration blocked.');
         const now = new Date().toISOString();
-        await this.store.updateStageStatus(stage.id, 'paused', now);
-        await this.store.createEvent({
-          id: this.nextEventId(runId, 'ev-exhausted-integration-blocked'),
-          runId, stageId: stage.id,
-          eventType: 'stage_paused',
-          eventData: { reason: 'exhausted_tasks_block_integration', exhaustedTaskIds: [...exhausted] },
+        await this.recordStagePause({
+          runId, stageId: stage.id, reasonCode: 'exhausted_tasks_block_integration',
+          category: 'retry', eventData: { exhaustedTaskIds: [...exhausted] }, createdAt: now,
         });
         return false;
       }
 
       let allOk = true;
       let hasMergeBlocked = false;
-      let hasReviewSkipped = false;
       for (const t of tasks) {
         const l = await this.store.getLatestAttempt(t.id);
         // Accept both approved and review_skipped as "ready for integration"
         if (!l || (l.status !== 'approved' && l.status !== 'review_skipped')) { allOk = false; break; }
-        if (l.status === 'review_skipped') { hasReviewSkipped = true; }
         // Also check current task status: merge_blocked tasks cannot be integrated again
         const ct = await this.store.getTask(t.id);
         if (ct?.status === 'merge_blocked') { hasMergeBlocked = true; }
@@ -1341,17 +1173,14 @@ export class StageScheduler {
         return false;
       }
       if (allOk) {
-        await this.integrate(stage, runId, wtm, base);
+        if (!await this.integrate(stage, runId, wtm, base)) return false;
       } else {
         // Not all tasks approved — stage cannot complete
         console.log('[Scheduler] Stage incomplete: not all tasks approved.');
         const now = new Date().toISOString();
-        await this.store.updateStageStatus(stage.id, 'paused', now);
-        await this.store.createEvent({
-          id: this.nextEventId(runId, 'ev-stage-incomplete'),
-          runId, stageId: stage.id,
-          eventType: 'stage_paused',
-          eventData: { reason: 'stage_incomplete_not_all_approved' },
+        await this.recordStagePause({
+          runId, stageId: stage.id, reasonCode: 'stage_incomplete_not_all_approved',
+          category: 'quality', createdAt: now,
         });
         return false;
       }
@@ -1375,8 +1204,8 @@ export class StageScheduler {
       return;
     }
 
-    await this.store.updateTaskStatus(tid, 'running', new Date().toISOString());
-    const pn = (await this.store.getLatestAttempt(tid))?.attemptNumber ?? 0;
+    await this.beginTaskAttempt(tid, new Date().toISOString());
+    const pn = latestBeforeExec?.attemptNumber ?? 0;
     const an = pn + 1;
     const aid = runId + '-att-' + tid + '-a' + an;
     const bn = 'brainctl/' + runId + '/' + tid + '/a' + an;
@@ -1387,11 +1216,39 @@ export class StageScheduler {
     mkdirSync(sd, { recursive: true }); mkdirSync(ld, { recursive: true });
 
     await this.store.createAttempt({ id: aid, taskId: tid, stageId: stage.id, attemptNumber: an, status: 'running' });
+    const dispatchLeasedAt = new Date();
+    await this.store.createEvent({
+      id: this.nextEventId(runId, 'ev-attempt-dispatch-lease'),
+      runId, stageId: stage.id, taskId: tid, attemptId: aid,
+      eventType: 'attempt_dispatch_lease',
+      eventData: {
+        ownerId: `${runId}:${aid}`,
+        heartbeatAt: dispatchLeasedAt.toISOString(),
+        leaseExpiresAt: new Date(dispatchLeasedAt.getTime() + this.config.workerTimeoutMs + 60_000).toISOString(),
+      },
+    });
 
-    try { wtm.createBranch(bn, base); wtm.createWorktree(bn, wr); }
+    let branchStartRef = base;
+    let taskDiffBase = base;
+    let reusedPreviousBranch = false;
+    // Interrupted attempts do not consume retry budget. If recovery preserved a
+    // checkpoint commit on their branch, continue from it instead of silently
+    // discarding paid worker progress and restarting from the stage base.
+    if (latestBeforeExec?.branchName && ['failed', 'rework_required', 'interrupted'].includes(latestBeforeExec.status)) {
+      try {
+        git(this.config.projectRoot, ['rev-parse', '--verify', '--end-of-options', `refs/heads/${latestBeforeExec.branchName}`]);
+        branchStartRef = latestBeforeExec.branchName;
+        taskDiffBase = await this.getAttemptDiffBase(runId, latestBeforeExec.id, base);
+        reusedPreviousBranch = true;
+      } catch {
+        // A missing prior branch cannot be reused; retry safely starts from the stage base.
+      }
+    }
+
+    try { wtm.createBranch(bn, branchStartRef); wtm.createWorktree(bn, wr); }
     catch (e: any) {
       await this.store.updateAttemptStatus(aid, 'failed', new Date().toISOString());
-      await this.store.updateTaskStatus(tid, 'failed', new Date().toISOString());
+      await this.store.updateTaskStatus(tid, 'rework_required', new Date().toISOString());
       await this.store.updateAttemptResult(aid, { exitReason: 'wt_fail: ' + (e.message || String(e)), stoppedAt: new Date().toISOString(), worktreePath: wp, branchName: bn });
       await this.releaseLocks(tid, runId); return;
     }
@@ -1402,8 +1259,15 @@ export class StageScheduler {
       await this.releaseLocks(tid, runId);
       return;
     }
-    const taskDiffBase = git(wp, ['rev-parse', 'HEAD']);
+    if (!reusedPreviousBranch) taskDiffBase = git(wp, ['rev-parse', 'HEAD']);
     await this.recordAttemptDiffBase(runId, stage.id, tid, aid, taskDiffBase);
+    if (reusedPreviousBranch) {
+      await this.store.createEvent({
+        id: this.nextEventId(runId, 'ev-retry-branch-reused'), runId, stageId: stage.id, taskId: tid, attemptId: aid,
+        eventType: 'retry_branch_reused',
+        eventData: { previousAttemptId: latestBeforeExec?.id, previousBranch: latestBeforeExec?.branchName },
+      });
+    }
 
     let wrResult: WorkerResult | null = null;
     let pid: number | null = null;
@@ -1411,6 +1275,8 @@ export class StageScheduler {
     let rawLog: string | undefined;
     let ph: string | undefined;
     let stoppedAt = new Date().toISOString();
+    let piCostReservationId: string | null = null;
+    let implementationPrompt: string | undefined;
 
     // ── M4: Create LedgerSink for Pi worker (only when governance enabled) ──
     let piLedgerSink: SqliteLedgerSink | null = null;
@@ -1424,18 +1290,58 @@ export class StageScheduler {
     }
 
     if (this.config.allowRealWorker) {
-      // P0-2: Privacy gate before real Provider spawn
+      // Local fail-closed checks and prompt construction happen before money is reserved.
       if (this.config.privacyService) {
         const spawnGate = this.config.privacyService.canSpawnRealProvider();
         if (!spawnGate.allowed) {
           console.error('[Scheduler] Real Pi spawn blocked: ' + spawnGate.reason);
           await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
-          await this.store.updateTaskStatus(tid, 'failed', stoppedAt);
+          await this.store.updateTaskStatus(tid, 'waiting_decision', stoppedAt);
           await this.store.updateAttemptResult(aid, { exitReason: 'privacy_gate_blocked: ' + spawnGate.reason, stoppedAt });
+          await this.recordCostPause({ runId, stageId: stage.id, taskId: tid, attemptId: aid, provider: 'pi', reason: 'privacy_gate_blocked' });
           await this.releaseLocks(tid, runId);
           return;
         }
       }
+      try {
+        const built = await this.buildImplementationPrompt(
+          spec, wp, latestBeforeExec, taskDiffBase, runId, stage.id, aid,
+        );
+        implementationPrompt = built.prompt;
+        await this.store.recordAttemptProvenance({
+          attemptId: aid, runId, stageId: stage.id, taskId: tid, baseCommit: taskDiffBase,
+          expectedBranch: bn, expectedWorktree: wp, taskPacketHash: built.taskPacketHash,
+          implementationPromptHash: sha256(built.prompt), workerId: 'bc-' + aid, sessionId: `${runId}:${aid}`,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
+        await this.store.updateTaskStatus(tid, 'waiting_decision', stoppedAt);
+        await this.store.updateAttemptResult(aid, { exitReason: 'prompt_build_failed_before_spawn: ' + message, stoppedAt });
+        await this.releaseLocks(tid, runId);
+        return;
+      }
+      // R2: an injected runner with a configured budget still reserves (so the
+      // cost ledger + heartbeat are exercised in fake tests); only an injected
+      // runner WITHOUT a budget skips the gate (legacy fake-test behavior). A
+      // real non-injected Pi always reserves.
+      const costGate = (this.config.piProcessRunner && !this.config.costBudget)
+        ? { allowed: true, reservationId: null, ownerId: null }
+        : await this.reserveProviderCost({
+        runId, stageId: stage.id, taskId: tid, attemptId: aid,
+        callType: 'pi_worker', callId: aid, provider: 'pi',
+      });
+      if (!costGate.allowed) {
+        const reason = costGate.reason || 'cost_budget_exceeded';
+        console.error('[Scheduler] Real Pi spawn blocked by cost gate: ' + reason);
+        await this.store.updateAttemptStatus(aid, 'interrupted', stoppedAt);
+        await this.store.updateTaskStatus(tid, 'rework_required', stoppedAt);
+        await this.store.updateAttemptResult(aid, { exitReason: reason, stoppedAt });
+        await this.recordCostPause({ runId, stageId: stage.id, taskId: tid, attemptId: aid, provider: 'pi', reason, remaining: costGate.remaining });
+        await this.releaseLocks(tid, runId);
+        return;
+      }
+      piCostReservationId = costGate.reservationId;
       const cfg: PiWorkerConfig = {
         workerId: 'bc-' + aid,
         command: this.config.workerConfig?.command || 'pi',
@@ -1446,15 +1352,33 @@ export class StageScheduler {
         rawLogPath: resolve(ld, runId + '_' + tid + '.log'),
         timeoutMs: this.config.workerConfig?.timeoutMs ?? this.config.workerTimeoutMs,
         allowRealPiExecution: true,
-        requireClarification: this.config.requireWorkerClarification ?? !this.config.piProcessRunner,
+        // Production Provider execution cannot bypass the 95% understanding gate.
+        // The override remains only for injected, non-provider test runners.
+        requireClarification: this.config.piProcessRunner
+          ? (this.config.requireWorkerClarification ?? false)
+          : true,
         env: this.config.privacyService?.buildProviderEnv('pi', undefined, this.config.workerConfig?.model),
         clarificationResponder: new CodexTechnicalClarifier({
           command: this.config.reviewerConfig?.command || 'codex',
           args: this.config.reviewerConfig?.args ?? ['exec', '--ephemeral', '--sandbox', 'read-only', '--ignore-user-config', '--ignore-rules', '-'],
           timeoutMs: this.config.reviewerConfig?.timeoutMs ?? 120_000,
           env: this.config.privacyService?.buildProviderEnv('codex'),
+          signal: this.abortController?.signal,
         }, this.config.codexProcessRunner),
         onProcessSpawn: async (spawnedPid) => {
+          if (piCostReservationId && this.store.markCostReservationSpawned) {
+            await this.store.markCostReservationSpawned(piCostReservationId, costGate.ownerId ?? '', new Date().toISOString());
+          }
+          // R2: refresh the one-shot lease while the worker is running.
+          heartbeatTimer = piCostReservationId && this.store.heartbeatCostReservation
+            ? startCostReservationHeartbeat({
+                reservationId: piCostReservationId,
+                ownerId: costGate.ownerId ?? '',
+                workerTimeoutMs: this.config.workerTimeoutMs,
+                overrideIntervalMs: this.config.costReservationHeartbeatMs,
+                heartbeat: (id, owner, at, lease) => this.store.heartbeatCostReservation!(id, owner, at, lease),
+              })
+            : null;
           await this.store.updateAttemptResult(aid, { piPid: spawnedPid, startedAt: attemptStartedAt });
           await this.store.createEvent({
             id: this.nextEventId(runId, 'ev-attempt-spawned'), runId, stageId: stage.id, taskId: tid, attemptId: aid,
@@ -1462,24 +1386,150 @@ export class StageScheduler {
             eventData: { pid: spawnedPid },
           });
         },
+        // R3: guard runtime self-check before the real Pi clarification session.
+        // Zero-inference probe; failure refuses to start (fail closed). Result is
+        // audited into SQLite (never the raw stderr — only category/version/duration/hash).
+        guardSelfCheck: {
+          markerDir: resolve(this.config.projectRoot, '.brainctl-dev/guard-selfcheck'),
+          verifiedPiVersion: this.config.workerConfig?.verifiedPiVersion ?? '0.82.1',
+          onResult: async (result) => {
+            await this.store.createEvent({
+              id: this.nextEventId(runId, 'ev-guard-selfcheck'),
+              runId, stageId: stage.id, taskId: tid, attemptId: aid,
+              eventType: 'pi_guard_selfcheck',
+              eventData: {
+                ok: result.ok,
+                piVersion: result.piVersion,
+                verifiedPiVersion: result.verifiedPiVersion,
+                versionMismatch: result.versionMismatch,
+                durationMs: result.durationMs,
+                failureCategory: result.failureCategory,
+                stderrHash: result.stderrHash,
+              },
+            });
+          },
+          // B (authorized): one minimal inference, cost-gated, cached per Pi version.
+          inferenceProbe: {
+            enabled: this.config.workerConfig?.allowInferenceProbe === true,
+            model: this.config.workerConfig?.model || 'deepseek/deepseek-v4-flash',
+            reserveCost: async () => {
+              const budget = this.config.costBudget;
+              if (!budget || !this.store.reserveCost) return { allowed: false, reason: 'cost_budget_missing' };
+              const result = await this.store.reserveCost({
+                id: `${runId}-guard-block-probe-cost`,
+                runId,
+                stageId: stage.id,
+                taskId: tid,
+                attemptId: aid,
+                callType: 'pi_worker',
+                callId: `${runId}-guard-block-probe`,
+                currency: budget.currency,
+                budgetLimit: budget.limit,
+                reservedCost: budget.maxPiCallCost,
+                pricingVersion: budget.pricingVersion,
+                ownerId: `${runId}:${aid}:guard-block-probe`,
+                heartbeatAt: new Date().toISOString(),
+              });
+              return { allowed: result.allowed, reason: result.reason };
+            },
+            settleCost: async (outcome, terminationEvidence) => {
+              if (!this.store.finalizeCostReservation) return false;
+              return this.store.finalizeCostReservation({
+                id: `${runId}-guard-block-probe-cost`,
+                outcome,
+                ownerId: `${runId}:${aid}:guard-block-probe`,
+                terminationEvidence,
+              });
+            },
+            cacheGet: async (piVersion) => {
+              if (!this.store.getGuardProbeCache) return null;
+              return this.store.getGuardProbeCache(piVersion);
+            },
+            cacheSet: async (piVersion, outcome, failureCategory) => {
+              if (!this.store.setGuardProbeCache) return;
+              await this.store.setGuardProbeCache(piVersion, outcome, failureCategory, new Date().toISOString());
+            },
+            onResult: async (result) => {
+              await this.store.createEvent({
+                id: this.nextEventId(runId, 'ev-guard-block-probe'),
+                runId, stageId: stage.id, taskId: tid, attemptId: aid,
+                eventType: 'pi_guard_block_probe',
+                eventData: {
+                  ok: result.ok,
+                  outcome: result.outcome,
+                  failureCategory: result.failureCategory,
+                  piVersion: result.piVersion,
+                  durationMs: result.durationMs,
+                  stderrHash: result.stderrHash,
+                },
+              });
+            },
+          },
+        },
       };
+      let heartbeatTimer: NodeJS.Timeout | null = null;
       const pi = new PiRpcWorker(cfg, this.config.piProcessRunner, { ledgerSink: piLedgerSink, invocationContext: piInvocationCtx });
-      const r = await pi.executeTask({ taskSpec: spec, worktreePath: wp, runId });
+      let r: Awaited<ReturnType<PiRpcWorker['executeTask']>>;
+      try {
+        r = await pi.executeTask({ taskSpec: spec, implementationPrompt, worktreePath: wp, runId });
+      } catch (error) {
+        if (piCostReservationId && this.store.finalizeCostReservation) {
+          await this.store.finalizeCostReservation({
+            id: piCostReservationId, outcome: 'unavailable', ownerId: costGate.ownerId,
+            terminationEvidence: 'pi_runner_threw_after_spawn_unknown',
+          });
+        }
+        throw error;
+      } finally {
+        // R2: heartbeat timer must be cleared on EVERY exit path (success,
+        // throw, timeout, abort) — never leave a ref that keeps the process up.
+        stopCostReservationHeartbeat(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+      if (piCostReservationId && this.store.finalizeCostReservation) {
+        await this.store.finalizeCostReservation({
+          id: piCostReservationId, outcome: 'unavailable', ownerId: costGate.ownerId,
+          terminationEvidence: 'provider_money_usage_unavailable',
+        });
+      }
       stoppedAt = new Date().toISOString();
       wrResult = r.workerResult; pid = r.pid ?? null; exitReason = r.errorMessage; rawLog = r.rawLogPath;
       if (!wrResult) {
         const detail = exitReason || 'Pi did not return a valid WorkerResult';
         const reason = `worker_result_missing: ${detail}`;
         await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
-        await this.store.updateTaskStatus(tid, 'failed', stoppedAt);
+        await this.store.updateTaskStatus(tid, 'waiting_decision', stoppedAt);
         await this.store.updateAttemptResult(aid, { piPid: pid, stoppedAt, exitReason: reason, rawLogPath: rawLog || null, promptHash: null as any, workerResultJson: null });
         await this.store.createEvent({ id: runId + '-ev-wr-missing-' + Date.now(), runId, stageId: stage.id, taskId: tid, attemptId: aid, eventType: 'attempt_failed', eventData: { reason: 'worker_result_missing', pid } });
+        await this.recordStagePause({
+          runId, stageId: stage.id, taskId: tid, attemptId: aid,
+          reasonCode: 'worker_result_missing_recovery_available', category: 'recovery', createdAt: stoppedAt,
+        });
         console.log('[Scheduler] WorkerResult MISSING for attempt ' + aid + ' — marked failed (no manual completion).');
         await this.releaseLocks(tid, runId);
         return;
       }
       ph = undefined;
     } else {
+      try {
+        const syntheticPacketHash = sha256(canonicalJson(spec));
+        await this.store.recordAttemptProvenance({
+          attemptId: aid, runId, stageId: stage.id, taskId: tid, baseCommit: taskDiffBase,
+          expectedBranch: bn, expectedWorktree: wp, taskPacketHash: syntheticPacketHash,
+          implementationPromptHash: syntheticPacketHash, workerId: 'fake-' + aid, sessionId: `${runId}:${aid}:fake`,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
+        await this.store.updateTaskStatus(tid, 'waiting_decision', stoppedAt);
+        await this.store.updateAttemptResult(aid, { exitReason: 'provenance_persist_failed_before_fake_worker: ' + message, stoppedAt });
+        await this.recordStagePause({
+          runId, stageId: stage.id, taskId: tid, attemptId: aid,
+          reasonCode: 'provenance_persist_failed', category: 'recovery', createdAt: stoppedAt,
+        });
+        await this.releaseLocks(tid, runId);
+        return;
+      }
       wrResult = this.config.fakeWorkerResult || { taskId: tid, status: 'completed', summary: 'fake', filesChanged: [], checks: [], scopeViolations: [], risks: [], unresolvedQuestions: [], productDecisionRequired: false, tokenUsage: { inputTokens: 0, outputTokens: 0, cacheHitTokens: 0 } };
       exitReason = 'fake_ok'; ph = 'fake';
       stoppedAt = new Date().toISOString();
@@ -1507,11 +1557,10 @@ export class StageScheduler {
           eventType: 'token_budget_exceeded',
           eventData: { policyType: 'pi_attempt', remaining: pc.remaining, limit: pc.limit },
         });
-        await this.store.updateStageStatus(stage.id, 'paused', new Date().toISOString());
-        await this.store.createEvent({
-          id: this.nextEventId(runId, 'ev-pause-budget'), runId, stageId: stage.id,
-          eventType: 'stage_paused',
-          eventData: { reason: 'token_budget_exceeded', policyType: 'pi_attempt' },
+        await this.recordStagePause({
+          runId, stageId: stage.id, taskId: tid, attemptId: aid,
+          reasonCode: 'token_budget_exceeded', category: 'budget',
+          requiredApprovalType: 'run_budget', eventData: { policyType: 'pi_attempt' },
         });
         tokenPaused = true;
       }
@@ -1530,29 +1579,38 @@ export class StageScheduler {
     if (wrResult && wrResult.productDecisionRequired) {
       await this.store.updateAttemptStatus(aid, 'rework_required', stoppedAt);
       await this.store.updateTaskStatus(tid, 'waiting_decision', stoppedAt);
-      await this.store.updateStageStatus(stage.id, 'paused', stoppedAt);
       await this.store.updateAttemptResult(aid, { exitReason: 'product_decision: ' + (exitReason || 'product_decision_required') });
-      await this.store.createEvent({
-        id: this.nextEventId(runId, 'ev-product-decision'), runId, stageId: stage.id, taskId: tid, attemptId: aid,
-        eventType: 'stage_paused',
-        eventData: { reason: 'product_decision_required', unresolvedQuestions: wrResult.unresolvedQuestions },
+      await this.recordStagePause({
+        runId, stageId: stage.id, taskId: tid, attemptId: aid,
+        reasonCode: 'product_decision_required', category: 'product_decision',
+        requiredApprovalType: 'product_decision',
+        eventData: { unresolvedQuestions: wrResult.unresolvedQuestions }, createdAt: stoppedAt,
       });
       await this.releaseLocks(tid, runId);
       return;
     }
     if (wrResult && (wrResult.status === 'blocked' || wrResult.status === 'needs_decision')) {
       await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
-      await this.store.updateTaskStatus(tid, 'failed', stoppedAt);
+      await this.store.updateTaskStatus(tid, 'waiting_decision', stoppedAt);
       await this.store.updateAttemptResult(aid, { exitReason: 'blocked: ' + wrResult.status });
       await this.store.createEvent({
         id: this.nextEventId(runId, 'ev-worker-blocked'), runId, stageId: stage.id, taskId: tid, attemptId: aid,
         eventType: 'attempt_failed',
         eventData: { reason: 'worker_blocked', workerStatus: wrResult.status },
       });
+      await this.recordStagePause({
+        runId, stageId: stage.id, taskId: tid, attemptId: aid,
+        reasonCode: 'worker_blocked', category: 'product_decision', createdAt: stoppedAt,
+      });
       await this.releaseLocks(tid, runId);
       return;
     }
-    if (!wrResult || wrResult.status === 'failed' || wrResult.status === 'scope_violation') { await this.store.updateAttemptStatus(aid, 'failed', stoppedAt); await this.store.updateTaskStatus(tid, 'failed', stoppedAt); await this.releaseLocks(tid, runId); return; }
+    if (!wrResult || wrResult.status === 'failed' || wrResult.status === 'scope_violation') {
+      await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
+      await this.store.updateTaskStatus(tid, wrResult?.status === 'scope_violation' ? 'waiting_decision' : 'rework_required', stoppedAt);
+      await this.releaseLocks(tid, runId);
+      return;
+    }
     await this.store.updateAttemptStatus(aid, 'worker_completed', stoppedAt);
     await this.store.updateTaskStatus(tid, 'worker_completed', stoppedAt);
 
@@ -1565,191 +1623,13 @@ export class StageScheduler {
     }
 
     const ch = wtm.getChangedFiles(wp, taskDiffBase);
-    const sv = dv.validate(ch, spec.allowedPaths || [], spec.forbiddenPaths || []);
-    if (!sv.valid || sv.violations.length > 0) {
-      await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
-      await this.store.updateTaskStatus(tid, 'failed', stoppedAt);
-      await this.store.updateAttemptResult(aid, { exitReason: 'scope: ' + sv.violations.join('; ') });
-      await this.store.createEvent({
-        id: this.nextEventId(runId, 'ev-scope-violation'), runId, stageId: stage.id, taskId: tid, attemptId: aid,
-        eventType: 'attempt_failed',
-        eventData: { reason: 'scope_violation', violations: sv.violations, forbiddenFiles: sv.forbiddenFiles },
-      });
-      await this.releaseLocks(tid, runId);
-      return;
-    }
+    await this.postWorkerHandler.handle({
+      source: 'fresh', runId, stage, taskId: tid, attemptId: aid, spec,
+      workerResult: wrResult, branchName: bn, worktreePath: wp, reviewBase: base,
+      changedFiles: ch, scopeValidator: dv, worktreeManager: wtm, timestamp: stoppedAt,
+    });
+    return;
 
-    if (!await this.verifyCompletionEvidence(aid, tid, stage, runId, wrResult, bn, ch, spec, stoppedAt, wp)) {
-      await this.releaseLocks(tid, runId);
-      return;
-    }
-
-    // ── M4: Scope expansion guard (only when governance enabled) ──
-    if (this.config.governanceEnabled && ch.length > 0) {
-      const scopeResult = checkScopeExpansion(ch, spec.estimatedWritePaths || ['src/'], spec.allowedPaths || []);
-      if (scopeResult.expanded) {
-        await createG2Approval(this.store, runId, tid, 'scope_expansion',
-          `Scope expansion: ${(scopeResult.expansionPct * 100).toFixed(1)}% outside estimate`);
-        await this.store.createEvent({
-          id: this.nextEventId(runId, 'ev-scope'), runId, stageId: stage.id, taskId: tid, attemptId: aid,
-          eventType: 'scope_expansion',
-          eventData: { taskId: tid, expansionPct: scopeResult.expansionPct, expandedCount: scopeResult.expandedFiles.length },
-        });
-        console.log('[Scheduler] Scope expansion detected for task ' + tid + ' — G2 approval created.');
-        await this.store.updateAttemptStatus(aid, 'rework_required', stoppedAt);
-        await this.store.updateTaskStatus(tid, 'waiting_decision', stoppedAt);
-        await this.store.updateStageStatus(stage.id, 'paused', stoppedAt);
-        await this.releaseLocks(tid, runId);
-        return;
-      }
-    }
-
-    if (await this.stopIfCanceled(runId, stage.id, tid, aid, 'before_quality_gate')) {
-      await this.releaseLocks(tid, runId);
-      return;
-    }
-
-
-    await this.store.updateAttemptStatus(aid, 'validating', stoppedAt);
-    await this.store.updateTaskStatus(tid, 'validating', stoppedAt);
-    const gs = this.config.taskQualityGates ?? this.config.qualityGates ?? [];
-    if (gs.length > 0) {
-      const qgStart = Date.now();
-      const qgr = await new QualityGateRunner(wp).runGates(gs, true);
-      const qgDurationMs = Date.now() - qgStart;
-      await this.store.createEvent({ id: runId + '-ev-qg-' + Date.now(), runId, stageId: stage.id, taskId: tid, attemptId: aid, eventType: 'review_completed', eventData: { kind: 'quality_gate', passed: qgr.passed, summary: qgr.summary, results: qgr.results, durationMs: qgDurationMs } });
-      if (!qgr.passed) {
-        await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
-        await this.store.updateTaskStatus(tid, 'failed', stoppedAt);
-        await this.store.updateAttemptResult(aid, { exitReason: 'qg_failed: ' + qgr.summary });
-        await this.releaseLocks(tid, runId);
-        return;
-      }
-    } else {
-      console.log('[Scheduler] FATAL: No quality gates configured for task ' + tid + '. Marking stage incomplete — stage cannot complete without quality gates.');
-      await this.store.createEvent({ id: runId + '-ev-nogate-' + Date.now(), runId, stageId: stage.id, taskId: tid, attemptId: aid, eventType: 'error', eventData: { reason: 'no_quality_gates_configured', fatal: true } });
-      await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
-      await this.store.updateTaskStatus(tid, 'failed', stoppedAt);
-      await this.store.updateAttemptResult(aid, { exitReason: 'no_quality_gates_configured: 缺少阶段级质量门，不能标 completed' });
-      await this.store.updateStageStatus(stage.id, 'paused', stoppedAt);
-      await this.store.createEvent({ id: runId + '-ev-stage-nogate-' + Date.now(), runId, stageId: stage.id, eventType: 'stage_paused', eventData: { reason: 'no_quality_gates_configured' } });
-      await this.releaseLocks(tid, runId);
-      return;
-    }
-
-    if (await this.stopIfCanceled(runId, stage.id, tid, aid, 'before_review')) {
-      await this.releaseLocks(tid, runId);
-      return;
-    }
-
-    // ── Token-Efficient: Skip per-task Codex review for low/medium risk tasks ──
-    const attemptNumber = (await this.store.getLatestAttempt(tid))?.attemptNumber ?? 1;
-    const isRetry = attemptNumber > 1;
-    if (isTokenEfficientMode(this.modeConfig.mode) &&
-        !shouldDoTaskLevelReview(spec, wrResult, true, this.modeConfig.mode, isRetry)) {
-      // Skip per-task review — approve directly from quality gate passage
-      await this.store.updateAttemptStatus(aid, 'review_skipped', stoppedAt);
-      await this.store.updateTaskStatus(tid, 'review_skipped', stoppedAt);
-      await this.store.createEvent({
-        id: this.nextEventId(runId, 'ev-review-skipped'),
-        runId, stageId: stage.id, taskId: tid, attemptId: aid,
-        eventType: 'review_skipped_token_efficient',
-        eventData: { reason: 'token_efficient_mode', mode: this.modeConfig.mode, riskLevel: spec.riskLevel },
-      });
-      console.log('[Scheduler] Token-efficient: skipped per-task Codex review for ' + tid + ' (risk=' + spec.riskLevel + ')');
-
-      // Record zero-token ledger entry for skipped review
-      if (this.config.governanceEnabled) {
-        const skipSink = new SqliteLedgerSink(this.store);
-        const skipCtx: import('../core/token-telemetry.js').InvocationContext = {
-          runId, stageId: stage.id, taskId: tid, attemptId: aid,
-          callType: 'codex_review_skipped', callId: aid + '-skipped', model: 'none',
-          synthetic: false,
-        };
-        await skipSink.writeEstimate(skipCtx, 0, 0, 0);
-        await skipSink.confirmActual(aid + '-skipped', 0, 0, 0, 0, 0);
-      }
-
-      await this.releaseLocks(tid, runId);
-      return;
-    }
-
-    await this.store.updateAttemptStatus(aid, 'reviewing', stoppedAt);
-    await this.store.updateTaskStatus(tid, 'reviewing', stoppedAt);
-    const diff = wtm.getDiff(wp, base);
-    const configuredReviewerType = this.config.reviewerConfig?.type || 'codex-cli';
-    const rv = await this.store.createReview({ id: runId + '-rv-' + aid, attemptId: aid, taskId: tid, reviewerType: configuredReviewerType, status: 'running' });
-
-    // ── M4: Create LedgerSink for Codex review (only when governance enabled) ──
-    let reviewLedgerSink: SqliteLedgerSink | null = null;
-    let reviewInvocationCtx: import('../core/token-telemetry.js').InvocationContext | null = null;
-    if (this.config.governanceEnabled) {
-      reviewLedgerSink = new SqliteLedgerSink(this.store);
-      reviewInvocationCtx = {
-        runId, stageId: stage.id, taskId: tid, attemptId: aid,
-        callType: 'codex_review', callId: rv.id, model: 'codex-cli',
-      };
-    }
-
-    let rr: ReviewResult;
-    if (this.config.allowRealReviewer && (!diff || diff.trim().length === 0)) {
-      await this.blockUnverifiableCompletion(aid, tid, stage, runId, stoppedAt, 'real_reviewer_empty_diff');
-      await this.store.updateReviewResult(rv.id, { status: 'failed', reviewJson: JSON.stringify({ taskId: tid, status: 'rejected', reviewSummary: 'real reviewer blocked: empty diff', findings: ['real_reviewer_empty_diff'], requiredRework: [], qualityGateStatus: 'not_run', mergeAllowed: false, reviewer: 'codex-cli' }), findingsJson: JSON.stringify(['real_reviewer_empty_diff']), requiredReworkJson: '[]', mergeAllowed: false, finishedAt: new Date().toISOString() });
-      await this.releaseLocks(tid, runId);
-      return;
-    } else if (this.config.allowRealReviewer) {
-      // P0-2: Privacy gate before real Provider spawn
-      if (this.config.privacyService) {
-        const spawnGate = this.config.privacyService.canSpawnRealProvider();
-        if (!spawnGate.allowed) {
-          console.error('[Scheduler] Real Codex review spawn blocked: ' + spawnGate.reason);
-          await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
-          await this.store.updateTaskStatus(tid, 'failed', stoppedAt);
-          await this.store.updateAttemptResult(aid, { exitReason: 'privacy_gate_blocked: ' + spawnGate.reason, stoppedAt });
-          await this.releaseLocks(tid, runId);
-          return;
-        }
-      }
-      rr = await new CodexCliReviewer(
-        { workDir: wp, sessionDir: sd, allowRealReview: true, timeoutMs: this.config.reviewerConfig?.timeoutMs ?? 120000, command: this.config.reviewerConfig?.command, args: this.config.reviewerConfig?.args, env: this.config.privacyService?.buildProviderEnv('codex') },
-        { processRunner: this.config.codexProcessRunner, ledgerSink: reviewLedgerSink, invocationContext: reviewInvocationCtx },
-      ).reviewDiff(diff, tid);
-    } else {
-      rr = configuredReviewerType === 'local-rule'
-        ? new LocalRuleReviewer().reviewDiff(diff, tid)
-        : this.config.fakeReviewResult || { taskId: tid, status: 'approved', reviewSummary: 'fake ok', findings: [], requiredRework: [], qualityGateStatus: 'passed', mergeAllowed: true, reviewer: configuredReviewerType };
-      console.log('[Scheduler] Local/fake review mode: attempt ' + aid + ' using ' + configuredReviewerType + '.');
-    }
-
-    await this.store.updateReviewResult(rv.id, { status: (rr.status === 'rejected' ? 'rework_required' : rr.status) as any, reviewJson: JSON.stringify(rr), findingsJson: JSON.stringify(rr.findings || []), requiredReworkJson: JSON.stringify(rr.requiredRework || []), mergeAllowed: rr.mergeAllowed, finishedAt: new Date().toISOString() });
-    if (await this.stopIfCanceled(runId, stage.id, tid, aid, 'before_approve')) {
-      await this.releaseLocks(tid, runId);
-      return;
-    }
-    if (rr.status === 'approved' && rr.mergeAllowed) { await this.store.updateAttemptStatus(aid, 'approved', new Date().toISOString()); await this.store.updateTaskStatus(tid, 'approved', new Date().toISOString()); }
-    else { await this.store.updateAttemptStatus(aid, 'rework_required', new Date().toISOString()); await this.store.updateTaskStatus(tid, 'rework_required', new Date().toISOString()); await this.store.updateAttemptResult(aid, { exitReason: 'review: ' + rr.reviewSummary }); }
-
-    // ── M4: Post-check after Codex review (adapter already wrote estimate/confirmed/unavailable) ──
-    if (this.config.governanceEnabled && reviewInvocationCtx) {
-      const reviewTokens = diff ? diff.split('\n').length * 2 + 500 : 500;
-      const rpc = await postCheckBudget(this.store, runId, 'codex_review_stage', reviewTokens).catch(() => null);
-      if (rpc && rpc.exceeded) {
-        console.log('[Scheduler] Codex review budget exceeded for stage ' + stage.stageNumber + ': ' + rpc.remaining + '/' + rpc.limit);
-        await this.store.createEvent({
-          id: this.nextEventId(runId, 'ev-review-exceeded'), runId, stageId: stage.id, taskId: tid, attemptId: aid,
-          eventType: 'token_budget_exceeded',
-          eventData: { policyType: 'codex_review_stage', remaining: rpc.remaining, limit: rpc.limit },
-        });
-        await this.store.updateStageStatus(stage.id, 'paused', new Date().toISOString());
-        await this.store.createEvent({
-          id: this.nextEventId(runId, 'ev-pause-review'), runId, stageId: stage.id,
-          eventType: 'stage_paused',
-          eventData: { reason: 'token_budget_exceeded', policyType: 'codex_review_stage' },
-        });
-      }
-    }
-
-    await this.releaseLocks(tid, runId);
     } catch (err: any) {
       // P0-3: Unified exception boundary — prevent unhandled rejections from
       // silently breaking retry logic and leaving locks held indefinitely.
@@ -1762,7 +1642,10 @@ export class StageScheduler {
           await this.store.updateAttemptStatus(latest.id, 'failed', errNow);
           await this.store.updateAttemptResult(latest.id, { exitReason: 'exception: ' + errMsg, stoppedAt: errNow });
         }
-        await this.store.updateTaskStatus(tid, 'failed', errNow);
+        const taskAfterError = await this.store.getTask(tid);
+        if (taskAfterError && !['merged', 'failed', 'canceled', 'rejected'].includes(taskAfterError.status)) {
+          await this.store.updateTaskStatus(tid, 'rework_required', errNow);
+        }
         await this.store.createEvent({
           id: this.nextEventId(runId, 'ev-exception'),
           runId, stageId: stage.id, taskId: tid,
@@ -1784,7 +1667,7 @@ export class StageScheduler {
    * continues with quality gate → Codex review → integration.
    */
   private async resumeFromWorkerCompleted(
-    attempt: import('../types/m2-types.js').AttemptRecord,
+    attempt: AttemptRecord,
     spec: StructuredTaskSpec,
     stage: StageRecord, runId: string, base: string,
     wtm: WorktreeManager, dv: DiffScopeValidator,
@@ -1797,12 +1680,6 @@ export class StageScheduler {
 
     console.log('[Scheduler] Resuming from worker_completed for attempt ' + aid + ' (skipping Pi re-execution).');
 
-    // Reuse the active locks kept by the hard-pause path. Recreating them would
-    // collide with the deterministic lock id and could also hide ownership drift.
-    const lps = [...new Set([...(spec.estimatedWritePaths || ['src/']), ...this.config.defaultLockedPaths])];
-    const lockCheck = await this.verifyResumeLocks(runId, stage.id, tid, aid, lps);
-    if (!lockCheck.ok) return;
-
     // Load saved WorkerResult
     let wrResult: WorkerResult | null = null;
     try {
@@ -1811,7 +1688,7 @@ export class StageScheduler {
 
     if (!wrResult) {
       await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
-      await this.store.updateTaskStatus(tid, 'failed', stoppedAt);
+      await this.store.updateTaskStatus(tid, 'waiting_decision', stoppedAt);
       await this.store.updateAttemptResult(aid, { exitReason: 'resume: workerResult missing' });
       await this.releaseLocks(tid, runId);
       return;
@@ -1821,159 +1698,146 @@ export class StageScheduler {
     const { existsSync } = await import('node:fs');
     if (!existsSync(wp)) {
       await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
-      await this.store.updateTaskStatus(tid, 'failed', stoppedAt);
+      await this.store.updateTaskStatus(tid, 'waiting_decision', stoppedAt);
       await this.store.updateAttemptResult(aid, { exitReason: 'resume: worktree missing: ' + wp });
       await this.releaseLocks(tid, runId);
       return;
     }
 
+    const recoveryProof = this.readRecoveryAdoptionProof(attempt, wrResult);
+    if (recoveryProof.kind === 'invalid') {
+      await this.pauseForInvalidRecovery(runId, stage.id, tid, aid, recoveryProof.reason);
+      return;
+    }
+    if (recoveryProof.kind === 'valid') {
+      const currentCommit = wtm.getCurrentCommit(wp);
+      if (currentCommit !== attempt.adoptedCommit) {
+        await this.pauseForInvalidRecovery(runId, stage.id, tid, aid, 'adopted_commit_drift');
+        return;
+      }
+      let currentBranch: string;
+      try {
+        currentBranch = git(wp, ['branch', '--show-current']);
+      } catch {
+        await this.pauseForInvalidRecovery(runId, stage.id, tid, aid, 'adopted_worktree_invalid');
+        return;
+      }
+      if (currentBranch !== bn) {
+        await this.pauseForInvalidRecovery(runId, stage.id, tid, aid, 'adopted_branch_drift');
+        return;
+      }
+    }
+
+    // Reuse the active locks kept by the hard-pause/recovery path. Recovery
+    // additionally proves and locks every adopted changed path, including an
+    // explicitly approved legacy TaskSpec expansion.
+    const observedRecoveryPaths = recoveryProof.kind === 'valid' ? recoveryProof.changedFiles : [];
+    const lps = this.lockPathsFor(spec, observedRecoveryPaths);
+    const lockCheck = await this.verifyResumeLocks(runId, stage.id, tid, aid, lps);
+    if (!lockCheck.ok) return;
+
     // Scope check
     const taskDiffBase = await this.getAttemptDiffBase(runId, aid, base);
     const ch = wtm.getChangedFiles(wp, taskDiffBase);
-    const sv = dv.validate(ch, spec.allowedPaths || [], spec.forbiddenPaths || []);
-    if (!sv.valid || sv.violations.length > 0) {
-      await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
-      await this.store.updateTaskStatus(tid, 'failed', stoppedAt);
-      await this.store.updateAttemptResult(aid, { exitReason: 'scope: ' + sv.violations.join('; ') });
-      await this.releaseLocks(tid, runId);
-      return;
-    }
-
-    if (!await this.verifyCompletionEvidence(aid, tid, stage, runId, wrResult, bn, ch, spec, stoppedAt, wp)) {
-      await this.releaseLocks(tid, runId);
-      return;
-    }
-
-    // ── M4: Scope expansion guard ──
-    if (this.config.governanceEnabled && ch.length > 0) {
-      const scopeResult = checkScopeExpansion(ch, spec.estimatedWritePaths || ['src/'], spec.allowedPaths || []);
-      if (scopeResult.expanded) {
-        await createG2Approval(this.store, runId, tid, 'scope_expansion',
-          `Scope expansion: ${(scopeResult.expansionPct * 100).toFixed(1)}% outside estimate`);
-        await this.store.createEvent({
-          id: this.nextEventId(runId, 'ev-scope'), runId, stageId: stage.id, taskId: tid, attemptId: aid,
-          eventType: 'scope_expansion',
-          eventData: { taskId: tid, expansionPct: scopeResult.expansionPct, expandedCount: scopeResult.expandedFiles.length },
-        });
-        await this.store.updateAttemptStatus(aid, 'rework_required', stoppedAt);
-        await this.store.updateTaskStatus(tid, 'waiting_decision', stoppedAt);
-        await this.store.updateStageStatus(stage.id, 'paused', stoppedAt);
-        await this.releaseLocks(tid, runId);
+    let approvedRecoveryExpansion: string[] = [];
+    if (recoveryProof.kind === 'valid') {
+      const actualChangedFiles = this.canonicalRecoveryPaths(ch);
+      if (actualChangedFiles.length !== recoveryProof.changedFileCount
+        || this.hashRecoveryPaths(actualChangedFiles) !== recoveryProof.changedFilesHash) {
+        await this.pauseForInvalidRecovery(runId, stage.id, tid, aid, 'adopted_changed_files_drift');
+        return;
+      }
+      const scope = checkScopeExpansion(
+        ch, spec.estimatedWritePaths ?? [], spec.allowedPaths ?? [], 0,
+      );
+      approvedRecoveryExpansion = this.canonicalRecoveryPaths([...scope.expandedFiles, ...scope.forbiddenFiles]);
+      const expansionHash = approvedRecoveryExpansion.length > 0
+        ? this.hashRecoveryPaths(approvedRecoveryExpansion) : null;
+      if (approvedRecoveryExpansion.length !== recoveryProof.scopeExpansionFileCount
+        || expansionHash !== recoveryProof.scopeExpansionFilesHash) {
+        await this.pauseForInvalidRecovery(runId, stage.id, tid, aid, 'adopted_scope_expansion_drift');
         return;
       }
     }
+    const taskAllowedPaths = spec.allowedPaths || [];
+    const effectiveAllowedPaths = taskAllowedPaths.length === 0
+      ? []
+      : [...taskAllowedPaths, ...approvedRecoveryExpansion];
+    await this.postWorkerHandler.handle({
+      source: 'resume', runId, stage, taskId: tid, attemptId: aid, spec,
+      workerResult: wrResult, branchName: bn, worktreePath: wp, reviewBase: base,
+      changedFiles: ch, scopeValidator: dv, worktreeManager: wtm, timestamp: stoppedAt,
+      effectiveAllowedPaths, recoveryExpansionApproved: recoveryProof.kind === 'valid',
+    });
+    return;
 
-    if (await this.stopIfCanceled(runId, stage.id, tid, aid, 'before_quality_gate_resume')) {
-      await this.releaseLocks(tid, runId);
-      return;
+  }
+
+  private canonicalRecoveryPaths(paths: string[]): string[] {
+    return [...new Set(paths.map((value) => value.replace(/\\/g, '/').replace(/^\.\//, '')))].sort();
+  }
+
+  private hashRecoveryPaths(paths: string[]): string {
+    return createHash('sha256').update(this.canonicalRecoveryPaths(paths).join('\n')).digest('hex');
+  }
+
+  private readRecoveryAdoptionProof(
+    attempt: AttemptRecord,
+    workerResult: WorkerResult,
+  ):
+    | { kind: 'none' }
+    | { kind: 'invalid'; reason: string }
+    | {
+      kind: 'valid'; changedFiles: string[]; changedFileCount: number; changedFilesHash: string;
+      scopeExpansionFileCount: number; scopeExpansionFilesHash: string | null;
+    } {
+    if (attempt.resultSource === 'pi') return { kind: 'none' };
+    if (!['manual', 'codex_recovery'].includes(attempt.resultSource)
+      || !attempt.adoptedCommit
+      || workerResult.commitHash !== attempt.adoptedCommit) {
+      return { kind: 'invalid', reason: 'adoption_provenance_invalid' };
     }
 
-    // Quality gate
-    await this.store.updateAttemptStatus(aid, 'validating', stoppedAt);
-    await this.store.updateTaskStatus(tid, 'validating', stoppedAt);
-    const gs = this.config.taskQualityGates ?? this.config.qualityGates ?? [];
-    if (gs.length > 0) {
-      const qgStart = Date.now();
-      const qgr = await new QualityGateRunner(wp).runGates(gs, true);
-      const qgDurationMs = Date.now() - qgStart;
-      await this.store.createEvent({ id: runId + '-ev-qg-' + Date.now(), runId, stageId: stage.id, taskId: tid, attemptId: aid, eventType: 'review_completed', eventData: { kind: 'quality_gate', passed: qgr.passed, summary: qgr.summary, results: qgr.results, durationMs: qgDurationMs } });
-      if (!qgr.passed) {
-        await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
-        await this.store.updateTaskStatus(tid, 'failed', stoppedAt);
-        await this.store.updateAttemptResult(aid, { exitReason: 'qg_failed: ' + qgr.summary });
-        await this.releaseLocks(tid, runId);
-        return;
-      }
-    } else {
-      console.log('[Scheduler] FATAL: No quality gates configured for resumed task ' + tid + '.');
-      await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
-      await this.store.updateTaskStatus(tid, 'failed', stoppedAt);
-      await this.store.updateAttemptResult(aid, { exitReason: 'no_quality_gates_configured' });
-      await this.store.updateStageStatus(stage.id, 'paused', stoppedAt);
-      await this.releaseLocks(tid, runId);
-      return;
+    let metadata: Record<string, unknown>;
+    try {
+      metadata = JSON.parse(attempt.adoptionMetadataJson || '{}') as Record<string, unknown>;
+    } catch {
+      return { kind: 'invalid', reason: 'adoption_metadata_invalid' };
     }
-
-    if (await this.stopIfCanceled(runId, stage.id, tid, aid, 'before_review_resume')) {
-      await this.releaseLocks(tid, runId);
-      return;
+    const changedFiles = this.canonicalRecoveryPaths(workerResult.filesChanged || []);
+    const changedFileCount = Number(metadata.changedFileCount);
+    const changedFilesHash = typeof metadata.changedFilesHash === 'string' ? metadata.changedFilesHash : '';
+    const scopeExpansionFileCount = Number(metadata.scopeExpansionFileCount);
+    const scopeExpansionFilesHash = metadata.scopeExpansionFilesHash == null
+      ? null : String(metadata.scopeExpansionFilesHash);
+    if (!Number.isInteger(changedFileCount) || changedFileCount !== changedFiles.length
+      || changedFilesHash !== this.hashRecoveryPaths(changedFiles)
+      || !Number.isInteger(scopeExpansionFileCount) || scopeExpansionFileCount < 0
+      || (scopeExpansionFileCount > 0 && !scopeExpansionFilesHash)
+      || (scopeExpansionFileCount === 0 && scopeExpansionFilesHash !== null)) {
+      return { kind: 'invalid', reason: 'adoption_metadata_mismatch' };
     }
+    return {
+      kind: 'valid', changedFiles, changedFileCount, changedFilesHash,
+      scopeExpansionFileCount, scopeExpansionFilesHash,
+    };
+  }
 
-    // Codex review
-    await this.store.updateAttemptStatus(aid, 'reviewing', stoppedAt);
-    await this.store.updateTaskStatus(tid, 'reviewing', stoppedAt);
-    const diff = wtm.getDiff(wp, base);
-    const configuredReviewerType = this.config.reviewerConfig?.type || 'codex-cli';
-    const rv = await this.store.createReview({ id: runId + '-rv-' + aid, attemptId: aid, taskId: tid, reviewerType: configuredReviewerType, status: 'running' });
-
-    let reviewLedgerSink: SqliteLedgerSink | null = null;
-    let reviewInvocationCtx: import('../core/token-telemetry.js').InvocationContext | null = null;
-    if (this.config.governanceEnabled) {
-      reviewLedgerSink = new SqliteLedgerSink(this.store);
-      reviewInvocationCtx = { runId, stageId: stage.id, taskId: tid, attemptId: aid, callType: 'codex_review', callId: rv.id, model: 'codex-cli' };
-    }
-
-    const sd = resolve(this.config.projectRoot, this.config.sessionDir);
-    let rr: ReviewResult;
-    if (this.config.allowRealReviewer && (!diff || diff.trim().length === 0)) {
-      await this.blockUnverifiableCompletion(aid, tid, stage, runId, stoppedAt, 'real_reviewer_empty_diff');
-      await this.store.updateReviewResult(rv.id, { status: 'failed', reviewJson: JSON.stringify({ taskId: tid, status: 'rejected', reviewSummary: 'real reviewer blocked: empty diff', findings: ['real_reviewer_empty_diff'], requiredRework: [], qualityGateStatus: 'not_run', mergeAllowed: false, reviewer: 'codex-cli' }), findingsJson: JSON.stringify(['real_reviewer_empty_diff']), requiredReworkJson: '[]', mergeAllowed: false, finishedAt: new Date().toISOString() });
-      await this.releaseLocks(tid, runId);
-      return;
-    } else if (this.config.allowRealReviewer) {
-      // P0-2: Privacy gate before real Provider spawn
-      if (this.config.privacyService) {
-        const spawnGate = this.config.privacyService.canSpawnRealProvider();
-        if (!spawnGate.allowed) {
-          console.error('[Scheduler] Real Codex review spawn blocked (resume): ' + spawnGate.reason);
-          await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
-          await this.store.updateTaskStatus(tid, 'failed', stoppedAt);
-          await this.store.updateAttemptResult(aid, { exitReason: 'privacy_gate_blocked: ' + spawnGate.reason, stoppedAt });
-          await this.releaseLocks(tid, runId);
-          return;
-        }
-      }
-      rr = await new CodexCliReviewer(
-        { workDir: wp, sessionDir: sd, allowRealReview: true, timeoutMs: this.config.reviewerConfig?.timeoutMs ?? 120000, command: this.config.reviewerConfig?.command, args: this.config.reviewerConfig?.args, env: this.config.privacyService?.buildProviderEnv('codex') },
-        { processRunner: this.config.codexProcessRunner, ledgerSink: reviewLedgerSink, invocationContext: reviewInvocationCtx },
-      ).reviewDiff(diff, tid);
-    } else {
-      rr = configuredReviewerType === 'local-rule'
-        ? new LocalRuleReviewer().reviewDiff(diff, tid)
-        : this.config.fakeReviewResult || { taskId: tid, status: 'approved', reviewSummary: 'fake ok', findings: [], requiredRework: [], qualityGateStatus: 'passed', mergeAllowed: true, reviewer: configuredReviewerType };
-      console.log('[Scheduler] Local/fake review mode (resume): attempt ' + aid + ' using ' + configuredReviewerType + '.');
-    }
-
-    await this.store.updateReviewResult(rv.id, { status: (rr.status === 'rejected' ? 'rework_required' : rr.status) as any, reviewJson: JSON.stringify(rr), findingsJson: JSON.stringify(rr.findings || []), requiredReworkJson: JSON.stringify(rr.requiredRework || []), mergeAllowed: rr.mergeAllowed, finishedAt: new Date().toISOString() });
-    if (await this.stopIfCanceled(runId, stage.id, tid, aid, 'before_approve_resume')) {
-      await this.releaseLocks(tid, runId);
-      return;
-    }
-    if (rr.status === 'approved' && rr.mergeAllowed) { await this.store.updateAttemptStatus(aid, 'approved', new Date().toISOString()); await this.store.updateTaskStatus(tid, 'approved', new Date().toISOString()); }
-    else { await this.store.updateAttemptStatus(aid, 'rework_required', new Date().toISOString()); await this.store.updateTaskStatus(tid, 'rework_required', new Date().toISOString()); await this.store.updateAttemptResult(aid, { exitReason: 'review: ' + rr.reviewSummary }); }
-
-    // ── M4: Post-check after Codex review ──
-    if (this.config.governanceEnabled && reviewInvocationCtx) {
-      const reviewTokens = diff ? diff.split('\n').length * 2 + 500 : 500;
-      const rpc = await postCheckBudget(this.store, runId, 'codex_review_stage', reviewTokens).catch(() => null);
-      if (rpc && rpc.exceeded) {
-        console.log('[Scheduler] Codex review budget exceeded for resumed stage ' + stage.stageNumber + ': ' + rpc.remaining + '/' + rpc.limit);
-        await this.store.createEvent({
-          id: this.nextEventId(runId, 'ev-review-exceeded'), runId, stageId: stage.id, taskId: tid, attemptId: aid,
-          eventType: 'token_budget_exceeded',
-          eventData: { policyType: 'codex_review_stage', remaining: rpc.remaining, limit: rpc.limit },
-        });
-        await this.store.updateStageStatus(stage.id, 'paused', new Date().toISOString());
-        await this.store.createEvent({
-          id: this.nextEventId(runId, 'ev-pause-review'), runId, stageId: stage.id,
-          eventType: 'stage_paused',
-          eventData: { reason: 'token_budget_exceeded', policyType: 'codex_review_stage' },
-        });
-      }
-    }
-
-    await this.releaseLocks(tid, runId);
-    console.log('[Scheduler] Resume complete for attempt ' + aid + ' (status: ' + (rr.status === 'approved' ? 'approved' : 'rework_required') + ')');
+  private async pauseForInvalidRecovery(
+    runId: string,
+    stageId: string,
+    taskId: string,
+    attemptId: string,
+    detail: string,
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    await this.store.updateAttemptResult(attemptId, { exitReason: 'recovery_integrity_invalid: ' + detail });
+    await this.recordStagePause({
+      runId, stageId, taskId, attemptId,
+      reasonCode: 'recovery_integrity_invalid', category: 'recovery',
+      eventData: { detail }, createdAt: now,
+    });
+    console.log('[Scheduler] Resume paused for attempt ' + attemptId + ': recovery integrity invalid (' + detail + ').');
   }
 
   private expectedLockId(runId: string, taskId: string, filePath: string): string {
@@ -2033,356 +1897,28 @@ export class StageScheduler {
     conflictCount?: number,
   ): Promise<void> {
     const now = new Date().toISOString();
-    await this.store.updateStageStatus(stageId, 'paused', now);
     await this.store.updateAttemptResult(attemptId, { exitReason: 'resume_path_lock_invalid: ' + reason });
-    await this.store.createEvent({
-      id: this.nextEventId(runId, 'ev-resume-lock-invalid'),
+    await this.recordStagePause({
       runId, stageId, taskId, attemptId,
-      eventType: 'stage_paused',
+      reasonCode: 'resume_path_lock_invalid', category: 'recovery',
       eventData: {
-        reason: 'resume_path_lock_invalid',
         detail: reason,
         filePath,
         conflictCount,
       },
+      createdAt: now,
     });
     console.log('[Scheduler] Resume paused for attempt ' + attemptId + ': invalid path lock (' + reason + ').');
   }
 
-  private async integrate(stage: StageRecord, runId: string, wtm: WorktreeManager, base: string): Promise<void> {
-    const now = new Date().toISOString();
-    const ib = 'brainctl/int/' + runId + '/stage-' + stage.stageNumber;
-    await this.store.updateStageIntegrationBranch(stage.id, ib);
-    await this.store.updateStageStatus(stage.id, 'integration', now);
-    const batch = await this.store.createIntegrationBatch({ id: runId + '-batch-' + stage.id, stageId: stage.id, runId, integrationBranch: ib });
-    const stageTasks = await this.tasksForStage(stage, runId);
-
-    const gs = this.config.stageQualityGates ?? this.config.qualityGates ?? [];
-    if (gs.length === 0) {
-      console.log('[Scheduler] Cannot integrate stage ' + stage.stageNumber + ': no quality gates configured.');
-      await this.store.updateIntegrationBatch(batch.id, { status: 'failed', finishedAt: now });
-      await this.store.updateStageStatus(stage.id, 'paused', now);
-      await this.mergeBlockApprovedTasks(stageTasks, now);
-      await this.store.createEvent({ id: runId + '-ev-int-nogate-' + Date.now(), runId, stageId: stage.id, eventType: 'error', eventData: { reason: 'no_quality_gates_configured', stage: stage.stageNumber } });
-      return;
-    }
-    const unapprovedTasks = stageTasks.filter((task) => task.status !== 'approved' && task.status !== 'review_skipped');
-    if (unapprovedTasks.length > 0) {
-      await this.store.updateIntegrationBatch(batch.id, { status: 'failed', conflictsJson: JSON.stringify({ reason: 'integration_with_unapproved_tasks', taskIds: unapprovedTasks.map((task) => task.id) }), finishedAt: now });
-      await this.store.updateStageStatus(stage.id, 'paused', now);
-      await this.mergeBlockApprovedTasks(stageTasks, now);
-      await this.store.createEvent({ id: this.nextEventId(runId, 'ev-unapproved-integration'), runId, stageId: stage.id, eventType: 'stage_paused', eventData: { reason: 'integration_with_unapproved_tasks', taskIds: unapprovedTasks.map((task) => task.id) } });
-      console.log('[Scheduler] Refusing integration: task approval invariant failed.');
-      return;
-    }
-
-    if (this.config.governanceEnabled) {
-      const pendingG2: string[] = [];
-      for (const task of stageTasks) {
-        const g2 = await checkG2Approvable(this.store, runId, task.id);
-        if (!g2.approvable) pendingG2.push(task.id);
-      }
-      if (pendingG2.length > 0) {
-        await this.store.updateIntegrationBatch(batch.id, { status: 'failed', conflictsJson: JSON.stringify({ reason: 'pending_g2_before_integration', taskIds: pendingG2 }), finishedAt: now });
-        await this.store.updateStageStatus(stage.id, 'paused', now);
-        await this.mergeBlockApprovedTasks(stageTasks, now);
-        await this.store.createEvent({ id: this.nextEventId(runId, 'ev-pending-g2-integration'), runId, stageId: stage.id, eventType: 'stage_paused', eventData: { reason: 'pending_g2_before_integration', taskIds: pendingG2 } });
-        console.log('[Scheduler] Refusing integration: pending G2 approval exists.');
-        return;
-      }
-    }
-
-    try {
-      wtm.createBranch(ib, base);
-      const ir = this.config.worktreeBaseDir + '/' + runId + '/int/stage-' + stage.stageNumber;
-      const ip = resolve(this.config.projectRoot, ir);
-      mkdirSync(dirname(ip), { recursive: true });
-      wtm.createWorktree(ib, ir);
-
-      const atts = await this.store.listAttemptsByStage(stage.id);
-      const bs: string[] = [];
-      const skippedTaskBranches: Array<{ taskId: string; branchName: string; diff: string }> = [];
-      for (const a of atts) {
-        if ((a.status === 'approved' || a.status === 'review_skipped') && a.branchName) {
-          bs.push(a.branchName);
-          if (a.status === 'review_skipped') {
-            try {
-              const aDiff = git(this.config.projectRoot, ['diff', `${base}..${a.branchName}`]);
-              skippedTaskBranches.push({ taskId: a.taskId, branchName: a.branchName, diff: aDiff });
-            } catch { /* skip */ }
-          }
-        }
-      }
-
-      for (const b of bs) {
-        try { git(ip, ['merge', '--no-ff', '--no-edit', '--', b]); }
-        catch (e: any) {
-          const ev = { branch: b, message: e.message || String(e) };
-          const pausedAt = new Date().toISOString();
-          await this.store.updateIntegrationBatch(batch.id, { status: 'conflict', conflictsJson: JSON.stringify(ev), finishedAt: pausedAt });
-          await this.store.updateStageStatus(stage.id, 'paused', pausedAt);
-          await this.mergeBlockApprovedTasks(stageTasks, pausedAt);
-          await this.store.createEvent({ id: runId + '-ev-conflict-' + Date.now(), runId, stageId: stage.id, eventType: 'integration_conflict', eventData: ev });
-          console.log('[Scheduler] Integration conflict ' + b + '.'); return;
-        }
-      }
-
-      if (await this.stopIfCanceled(runId, stage.id, null, null, 'before_stage_quality_gate')) return;
-
-      const qg = new QualityGateRunner(ip);
-      const qgResult = await qg.runGates(gs, true);
-      await this.store.createEvent({ id: runId + '-ev-int-qg-' + Date.now(), runId, stageId: stage.id, eventType: 'review_completed', eventData: { kind: 'stage_quality_gate', passed: qgResult.passed, summary: qgResult.summary, results: qgResult.results } });
-      if (!qgResult.passed) {
-        const pausedAt = new Date().toISOString();
-        console.log('[Scheduler] Stage-level quality gates failed for stage ' + stage.stageNumber + ': ' + qgResult.summary);
-        await this.store.updateIntegrationBatch(batch.id, { status: 'failed', finishedAt: pausedAt });
-        await this.store.updateStageStatus(stage.id, 'paused', pausedAt);
-        await this.mergeBlockApprovedTasks(stageTasks, pausedAt);
-        await this.store.createEvent({ id: runId + '-ev-qg-fail-' + Date.now(), runId, stageId: stage.id, eventType: 'stage_failed', eventData: { reason: 'stage_quality_gates_failed', summary: qgResult.summary } });
-        return;
-      }
-
-      const mh = git(ip, ['rev-parse', 'HEAD']);
-      await this.store.updateIntegrationBatch(batch.id, { status: 'completed', mergeCommitHash: mh, baseCommit: base, finishedAt: new Date().toISOString() });
-
-      // ── M4: G3 Merge Gate check before target branch merge ──
-      if (await this.stopIfCanceled(runId, stage.id, null, null, 'before_integration_merge')) return;
-
-      if (this.config.governanceEnabled) {
-        const g3Check = await checkG3Approvable(this.store, runId, stage.id);
-        if (!g3Check.approvable) {
-          const pausedAt = new Date().toISOString();
-          console.log('[Scheduler] G3 blocked integration for stage ' + stage.stageNumber + ' (' + g3Check.pendingDecisions.length + ' pending)');
-          await this.store.updateStageStatus(stage.id, 'paused', pausedAt);
-          await this.mergeBlockApprovedTasks(stageTasks, pausedAt);
-          await this.store.createEvent({
-            id: this.nextEventId(runId, 'ev-g3-block'), runId, stageId: stage.id,
-            eventType: 'stage_paused',
-            eventData: { reason: 'g3_pending_approval', stageNumber: stage.stageNumber },
-          });
-          return;
-        }
-
-        // Check for large diff (estimate: count total lines from all attempts' diffs)
-        let totalDiffLines = 0;
-        for (const att of atts) {
-          if (att.status === 'approved' && att.branchName) {
-            try {
-              const diffOut = git(this.config.projectRoot, ['diff', `${base}..${att.branchName}`, '--stat']);
-              const lastLine = diffOut.trim().split('\n').pop() || '';
-              const match = lastLine.match(/(\d+) insertion/);
-              const insertions = match ? parseInt(match[1], 10) : 0;
-              const delMatch = lastLine.match(/(\d+) deletion/);
-              const deletions = delMatch ? parseInt(delMatch[1], 10) : 0;
-              totalDiffLines += insertions + deletions;
-            } catch { /* skip */ }
-          }
-        }
-
-        if (totalDiffLines > 500) {
-          const pausedAt = new Date().toISOString();
-          await createG3Approval(this.store, runId, stage.id, 'large_merge',
-            `Merge diff exceeds 500 lines (${totalDiffLines} total)`);
-          console.log('[Scheduler] Large merge diff for stage ' + stage.stageNumber + ' — G3 approval created.');
-          await this.store.updateStageStatus(stage.id, 'paused', pausedAt);
-          await this.mergeBlockApprovedTasks(stageTasks, pausedAt);
-          await this.store.createEvent({
-            id: this.nextEventId(runId, 'ev-large-merge'), runId, stageId: stage.id,
-            eventType: 'stage_paused',
-            eventData: { reason: 'large_merge_diff', diffLines: totalDiffLines },
-          });
-          return;
-        }
-
-        // Token budget post-check for stage
-        const budgetCheck = await preCheckBudget(this.store, runId, 'codex_review_stage', 10000);
-        if (!budgetCheck.allowed) {
-          const pausedAt = new Date().toISOString();
-          await createG3Approval(this.store, runId, stage.id, 'stage_budget_override',
-            budgetCheck.reason || 'stage_budget_exceeded');
-          console.log('[Scheduler] Stage budget exceeded for stage ' + stage.stageNumber + ' — G3 approval created.');
-          await this.store.updateStageStatus(stage.id, 'paused', pausedAt);
-          await this.mergeBlockApprovedTasks(stageTasks, pausedAt);
-          await this.store.createEvent({
-            id: runId + '-ev-budget-merge-' + Date.now(), runId, stageId: stage.id,
-            eventType: 'token_budget_exceeded',
-            eventData: { policyType: 'codex_review_stage', remaining: budgetCheck.remaining, limit: budgetCheck.limit },
-          });
-          return;
-        }
-      }
-
-      // ── Token-Efficient: Stage-level aggregated Codex review ──
-      if (skippedTaskBranches.length > 0 && isTokenEfficientMode(this.modeConfig.mode)) {
-        console.log('[Scheduler] Running stage-level aggregated review for ' + skippedTaskBranches.length + ' skipped tasks in stage ' + stage.stageNumber);
-        await this.store.createEvent({
-          id: this.nextEventId(runId, 'ev-stage-review-start'),
-          runId, stageId: stage.id,
-          eventType: 'stage_review_started',
-          eventData: { taskCount: skippedTaskBranches.length, stageNumber: stage.stageNumber },
-        });
-
-        const aggregatedDiff = skippedTaskBranches.map(t => t.diff).join('\n\n');
-        const taskGateResults = stageTasks
-          .filter(t => skippedTaskBranches.some(s => s.taskId === t.id))
-          .map(t => ({ taskId: t.id, passed: true, summary: 'quality gate passed' }));
-        const reviewInput = prepareStageReviewInput(stage, aggregatedDiff, taskGateResults);
-
-        let stageReviewLedgerSink: SqliteLedgerSink | null = null;
-        let stageReviewCtx: import('../core/token-telemetry.js').InvocationContext | null = null;
-        if (this.config.governanceEnabled) {
-          stageReviewLedgerSink = new SqliteLedgerSink(this.store);
-          stageReviewCtx = {
-            runId, stageId: stage.id,
-            callType: 'stage_review', callId: `${runId}-stage-review-${stage.stageNumber}`,
-            model: 'codex-cli', synthetic: !this.config.allowRealReviewer,
-          };
-        }
-
-        const stageReviewResult = await runStageReview(
-          reviewInput, base, this.reviewCache, this.store, runId, stage.id,
-          {
-            workDir: ip,
-            sessionDir: resolve(this.config.projectRoot, this.config.sessionDir),
-            allowRealReview: this.config.allowRealReviewer,
-            timeoutMs: this.config.reviewerConfig?.timeoutMs ?? 120000,
-            command: this.config.reviewerConfig?.command,
-            args: this.config.reviewerConfig?.args,
-            codexProcessRunner: this.config.codexProcessRunner,
-            ledgerSink: stageReviewLedgerSink ?? undefined,
-            invocationContext: stageReviewCtx ?? undefined,
-          },
-        );
-
-        if (!stageReviewResult.passed) {
-          const pausedAt = new Date().toISOString();
-          console.log('[Scheduler] Stage-level review FAILED for stage ' + stage.stageNumber + '. Promoting to task-level reviews.');
-          await this.store.createEvent({
-            id: this.nextEventId(runId, 'ev-stage-review-fail'),
-            runId, stageId: stage.id,
-            eventType: 'stage_review_failed',
-            eventData: { findings: stageReviewResult.reviewResult.findings },
-          });
-          await this.store.updateStageStatus(stage.id, 'paused', pausedAt);
-          await this.mergeBlockApprovedTasks(stageTasks, pausedAt);
-          return;
-        }
-
-        // Stage review passed — approve all skipped tasks
-        const approvedAt = new Date().toISOString();
-        if (await this.stopIfCanceled(runId, stage.id, null, null, 'before_stage_review_approve')) return;
-        for (const st of skippedTaskBranches) {
-          await this.store.updateAttemptStatus(
-            (await this.store.getLatestAttempt(st.taskId))?.id || '',
-            'approved', approvedAt,
-          );
-          await this.store.updateTaskStatus(st.taskId, 'approved', approvedAt);
-        }
-        await this.store.createEvent({
-          id: this.nextEventId(runId, 'ev-stage-review-ok'),
-          runId, stageId: stage.id,
-          eventType: 'stage_review_completed',
-          eventData: { cacheHit: stageReviewResult.cacheHit, approvedTasks: skippedTaskBranches.map(s => s.taskId) },
-        });
-        console.log('[Scheduler] Stage-level review PASSED for stage ' + stage.stageNumber + ' (' + (stageReviewResult.cacheHit ? 'cache hit' : 'fresh review') + ')');
-      }
-
-      let targetBranch = this.config.targetBranch;
-      try {
-        const currentBranch = git(this.config.projectRoot, ['rev-parse', '--abbrev-ref', 'HEAD']);
-        try { git(this.config.projectRoot, ['rev-parse', '--verify', '--end-of-options', targetBranch]); }
-        catch { console.log('[Scheduler] Target branch ' + targetBranch + ' not found. Using current branch: ' + currentBranch); targetBranch = currentBranch; }
-        const worktreeList = git(this.config.projectRoot, ['worktree', 'list', '--porcelain']);
-        const checkedOutBranches = worktreeList.split('\n').filter((line) => line.startsWith('branch ')).map((line) => line.replace(/^branch refs\/heads\//, '').trim());
-        if (currentBranch !== targetBranch) {
-          if (checkedOutBranches.some((b) => b === targetBranch || b === 'refs/heads/' + targetBranch)) {
-            console.log('[Scheduler] WARNING: target branch ' + targetBranch + ' checked out in another worktree. Attempting checkout in main worktree.');
-          }
-          git(this.config.projectRoot, ['checkout', targetBranch]);
-        }
-        git(this.config.projectRoot, ['merge', '--no-ff', '--no-edit', '--', ib]);
-        const targetMergeCommit = git(this.config.projectRoot, ['rev-parse', 'HEAD']);
-        await this.store.updateIntegrationBatch(batch.id, { mergeCommitHash: targetMergeCommit, targetMergeCommit: targetMergeCommit, finishedAt: new Date().toISOString() });
-        await this.store.createEvent({ id: runId + '-ev-target-merge-' + Date.now(), runId, stageId: stage.id, eventType: 'integration_completed', eventData: { targetBranch, targetMergeCommit, integrationBranch: ib } });
-        console.log('[Scheduler] Target branch merge complete: ' + ib + ' -> ' + targetBranch + ' (' + targetMergeCommit + ')');
-      } catch (mergeErr: any) {
-        const errMsg = mergeErr.message || String(mergeErr);
-        const pausedAt = new Date().toISOString();
-        console.log('[Scheduler] Target branch merge conflict: ' + errMsg);
-        await this.store.updateIntegrationBatch(batch.id, { status: 'conflict', conflictsJson: JSON.stringify({ error: errMsg, integrationBranch: ib, targetBranch }), finishedAt: pausedAt });
-        await this.store.updateStageStatus(stage.id, 'paused', pausedAt);
-        await this.mergeBlockApprovedTasks(stageTasks, pausedAt);
-        await this.store.createEvent({ id: runId + '-ev-target-conflict-' + Date.now(), runId, stageId: stage.id, eventType: 'integration_conflict', eventData: { integrationBranch: ib, targetBranch, error: errMsg } });
-        return;
-      }
-
-      const mergedAt = new Date().toISOString();
-      for (const task of stageTasks) {
-        await this.store.updateTaskStatus(task.id, 'merged', mergedAt);
-      }
-      await this.store.updateStageStatus(stage.id, 'completed', mergedAt);
-      await this.store.createEvent({ id: runId + '-ev-int-ok-' + Date.now(), runId, stageId: stage.id, eventType: 'stage_completed', eventData: { stageNumber: stage.stageNumber, targetBranch, targetMergeCommit: git(this.config.projectRoot, ['rev-parse', 'HEAD']) } });
-      console.log('[Scheduler] Stage ' + stage.stageNumber + ' integrated + merged to ' + targetBranch + '.');
-      if (this.config.cleanupMergedWorktrees || this.config.allowRealWorker || this.config.allowRealReviewer) {
-        await this.cleanupMergedStageWorktrees(runId, stage.id, wtm, atts, ib, ip);
-      }
-    } catch (e: any) {
-      const pausedAt = new Date().toISOString();
-      await this.store.updateIntegrationBatch(batch.id, { status: 'failed', conflictsJson: JSON.stringify({ error: e.message }), finishedAt: pausedAt });
-      await this.store.updateStageStatus(stage.id, 'paused', pausedAt);
-      await this.mergeBlockApprovedTasks(stageTasks, pausedAt);
-    }
-  }
-
-  private async cleanupMergedStageWorktrees(
+  /** Thin orchestration seam retained for characterization tests. */
+  private async integrate(
+    stage: StageRecord,
     runId: string,
-    stageId: string,
-    wtm: WorktreeManager,
-    attempts: Awaited<ReturnType<StateStore['listAttemptsByStage']>>,
-    integrationBranch: string,
-    integrationWorktreePath: string,
-  ): Promise<void> {
-    const warnings: string[] = [];
-    const cleanupBranch = async (branchName: string, worktreePath?: string | null): Promise<void> => {
-      try {
-        await wtm.cleanupWorktree(branchName, worktreePath || undefined);
-        wtm.deleteBranch(branchName);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        warnings.push(branchName + ': ' + message.split('\n')[0]);
-      }
-    };
-
-    await cleanupBranch(integrationBranch, integrationWorktreePath);
-    for (const attempt of attempts) {
-      if (attempt.status !== 'approved' || !attempt.branchName) continue;
-      await cleanupBranch(attempt.branchName, attempt.worktreePath);
-    }
-
-    if (warnings.length > 0) {
-      await this.store.createEvent({
-        id: this.nextEventId(runId, 'ev-cleanup-warning'),
-        runId, stageId,
-        eventType: 'cleanup_warning',
-        eventData: { warnings },
-      });
-      console.log('[Scheduler] Cleanup warning after merge: ' + warnings.join('; '));
-    }
-  }
-
-  /**
-   * When integration fails (conflict/failed batch), mark all approved tasks
-   * as merge_blocked so downstream consumers never mistake approved for merged.
-   */
-  private async mergeBlockApprovedTasks(
-    stageTasks: Array<{ id: string; status: string }>,
-    timestamp: string,
-  ): Promise<void> {
-    for (const task of stageTasks) {
-      if (task.status === 'approved' || task.status === 'review_skipped') {
-        await this.store.updateTaskStatus(task.id, 'merge_blocked', timestamp);
-      }
-    }
+    worktrees: WorktreeManager,
+    base: string,
+  ): Promise<boolean> {
+    return this.integrationCoordinator.integrate(stage, runId, worktrees, base);
   }
 
   private async releaseLocks(taskId: string, runId: string): Promise<void> {

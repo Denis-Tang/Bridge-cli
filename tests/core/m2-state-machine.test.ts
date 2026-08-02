@@ -65,6 +65,7 @@ describe('Attempt Status Transitions', () => {
     ['reviewing', 'approved', true],
     ['reviewing', 'rework_required', true],
     ['reviewing', 'failed', true],
+    ['reviewing', 'canceled', true],
     ['rework_required', 'running', true],
     ['approved', 'running', false],
     ['failed', 'running', false],

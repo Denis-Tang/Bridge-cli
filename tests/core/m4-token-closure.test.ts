@@ -23,7 +23,11 @@ import { promptHash } from '../../src/utils/sanitize.js';
 import { StageScheduler } from '../../src/core/stage-scheduler.js';
 import type { WorkerResult } from '../../src/types/protocol.js';
 import { FakeProcessRunner } from '../../src/adapters/pi-rpc-worker.js';
-import { FakeCodexProcessRunner, type CodexProcessRunResult } from '../../src/adapters/codex-process-runner.js';
+import {
+  FakeCodexProcessRunner,
+  type CodexProcessRunner,
+  type CodexProcessRunResult,
+} from '../../src/adapters/codex-process-runner.js';
 import { CodexCliBrain } from '../../src/adapters/codex-cli-brain.js';
 import { CodexCliReviewer } from '../../src/adapters/codex-cli-reviewer.js';
 import { PiRpcWorker } from '../../src/adapters/pi-rpc-worker.js';
@@ -269,6 +273,36 @@ describe('M4 Token Ledger Closure v2', () => {
     afterAll(async () => {
       await store.close();
       try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    });
+
+    it('C0: invokes the non-interactive read-only exec flow for structured planning', async () => {
+      let invocation: { command: string; args: string[]; input?: string } | undefined;
+      const runner: CodexProcessRunner = {
+        async run(command, args, options) {
+          invocation = { command, args, input: options.input };
+          return {
+            stdout: '```json\n{"stages":[{"stageNumber":1,"title":"S1","tasks":["t1"]}],"tasks":[{"taskId":"t1","stageNumber":1,"title":"T1","goal":"plan","dependencies":[],"estimatedWritePaths":["src/"],"allowedPaths":["src/"],"forbiddenPaths":[],"contextFiles":[],"acceptanceChecks":[],"allowedCommands":[],"riskLevel":"low","productDecisionsLocked":true,"expectedOutputs":[],"heavyCommandSlotsRequired":0,"timeoutSeconds":60}]}\n```',
+            stderr: '',
+            exitCode: 0,
+            durationMs: 1,
+          };
+        },
+      };
+      const brain = new CodexCliBrain(
+        { allowRealPlanning: true, workDir: tmpDir, sessionDir: tmpDir, timeoutMs: 5000 },
+        { processRunner: runner },
+      );
+
+      const result = await brain.generatePlan('plan safely', 'c-brain-entrypoint');
+
+      expect(result.success).toBe(true);
+      expect(invocation).toEqual({
+        command: 'codex',
+        args: ['exec', '--ephemeral', '--sandbox', 'read-only', '--ignore-user-config', '--ignore-rules', '-'],
+        input: expect.stringContaining('plan safely'),
+      });
+      expect(invocation?.input).toContain('dependencies array MUST contain only task IDs from the same stage');
+      expect(invocation?.input).toContain('NEVER list a task from an earlier or later stage');
     });
 
     it('C1: writes estimate BEFORE external call, confirmed when tokenUsage present', async () => {

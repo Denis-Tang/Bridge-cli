@@ -147,6 +147,30 @@ describe('WorktreeManager', () => {
   });
 
   describe('cleanupWorktree', () => {
+    it('preserves dirty worktrees and branches with unique recoverable commits', async () => {
+      const dirtyBranch = 'task/test-dirty-preserve';
+      const dirtyDir = path.join(tmpDir, 'dirty-preserve-wt');
+      manager.createBranch(dirtyBranch, 'main');
+      manager.createWorktree(dirtyBranch, dirtyDir);
+      writeFileSync(path.join(dirtyDir, 'dirty.txt'), 'uncommitted');
+      await expect(manager.cleanupRedundantWorktree(dirtyBranch, dirtyDir, 'main')).rejects.toThrow(/dirty.*preserved/i);
+      expect(existsSync(dirtyDir)).toBe(true);
+      runGit(['worktree', 'remove', '--force', dirtyDir]);
+      runGit(['branch', '-D', dirtyBranch]);
+
+      const uniqueBranch = 'task/test-unique-preserve';
+      const uniqueDir = path.join(tmpDir, 'unique-preserve-wt');
+      manager.createBranch(uniqueBranch, 'main');
+      manager.createWorktree(uniqueBranch, uniqueDir);
+      writeFileSync(path.join(uniqueDir, 'unique.txt'), 'recoverable');
+      runGit(['add', 'unique.txt'], uniqueDir);
+      runGit(['commit', '-m', 'unique-recoverable'], uniqueDir);
+      await expect(manager.cleanupRedundantWorktree(uniqueBranch, uniqueDir, 'main')).rejects.toThrow(/unique recoverable commits.*preserved/i);
+      expect(existsSync(uniqueDir)).toBe(true);
+      runGit(['worktree', 'remove', '--force', uniqueDir]);
+      runGit(['branch', '-D', uniqueBranch]);
+    });
+
     it('removes a worktree safely', async () => {
       // Create another branch and worktree for cleanup testing
       const branchName = 'task/test-cleanup';

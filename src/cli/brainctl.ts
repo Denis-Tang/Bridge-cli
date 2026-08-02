@@ -14,6 +14,10 @@ import { revokeCommand } from './commands/revoke.js';
 import { auditCommand } from './commands/audit.js';
 import { reconcileCommand } from './commands/reconcile.js';
 import { privacyCommand } from './commands/privacy.js';
+import { dashboardCommand } from './commands/dashboard.js';
+import { recoverCommand } from './commands/recover.js';
+import { gcCommand } from './commands/gc.js';
+import { budgetCommand } from './commands/budget.js';
 
 const program = new Command();
 
@@ -35,6 +39,10 @@ program.addCommand(revokeCommand);
 program.addCommand(auditCommand);
 program.addCommand(reconcileCommand);
 program.addCommand(privacyCommand);
+program.addCommand(dashboardCommand);
+program.addCommand(recoverCommand);
+program.addCommand(gcCommand);
+program.addCommand(budgetCommand);
 
 program.parse(process.argv);
 

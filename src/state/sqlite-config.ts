@@ -19,10 +19,10 @@ export const DEFAULT_SQLITE_PATH = '.brainctl/state/brainctl.sqlite';
  * Read SQLite config from environment variable or return default.
  * Priority: BRAINCTL_SQLITE_PATH env var > default path.
  */
-export function readSqliteConfigFromEnv(projectRoot?: string): SqliteConfig {
+export function readSqliteConfigFromEnv(projectRoot?: string, explicitPath?: string): SqliteConfig {
   const envPath = process.env.BRAINCTL_SQLITE_PATH;
-  const dbPath = envPath || DEFAULT_SQLITE_PATH;
-  const fullPath = projectRoot ? resolve(projectRoot, dbPath) : dbPath;
+  const dbPath = explicitPath || envPath || DEFAULT_SQLITE_PATH;
+  const fullPath = projectRoot ? resolve(projectRoot, dbPath) : (explicitPath ? resolve(explicitPath) : dbPath);
   return {
     path: fullPath,
     maskedPath: fullPath,

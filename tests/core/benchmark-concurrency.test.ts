@@ -78,6 +78,40 @@ describe('BENCH-CONCURRENCY — Real Overlap Detection', () => {
       await teardownBenchmark(ctx);
     }
   });
+
+  it('CONC-ROLLING: refills a slot before the slow task in the prior wave finishes', { timeout: 30000 }, async () => {
+    const ctx = await setupBenchmark(CORRECT_DAG, 2, 'conc-rolling');
+    const starts = new Map<string, number>();
+    const ends = new Map<string, number>();
+    const originalRun = ctx.piRunner.run.bind(ctx.piRunner);
+    ctx.piRunner.run = async (input) => {
+      const taskId = input.cwd.replace(/\\/g, '/').split('/').find((part) => /^T\d+$/.test(part)) || 'unknown';
+      starts.set(taskId, Date.now());
+      if (taskId === 'T1') await new Promise((resolve) => setTimeout(resolve, 5000));
+      const result = await originalRun(input);
+      ends.set(taskId, Date.now());
+      return result;
+    };
+    try {
+      await ctx.scheduler.startRun(ctx.runId);
+      expect(starts.get('T3')).toBeDefined();
+      expect(ends.get('T1')).toBeDefined();
+      expect(starts.get('T3')!).toBeLessThan(ends.get('T1')!);
+    } finally {
+      await teardownBenchmark(ctx);
+    }
+  });
+
+  it('CONC-LOCKS: unrelated global protected paths do not serialize independent tasks', { timeout: 30000 }, async () => {
+    const ctx = await setupBenchmark(CORRECT_DAG, 2, 'conc-locks');
+    (ctx.scheduler as any).config.defaultLockedPaths = ['package.json', 'package-lock.json', 'tsconfig.json'];
+    try {
+      await ctx.scheduler.startRun(ctx.runId);
+      await assertOverlap(ctx.piRunner, ['T1', 'T2']);
+    } finally {
+      await teardownBenchmark(ctx);
+    }
+  });
 });
 
 describe('BENCH-CONCURRENCY — Sequential vs Orchestrated Comparison', () => {

@@ -22,6 +22,7 @@ export class DiffScopeValidator {
     changedFiles: string[],
     allowedPaths: string[],
     forbiddenPaths: string[] = [],
+    repositoryRoot?: string,
   ): ScopeValidationResult {
     const violations: string[] = [];
     const allowedFiles: string[] = [];
@@ -29,7 +30,7 @@ export class DiffScopeValidator {
     const invalidPathFiles: string[] = [];
 
     const allowed = this.normalizePatternList('allowedPaths', allowedPaths, violations);
-    const forbidden = this.normalizePatternList('forbiddenPaths', forbiddenPaths, violations);
+    const forbidden = this.normalizePatternList('forbiddenPaths', forbiddenPaths, violations, repositoryRoot);
 
     for (const file of changedFiles) {
       const normalizedFile = this.normalizeChangedPath(file);
@@ -91,10 +92,36 @@ export class DiffScopeValidator {
     return this.normalizeChangedPath(filePath);
   }
 
-  private normalizePatternList(kind: string, patterns: string[], violations: string[]): string[] {
+  private normalizePatternList(
+    kind: string,
+    patterns: string[],
+    violations: string[],
+    repositoryRoot?: string,
+  ): string[] {
     const normalized: string[] = [];
     for (const pattern of patterns) {
-      const out = this.normalizePattern(pattern);
+      let candidate = pattern;
+      const raw = String(pattern || '').replace(/\\/g, '/').trim();
+      const isAbsolutePattern = path.isAbsolute(raw) || /^[A-Za-z]:/.test(raw) || raw.startsWith('//');
+      if (kind === 'forbiddenPaths' && repositoryRoot && isAbsolutePattern) {
+        if (raw.includes('*') || raw.includes('?')) {
+          violations.push(`${kind} entry '${pattern}' is unsafe: absolute glob patterns are forbidden`);
+          continue;
+        }
+        const relativePath = path.relative(path.resolve(repositoryRoot), path.resolve(raw));
+        const outsideRepository = relativePath === '..'
+          || relativePath.startsWith(`..${path.sep}`)
+          || path.isAbsolute(relativePath);
+        if (outsideRepository) {
+          // Git changed-file evidence is repository-relative, so an external
+          // privacy/evidence directory cannot match it. Keep that boundary in
+          // the worker/privacy configuration without treating it as bad diff policy.
+          continue;
+        }
+        candidate = relativePath || '**';
+      }
+
+      const out = this.normalizePattern(candidate);
       if (!out.ok) {
         violations.push(`${kind} entry '${pattern}' is unsafe: ${out.reason}`);
       } else {

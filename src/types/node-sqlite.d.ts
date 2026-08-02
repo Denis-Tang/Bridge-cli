@@ -1,5 +1,5 @@
 /**
- * Minimal type declarations for Node.js built-in `node:sqlite` (experimental, Node 22+).
+ * Minimal type declarations for Node.js built-in `node:sqlite` (Bridge supports Node 24.x).
  * API reference: https://nodejs.org/api/sqlite.html
  */
 declare module 'node:sqlite' {

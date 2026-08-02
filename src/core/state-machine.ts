@@ -14,9 +14,9 @@ export type RunStatus =
 
 const RUN_TRANSITIONS: Record<RunStatus, RunStatus[]> = {
   queued: ['planning'],
-  planning: ['running', 'failed'],
-  running: ['waiting_decision', 'reviewing', 'failed', 'canceled'],
-  waiting_decision: ['running', 'canceled'],
+  planning: ['running', 'failed', 'canceled'],
+  running: ['waiting_decision', 'reviewing', 'completed', 'failed', 'canceled'],
+  waiting_decision: ['running', 'failed', 'canceled'],
   reviewing: ['merging', 'failed', 'canceled'],
   merging: ['completed', 'failed'],
   completed: [],
@@ -48,10 +48,10 @@ export type StageStatus =
   | 'canceled';
 
 const STAGE_TRANSITIONS: Record<StageStatus, StageStatus[]> = {
-  pending: ['ready'],
-  ready: ['running', 'canceled'],
+  pending: ['ready', 'paused', 'canceled'],
+  ready: ['running', 'paused', 'canceled'],
   running: ['integration', 'failed', 'paused', 'canceled'],
-  integration: ['completed', 'failed', 'paused'],
+  integration: ['completed', 'failed', 'paused', 'canceled'],
   completed: [],
   failed: [],
   paused: ['ready', 'canceled'],
@@ -86,10 +86,10 @@ export type AttemptStatus =
 
 const ATTEMPT_TRANSITIONS: Record<AttemptStatus, AttemptStatus[]> = {
   pending: ['running', 'canceled'],
-  running: ['worker_completed', 'failed', 'interrupted', 'canceled'],
-  worker_completed: ['validating', 'failed'],
+  running: ['worker_completed', 'rework_required', 'failed', 'interrupted', 'canceled'],
+  worker_completed: ['validating', 'rework_required', 'failed', 'canceled'],
   validating: ['reviewing', 'review_skipped', 'failed', 'rework_required'],
-  reviewing: ['approved', 'rework_required', 'failed'],
+  reviewing: ['approved', 'rework_required', 'failed', 'canceled'],
   review_skipped: ['approved', 'rework_required'],
   approved: [],
   rework_required: ['running'],
@@ -129,21 +129,21 @@ export type TaskStatus =
   | 'merge_blocked';
 
 const TASK_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
-  pending: ['ready'],
-  ready: ['running', 'canceled'],
+  pending: ['ready', 'waiting_decision', 'canceled'],
+  ready: ['running', 'waiting_decision', 'rework_required', 'canceled'],
   running: ['worker_completed', 'waiting_decision', 'failed', 'canceled', 'rework_required'],
-  worker_completed: ['validating', 'failed'],
-  validating: ['reviewing', 'review_skipped', 'failed', 'rework_required', 'canceled'],
-  reviewing: ['approved', 'rework_required', 'failed', 'rejected', 'canceled'],
-  review_skipped: ['approved', 'rework_required'],
-  approved: ['merged', 'merge_blocked'],
+  worker_completed: ['validating', 'waiting_decision', 'failed', 'rework_required', 'canceled'],
+  validating: ['reviewing', 'review_skipped', 'waiting_decision', 'failed', 'rework_required', 'canceled'],
+  reviewing: ['approved', 'waiting_decision', 'rework_required', 'failed', 'rejected', 'canceled'],
+  review_skipped: ['approved', 'rework_required', 'failed', 'canceled'],
+  approved: ['merged', 'merge_blocked', 'canceled'],
   merged: [],
   failed: [],
   canceled: [],
   rejected: [],
-  rework_required: ['ready'],
-  waiting_decision: ['running', 'failed', 'canceled'],
-  merge_blocked: [],
+  rework_required: ['ready', 'waiting_decision', 'canceled'],
+  waiting_decision: ['running', 'rework_required', 'failed', 'canceled'],
+  merge_blocked: ['approved', 'rework_required', 'canceled'],
 };
 
 export function canTransitionTask(from: TaskStatus, to: TaskStatus): boolean {
@@ -156,4 +156,4 @@ export function assertTransitionTask(from: TaskStatus, to: TaskStatus): void {
   }
 }
 
-export const TERMINAL_TASK_STATUSES: TaskStatus[] = ['merged', 'failed', 'canceled', 'rejected', 'merge_blocked'];
+export const TERMINAL_TASK_STATUSES: TaskStatus[] = ['merged', 'failed', 'canceled', 'rejected'];

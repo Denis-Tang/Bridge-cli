@@ -58,6 +58,7 @@ describe('ProjectAdapter and universal configuration', () => {
       project.defaultBaseBranch = 'project-branch';
       const snapshot = {
         targetBranch: 'snapshot-branch',
+        executionMode: 'simple' as const,
         worker: { ...project.worker, type: 'real-pi' as const, model: 'snapshot-model' },
         maxParallelTasks: 2,
       };
@@ -65,12 +66,13 @@ describe('ProjectAdapter and universal configuration', () => {
         projectConfig: project,
         snapshot,
         detectedBranch: 'detected-branch',
-        cliOverrides: { targetBranch: 'cli-branch', worker: 'fake', maxParallelTasks: 3 },
+        cliOverrides: { targetBranch: 'cli-branch', worker: 'fake', maxParallelTasks: 3, executionMode: 'default' },
       });
       expect(resolved.targetBranch).toBe('cli-branch');
       expect(resolved.worker.type).toBe('fake');
       expect(resolved.worker.model).toBe('snapshot-model');
       expect(resolved.maxParallelTasks).toBe(3);
+      expect(resolved.executionMode).toBe('default');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -85,6 +87,7 @@ describe('ProjectAdapter and universal configuration', () => {
       expect(serialized).not.toContain('super-secret');
       expect(serialized).not.toContain('also-secret');
       expect(deserializeExecutionConfigSnapshot(serialized)?.snapshotVersion).toBe(1);
+      expect(deserializeExecutionConfigSnapshot(serialized)?.config.executionMode).toBe('token-efficient');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

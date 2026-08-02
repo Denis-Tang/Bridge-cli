@@ -76,6 +76,16 @@ export class WorktreeManager {
     }
   }
 
+  isBranchMergedInto(branchName: string, targetRef = 'HEAD'): boolean {
+    if (!this.branchExists(branchName)) return true;
+    try {
+      this.git(['merge-base', '--is-ancestor', branchName, targetRef]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * Create a new branch from the given base branch.
    * If the branch already exists, return it without error.
@@ -334,6 +344,22 @@ export class WorktreeManager {
       `This is a safety measure. If you're sure you want to remove it, ` +
       `manually check the worktree and use 'git worktree remove -f ${targetPath}'.`,
     );
+  }
+
+  async cleanupRedundantWorktree(
+    branchName: string,
+    worktreePath: string | undefined,
+    targetRef = 'HEAD',
+  ): Promise<void> {
+    const targetPath = worktreePath ?? path.resolve(this.projectRoot, '.brainctl/worktrees', branchName);
+    if (existsSync(targetPath) && this.hasUncommittedChanges(targetPath)) {
+      throw new Error(`Worktree '${branchName}' is dirty and must be preserved.`);
+    }
+    if (!this.isBranchMergedInto(branchName, targetRef)) {
+      throw new Error(`Branch '${branchName}' has unique recoverable commits and must be preserved.`);
+    }
+    await this.cleanupWorktree(branchName, targetPath);
+    this.deleteBranch(branchName);
   }
 
   /**

@@ -149,3 +149,37 @@ export interface GovernanceStatus {
   enabled: boolean;
   pendingApprovals: number;
 }
+
+export interface CostBudgetConfig {
+  currency: 'CNY' | 'USD';
+  limit: number;
+  maxPiCallCost: number;
+  maxCodexCallCost: number;
+  pricingVersion: string;
+}
+
+export interface CostReservation {
+  id: string;
+  runId: string;
+  stageId: string | null;
+  taskId: string | null;
+  attemptId: string | null;
+  callType: CallType;
+  callId: string;
+  currency: CostBudgetConfig['currency'];
+  budgetLimit: number;
+  reservedCost: number;
+  actualCost: number | null;
+  status: 'reserved' | 'confirmed' | 'unavailable' | 'released' | 'written_off';
+  pricingVersion: string;
+  usageStatus: 'pending' | 'confirmed' | 'unavailable';
+  phase: 'reserved' | 'spawned' | 'settled';
+  spawnedAt: string | null;
+  ownerId: string | null;
+  leaseExpiresAt: string | null;
+  heartbeatAt: string | null;
+  terminationEvidence: string | null;
+  settledAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}

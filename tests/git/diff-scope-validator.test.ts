@@ -48,6 +48,39 @@ describe('DiffScopeValidator', () => {
       expect(result.invalidPathFiles).toContain(files[0]);
     });
 
+    it('ignores an absolute external forbidden directory for repository-relative Git evidence', () => {
+      const result = validator.validate(
+        ['src/index.ts'],
+        ['src/'],
+        ['D:/external-private-evidence/'],
+        'C:/fake-project',
+      );
+      expect(result.valid).toBe(true);
+      expect(result.violations).toEqual([]);
+    });
+
+    it('maps an absolute in-repository forbidden directory back to a relative policy', () => {
+      const result = validator.validate(
+        ['src/private/key.txt'],
+        ['src/'],
+        ['C:/fake-project/src/private/'],
+        'C:/fake-project',
+      );
+      expect(result.valid).toBe(false);
+      expect(result.forbiddenFiles).toEqual(['src/private/key.txt']);
+    });
+
+    it('still rejects absolute allowed paths even when repositoryRoot is provided', () => {
+      const result = validator.validate(
+        ['src/index.ts'],
+        ['C:/fake-project/src/'],
+        [],
+        'C:/fake-project',
+      );
+      expect(result.valid).toBe(false);
+      expect(result.violations.join('\n')).toContain('absolute path is forbidden');
+    });
+
     it('handles Windows backslash paths', () => {
       const files = ['src\\index.ts'];
       const result = validator.validate(files, ['src/'], []);

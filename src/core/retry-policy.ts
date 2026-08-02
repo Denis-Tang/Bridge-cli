@@ -140,50 +140,57 @@ export function classifyFailure(
     return { retriable: false, reason: 'resume_failed', category: FailureCategory.DATA_CORRUPTION };
   }
 
-  // ── 8. Non-retriable: blocked / needs_decision ────────────────────
+  // ── 8. Retriable: clarification protocol/uncertainty without a user question ──
+  // The 95% gate still fails closed, but a fresh bounded attempt may read again.
+  // Actual user questions remain product_decision and are handled above.
+  if (reason.startsWith('clarification_required:')) {
+    return { retriable: true, reason: 'clarification_retry_required', category: FailureCategory.TRANSIENT };
+  }
+
+  // ── 9. Non-retriable: blocked / needs_decision ────────────────────
   if (reason.startsWith('blocked:')) {
     return { retriable: false, reason: 'worker_blocked', category: FailureCategory.PRODUCT_DECISION };
   }
 
-  // ── 9. Non-retriable: no quality gates configured ─────────────────
+  // ── 10. Non-retriable: no quality gates configured ────────────────
   if (reason.startsWith('no_quality_gates_configured')) {
     return { retriable: false, reason: 'no_quality_gates_configured', category: FailureCategory.UNKNOWN };
   }
 
-  // ── 10. Retriable: worktree failure ───────────────────────────────
+  // ── 11. Retriable: worktree failure ───────────────────────────────
   if (reason.startsWith('wt_fail:')) {
     return { retriable: true, reason: 'worktree_failure', category: FailureCategory.TRANSIENT };
   }
 
-  // ── 11. Retriable: worker result missing ──────────────────────────
+  // ── 12. Retriable: worker result missing ──────────────────────────
   if (reason.startsWith('worker_result_missing') || reason.includes('worker_result_missing')) {
     return { retriable: true, reason: 'worker_result_missing', category: FailureCategory.TRANSIENT };
   }
 
-  // ── 12. Retriable: exception (unhandled throw in execTask) ────────
+  // ── 13. Retriable: exception (unhandled throw in execTask) ────────
   // Only explicit `exception:` prefix from catch block is retriable;
   // other unknown paths are fail-closed.
   if (reason.startsWith('exception:')) {
     return { retriable: true, reason: 'exec_task_exception', category: FailureCategory.TRANSIENT };
   }
 
-  // ── 13. Retriable: quality gate failure ───────────────────────────
+  // ── 14. Retriable: quality gate failure ───────────────────────────
   if (reason.startsWith('qg_failed:')) {
     return { retriable: true, reason: 'quality_gate_failure', category: FailureCategory.QUALITY };
   }
 
-  // ── 14. Retriable: review rejection ───────────────────────────────
+  // ── 15. Retriable: review rejection ───────────────────────────────
   if (reason.startsWith('review:')) {
     return { retriable: true, reason: 'review_rejection', category: FailureCategory.REVIEW };
   }
 
-  // ── 15. Attempt status fallback — explicit rework_required with no reason ──
+  // ── 16. Attempt status fallback — explicit rework_required with no reason ──
   if (attemptStatus === 'rework_required') {
     // rework_required without a reason prefix → review rejection (retriable)
     return { retriable: true, reason: 'rework_required_no_reason', category: FailureCategory.REVIEW };
   }
 
-  // ── 16. Default: unknown — fail-closed ────────────────────────────
+  // ── 17. Default: unknown — fail-closed ────────────────────────────
   // Any unrecognized failure pattern, including `failed` status with no
   // matching exitReason, is treated as non-retriable to prevent infinite loops.
   return { retriable: false, reason: 'unrecognized_failure', category: FailureCategory.UNKNOWN };

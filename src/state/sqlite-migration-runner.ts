@@ -127,36 +127,38 @@ export class SqliteMigrationRunner {
     const applied: MigrationRecord[] = [];
 
     for (const migration of plan.pending) {
-      // Execute the migration SQL
-      const statements = splitSqlStatements(migration.sql);
-      for (const stmt of statements) {
-        try {
-          this.db.exec(stmt);
-        } catch (err: unknown) {
-          // ALTER TABLE ADD COLUMN is not idempotent in SQLite.
-          // If the column already exists, skip the error.
-          const msg = err instanceof Error ? err.message : String(err);
-          if (stmt.trim().toUpperCase().startsWith('ALTER TABLE') &&
-              msg.includes('duplicate column name')) {
-            // Column already exists — safe to skip
-            continue;
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        const statements = splitSqlStatements(migration.sql);
+        for (const stmt of statements) {
+          try {
+            this.db.exec(stmt);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (isAlterTableAddColumn(stmt) && msg.toLowerCase().includes('duplicate column name')) {
+              assertDuplicateColumnCompatible(this.db, stmt);
+              continue;
+            }
+            throw err;
           }
-          throw err;
         }
-      }
 
-      // Record the migration
-      const recordStmt = this.db.prepare(`
-        INSERT INTO schema_migrations (version, name, filename, checksum, applied_at)
-        VALUES (?, ?, ?, ?, ?)
-      `);
-      recordStmt.run(
-        migration.version,
-        migration.name,
-        migration.filename,
-        migration.checksum,
-        new Date().toISOString(),
-      );
+        const recordStmt = this.db.prepare(`
+          INSERT INTO schema_migrations (version, name, filename, checksum, applied_at)
+          VALUES (?, ?, ?, ?, ?)
+        `);
+        recordStmt.run(
+          migration.version,
+          migration.name,
+          migration.filename,
+          migration.checksum,
+          new Date().toISOString(),
+        );
+        this.db.exec('COMMIT');
+      } catch (error) {
+        try { this.db.exec('ROLLBACK'); } catch { /* transaction already closed */ }
+        throw error;
+      }
 
       applied.push(migration);
     }
@@ -209,18 +211,103 @@ export function computeChecksum(content: string): string {
  * Removes comment lines and inline block comments, splits by semicolons.
  */
 export function splitSqlStatements(sql: string): string[] {
-  // Remove block comments (/* ... */) including inline ones
-  let cleaned = sql.replace(/\/\*[\s\S]*?\*\//g, '');
+  const cleaned = stripSqlComments(sql);
+  const statements: string[] = [];
+  let current = '';
+  let quote: "'" | '"' | '`' | ']' | null = null;
+  for (let index = 0; index < cleaned.length; index++) {
+    const char = cleaned[index];
+    current += char;
+    if (quote) {
+      if (quote === ']' && char === ']') quote = null;
+      else if (quote !== ']' && char === quote) {
+        if (cleaned[index + 1] === quote) current += cleaned[++index];
+        else quote = null;
+      }
+      continue;
+    }
+    if (char === "'" || char === '"' || char === '`') { quote = char; continue; }
+    if (char === '[') { quote = ']'; continue; }
+    if (char !== ';') continue;
+    const trimmed = current.trim();
+    const trigger = /^CREATE\s+(?:TEMP(?:ORARY)?\s+)?TRIGGER\b/i.test(trimmed);
+    if (trigger && !/\bEND\s*;$/i.test(trimmed)) continue;
+    if (trimmed) statements.push(trimmed);
+    current = '';
+  }
+  const tail = current.trim();
+  if (tail) statements.push(tail.endsWith(';') ? tail : `${tail};`);
+  return statements;
+}
 
-  // Remove single-line comments
-  cleaned = cleaned
-    .split('\n')
-    .filter((line) => !line.trim().startsWith('--'))
-    .join('\n');
+function stripSqlComments(sql: string): string {
+  let output = '';
+  let quote: "'" | '"' | '`' | ']' | null = null;
+  for (let index = 0; index < sql.length; index++) {
+    const char = sql[index];
+    const next = sql[index + 1];
+    if (quote) {
+      output += char;
+      if (quote === ']' && char === ']') quote = null;
+      else if (quote !== ']' && char === quote) {
+        if (next === quote) output += sql[++index];
+        else quote = null;
+      }
+      continue;
+    }
+    if (char === "'" || char === '"' || char === '`') { quote = char; output += char; continue; }
+    if (char === '[') { quote = ']'; output += char; continue; }
+    if (char === '-' && next === '-') {
+      while (index < sql.length && sql[index] !== '\n') index++;
+      output += '\n';
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      index += 2;
+      while (index < sql.length && !(sql[index] === '*' && sql[index + 1] === '/')) index++;
+      index++;
+      continue;
+    }
+    output += char;
+  }
+  return output;
+}
 
-  return cleaned
-    .split(';')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0)
-    .map((s) => s + ';');
+function isAlterTableAddColumn(statement: string): boolean {
+  return /^ALTER\s+TABLE\s+[^\s]+\s+ADD\s+(?:COLUMN\s+)?/i.test(statement.trim());
+}
+
+function normalizeDefault(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  let normalized = String(value).trim();
+  while (normalized.startsWith('(') && normalized.endsWith(')')) normalized = normalized.slice(1, -1).trim();
+  return normalized.replace(/\s+/g, ' ');
+}
+
+function assertDuplicateColumnCompatible(db: DatabaseSync, statement: string): void {
+  const match = statement.trim().replace(/;$/, '').match(
+    /^ALTER\s+TABLE\s+["`\[]?([^\s"`\]]+)["`\]]?\s+ADD\s+(?:COLUMN\s+)?["`\[]?([^\s"`\]]+)["`\]]?\s+([\s\S]+)$/i,
+  );
+  if (!match) throw new Error('duplicate column schema mismatch: cannot parse ALTER TABLE ADD COLUMN');
+  const [, tableName, columnName, definition] = match;
+  const row = db.prepare(`PRAGMA table_info(${JSON.stringify(tableName)})`).all()
+    .find((candidate: any) => String(candidate.name).toLowerCase() === columnName.toLowerCase()) as any;
+  if (!row) throw new Error(`duplicate column schema mismatch: ${tableName}.${columnName} is not present`);
+
+  const typeMatch = definition.trim().match(/^([^\s]+)/);
+  const expectedType = String(typeMatch?.[1] ?? '').toUpperCase();
+  const expectedNotNull = /\bNOT\s+NULL\b/i.test(definition) ? 1 : 0;
+  const expectedPrimaryKey = /\bPRIMARY\s+KEY\b/i.test(definition) ? 1 : 0;
+  const defaultMatch = definition.match(/\bDEFAULT\s+((?:'[^']*(?:''[^']*)*'|"[^"]*"|\([^)]*\)|[^\s,]+))/i);
+  const expectedDefault = normalizeDefault(defaultMatch?.[1]);
+  const actual = {
+    type: String(row.type ?? '').toUpperCase(),
+    notNull: Number(row.notnull ?? 0),
+    primaryKey: Number(row.pk ?? 0),
+    defaultValue: normalizeDefault(row.dflt_value),
+  };
+  if (actual.type !== expectedType || actual.notNull !== expectedNotNull
+    || actual.primaryKey !== expectedPrimaryKey || actual.defaultValue !== expectedDefault) {
+    throw new Error(`duplicate column schema mismatch: ${tableName}.${columnName}`);
+  }
 }

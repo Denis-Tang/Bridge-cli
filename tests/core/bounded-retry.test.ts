@@ -24,6 +24,7 @@ import { SqliteStateStore } from '../../src/state/sqlite-store.js';
 import { SqliteMigrationRunner } from '../../src/state/sqlite-migration-runner.js';
 import { readSqliteConfigFromEnv } from '../../src/state/sqlite-config.js';
 import { StageScheduler } from '../../src/core/stage-scheduler.js';
+import { resolveStagePause } from '../../src/core/pause-service.js';
 import {
   classifyFailure,
   checkRetryBudget,
@@ -109,12 +110,23 @@ async function seedAttempt(
   if (exitReason !== undefined) {
     await store.updateAttemptResult(aid, { exitReason, stoppedAt: now, worktreePath: tmpDir + '/wt/' + aid });
   }
-  // Update task status to match
+  // Seed the Task through the same recoverable lifecycle used by production.
+  // Failed Attempt rows are immutable evidence; retryability lives on Task.
+  let task = await store.getTask(taskId);
+  if (task?.status === 'pending') {
+    await store.updateTaskStatus(taskId, 'ready', now);
+    await store.updateTaskStatus(taskId, 'running', now);
+    task = await store.getTask(taskId);
+  }
+  const retryable = status === 'rework_required'
+    || (status === 'failed' && /^(review:|wt_fail:)/.test(exitReason ?? ''));
   const taskStatus = status === 'approved' ? 'approved'
-    : status === 'failed' ? 'failed'
-    : status === 'rework_required' ? 'rework_required'
+    : retryable ? 'rework_required'
+    : status === 'failed' ? 'waiting_decision'
     : 'running';
-  await store.updateTaskStatus(taskId, taskStatus as any, now);
+  if (task?.status !== taskStatus) {
+    await store.updateTaskStatus(taskId, taskStatus as any, now);
+  }
   return aid;
 }
 
@@ -210,6 +222,12 @@ describe('classifyFailure (unit)', () => {
   });
 
   // ── Retriable categories ──
+  it('no-question clarification uncertainty → retriable (fresh bounded attempt)', () => {
+    const r = classifyFailure('failed', 'clarification_required: Pi 理解度为 93%，但没有提出可回答的问题');
+    expect(r.retriable).toBe(true);
+    expect(r.category).toBe(FailureCategory.TRANSIENT);
+  });
+
   it('worktree failure → retriable (transient)', () => {
     const r = classifyFailure('failed', 'wt_fail: git error');
     expect(r.retriable).toBe(true);
@@ -471,9 +489,18 @@ describe('StageScheduler bounded retry (integration)', () => {
 
     // Good: 1 approved attempt
     const goodAid = goodTaskId + '-a1';
+    const approvedAt = new Date().toISOString();
+    await store.updateTaskStatus(goodTaskId, 'ready', approvedAt);
+    await store.updateTaskStatus(goodTaskId, 'running', approvedAt);
     await store.createAttempt({ id: goodAid, taskId: goodTaskId, stageId, attemptNumber: 1, status: 'running' });
-    await store.updateAttemptStatus(goodAid, 'approved', new Date().toISOString());
-    await store.updateTaskStatus(goodTaskId, 'approved', new Date().toISOString());
+    await store.updateAttemptStatus(goodAid, 'worker_completed', approvedAt);
+    await store.updateTaskStatus(goodTaskId, 'worker_completed', approvedAt);
+    await store.updateAttemptStatus(goodAid, 'validating', approvedAt);
+    await store.updateTaskStatus(goodTaskId, 'validating', approvedAt);
+    await store.updateAttemptStatus(goodAid, 'reviewing', approvedAt);
+    await store.updateTaskStatus(goodTaskId, 'reviewing', approvedAt);
+    await store.updateAttemptStatus(goodAid, 'approved', approvedAt);
+    await store.updateTaskStatus(goodTaskId, 'approved', approvedAt);
 
     const scheduler = new StageScheduler(store, makeSchedulerConfig()) as any;
     await scheduler.startRun(runId);
@@ -540,8 +567,15 @@ describe('StageScheduler bounded retry (integration)', () => {
     // Save attempt count
     const attemptsAfterFirst = (await store.listAttempts(taskId)).length;
 
-    // "Resume": manually set stage back to ready (simulate human resume decision)
-    await store.updateStageStatus(stageId, 'ready', new Date().toISOString());
+    // Resume only through the exact active PauseRecord CAS boundary.
+    const activePause = await store.getActivePauseForStage(stageId);
+    expect(activePause).not.toBeNull();
+    await expect(resolveStagePause(store, {
+      pauseId: activePause!.id,
+      stageId,
+      resolutionNote: 'bounded retry test confirms exact pause',
+      approvalDecisionId: activePause!.decisionId,
+    })).resolves.toBe(true);
 
     // Second run: should not create new attempts (exhausted)
     const scheduler2 = new StageScheduler(store, makeSchedulerConfig()) as any;

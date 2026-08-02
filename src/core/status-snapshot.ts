@@ -2,7 +2,7 @@
 // Builds StatusSnapshot from StateStore + ResourceSampler for CLI output
 
 import { execFileSync } from 'node:child_process';
-import type { StateStore, RunRecord } from '../state/state-store.js';
+import type { StateQueryStore, RunRecord } from '../state/state-store.js';
 import type { ResourceSampler, BudgetState } from '../types/m3-types.js';
 import { computeBudget, deriveHardCap } from '../types/m3-types.js';
 import type {
@@ -24,9 +24,10 @@ import { getGovernanceConfig, resetGovernanceConfigCache } from './decision-gate
 import { resolveIntegrationTargetBranch } from './reconciliation/target-branch-resolver.js';
 
 export interface BuildSnapshotOptions {
-  store: StateStore;
+  store: StateQueryStore;
   sampler: ResourceSampler;
   userMaxParallel: number;
+  dbPath?: string;
 }
 
 /**
@@ -105,13 +106,13 @@ export async function buildStatusSnapshot(
   let runs: RunSnapshot[];
   if (runId) {
     const run = await store.getRun(runId);
-    runs = run ? [await buildRunSnapshot(store, run)] : [];
+    runs = run ? [await buildRunSnapshot(store, run, options.dbPath)] : [];
   } else {
     // Get recent runs — we need to query directly
     const allRuns = await getRecentRuns(store);
     const snapshots: RunSnapshot[] = [];
     for (const run of allRuns) {
-      snapshots.push(await buildRunSnapshot(store, run));
+      snapshots.push(await buildRunSnapshot(store, run, options.dbPath));
     }
     runs = snapshots;
   }
@@ -122,7 +123,7 @@ export async function buildStatusSnapshot(
 /**
  * Helper to get recent runs. Uses a lightweight approach via the store.
  */
-async function getRecentRuns(store: StateStore): Promise<RunRecord[]> {
+async function getRecentRuns(store: StateQueryStore): Promise<RunRecord[]> {
   // We'll collect runs by querying known IDs from events table or runs table.
   // The store doesn't have a "list all runs" method, so we use a workaround.
   // For M3, we'll read recent runs from the SQLite store's raw db.
@@ -156,7 +157,7 @@ function mapRowToRunRecord(row: Record<string, unknown>): RunRecord {
   };
 }
 
-async function buildRunSnapshot(store: StateStore, run: RunRecord): Promise<RunSnapshot> {
+async function buildRunSnapshot(store: StateQueryStore, run: RunRecord, dbPath?: string): Promise<RunSnapshot> {
   const stages = await store.listStages(run.id);
   const events = await store.listEvents(run.id);
   const pausedEvents = events.filter((e) => e.eventType === 'stage_paused');
@@ -178,6 +179,32 @@ async function buildRunSnapshot(store: StateStore, run: RunRecord): Promise<RunS
       ? (() => { try { const d = JSON.parse(ev.eventDataJson!); return JSON.stringify(d); } catch { return ev.eventDataJson!; } })()
       : '',
   }));
+  const costEntries = store.listCostReservations ? await store.listCostReservations(run.id) : [];
+  const cost = costEntries.length > 0 ? (() => {
+    const latest = costEntries[costEntries.length - 1];
+    // written_off is an explicit release of the budget: it must NOT count as
+    // committed (distinct from released which proves no money was spent).
+    const committed = costEntries.reduce((sum, entry) => sum + (entry.status === 'confirmed' && entry.actualCost != null ? entry.actualCost : entry.status === 'released' || entry.status === 'written_off' ? 0 : entry.reservedCost), 0);
+    const breakdown = {
+      reserved: 0,     // status=reserved, phase=reserved (not yet spawned)
+      spawned: 0,      // status=reserved, phase=spawned (running, heartbeated)
+      unavailable: 0,  // status=unavailable (spent/unknown, awaiting write-off)
+      written_off: 0,  // status=written_off (manually released)
+      settled: 0,      // confirmed/released (real cost or proven no-spend)
+    };
+    for (const e of costEntries) {
+      if (e.status === 'reserved') {
+        if (e.phase === 'spawned') breakdown.spawned += e.reservedCost;
+        else breakdown.reserved += e.reservedCost;
+      } else if (e.status === 'unavailable') breakdown.unavailable += e.reservedCost;
+      else if (e.status === 'written_off') breakdown.written_off += e.reservedCost;
+      else breakdown.settled += (e.status === 'confirmed' && e.actualCost != null ? e.actualCost : 0);
+    }
+    return { currency: latest.currency, limit: latest.budgetLimit, committed, remaining: Math.max(0, latest.budgetLimit - committed), unavailableCalls: costEntries.filter((entry) => entry.usageStatus === 'unavailable').length, breakdown };
+  })() : null;
+  const nextAction = pausedReason || stages.some((stage) => stage.status === 'paused')
+    ? `brainctl resume ${run.id} --allow-real-project${dbPath ? ` --db "${dbPath}"` : ''}`
+    : null;
 
   return {
     id: run.id,
@@ -188,12 +215,14 @@ async function buildRunSnapshot(store: StateStore, run: RunRecord): Promise<RunS
     finishedAt: run.finishedAt || null,
     stages: stageSnapshots,
     pausedReason,
+    nextAction,
+    cost,
     events: eventSnapshots,
   };
 }
 
 async function buildStageSnapshot(
-  store: StateStore,
+  store: StateQueryStore,
   stage: any,
   runId: string,
   events: readonly EventRecord[],
@@ -264,6 +293,8 @@ async function buildStageSnapshot(
         durationMs,
         reviewStatus: att.status === 'approved' || att.status === 'rework_required' ? att.status : null,
         qualityGatePassed,
+        resultSource: att.resultSource,
+        adoptedCommit: att.adoptedCommit,
       };
     });
 
@@ -275,6 +306,10 @@ async function buildStageSnapshot(
         ? (() => { try { const r = JSON.parse(latestReview.reviewJson!); return r.reviewSummary || ''; } catch { return ''; } })()
         : '',
       finishedAt: latestReview.finishedAt,
+      reviewedThroughCommit: latestReview.reviewedThroughCommit,
+      finalCommit: latestReview.finalCommit,
+      coverageStatus: latestReview.coverageStatus,
+      reviewerUnavailable: latestReview.reviewerUnavailable,
     } : null;
 
     taskSnapshots.push({
@@ -301,6 +336,10 @@ async function buildStageSnapshot(
       ? (() => { try { return JSON.stringify(JSON.parse(batch.conflictsJson!)); } catch { return batch.conflictsJson!; } })()
       : null,
     qualityGatePassed: batch.status === 'completed' ? true : batch.status === 'failed' ? false : null,
+    reviewedThroughCommit: batch.reviewedThroughCommit,
+    finalCommit: batch.finalCommit,
+    reviewCoverageStatus: batch.reviewCoverageStatus,
+    reviewerUnavailable: batch.reviewerUnavailable,
   } : null;
 
   const stageLocks: LockSnapshot[] = locks

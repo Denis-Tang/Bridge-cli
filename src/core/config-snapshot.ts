@@ -10,7 +10,8 @@ export interface SanitizedResolvedConfig {
   projectId: string;
   projectRoot: string;
   targetBranch: string;
-  worker: { type: string; command: string; args: string[]; model: string; timeoutMs: number; maxConcurrency: number };
+  executionMode: SchedulerResolvedConfig['executionMode'];
+  worker: { type: string; command: string; args: string[]; model: string; timeoutMs: number; maxConcurrency: number; verifiedPiVersion?: string; allowInferenceProbe?: boolean };
   reviewer: { type: string; command: string; args: string[]; model: string; timeoutMs: number };
   qualityGatesTask: Array<{
     name: string;
@@ -38,6 +39,7 @@ export interface SanitizedResolvedConfig {
   outputDir: string;
   logsDir: string;
   retentionDays: number;
+  costBudget: SchedulerResolvedConfig['costBudget'];
 }
 
 const SENSITIVE_KEYS = new Set([
@@ -83,6 +85,7 @@ export function sanitizeResolvedConfig(config: SchedulerResolvedConfig): Sanitiz
     projectId: config.projectId,
     projectRoot: config.projectRoot,
     targetBranch: config.targetBranch,
+    executionMode: config.executionMode,
     worker: {
       type: config.worker.type,
       command: config.worker.command,
@@ -90,6 +93,8 @@ export function sanitizeResolvedConfig(config: SchedulerResolvedConfig): Sanitiz
       model: config.worker.model,
       timeoutMs: config.worker.timeoutMs,
       maxConcurrency: config.worker.maxConcurrency,
+      verifiedPiVersion: config.worker.verifiedPiVersion,
+      allowInferenceProbe: config.worker.allowInferenceProbe,
     },
     reviewer: {
       type: config.reviewer.type,
@@ -124,6 +129,7 @@ export function sanitizeResolvedConfig(config: SchedulerResolvedConfig): Sanitiz
     outputDir: config.outputDir,
     logsDir: config.logsDir,
     retentionDays: config.retentionDays,
+    costBudget: config.costBudget,
   };
 }
 

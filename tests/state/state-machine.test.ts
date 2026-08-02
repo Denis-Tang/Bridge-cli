@@ -89,5 +89,9 @@ describe('Task Status Transitions', () => {
     expect(TERMINAL_TASK_STATUSES).toContain('failed');
     expect(TERMINAL_TASK_STATUSES).toContain('canceled');
     expect(TERMINAL_TASK_STATUSES).toContain('rejected');
+    expect(TERMINAL_TASK_STATUSES).not.toContain('merge_blocked');
+    expect(canTransitionTask('merge_blocked', 'approved')).toBe(true);
+    expect(canTransitionTask('merge_blocked', 'rework_required')).toBe(true);
+    expect(canTransitionTask('merge_blocked', 'canceled')).toBe(true);
   });
 });

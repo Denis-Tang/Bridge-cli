@@ -90,6 +90,7 @@ class DelayedWriteStore implements StateStore {
   async getRun(runId: string): Promise<any> { return this.delegate.getRun(runId); }
   async getActiveRunByProject(projectRoot: string): Promise<any> { return this.delegate.getActiveRunByProject(projectRoot); }
   async updateRunStatus(runId: string, status: any, updatedAt: string): Promise<boolean> { return this.delegate.updateRunStatus(runId, status, updatedAt); }
+  async failRunForConvergenceAtomically(input: any): Promise<boolean> { return this.delegate.failRunForConvergenceAtomically(input); }
   async updateRunFinishedAt(runId: string, finishedAt: string): Promise<boolean> { return this.delegate.updateRunFinishedAt(runId, finishedAt); }
   async createTask(input: any): Promise<any> { return this.delegate.createTask(input); }
   async getTask(taskId: string): Promise<any> { return this.delegate.getTask(taskId); }
@@ -99,23 +100,29 @@ class DelayedWriteStore implements StateStore {
   async listTasksByStage(stageId: string): Promise<any[]> { return this.delegate.listTasksByStage(stageId); }
   async createStage(input: any): Promise<any> { return this.delegate.createStage(input); }
   async getStage(stageId: string): Promise<any> { return this.delegate.getStage(stageId); }
-  async updateStageStatus(stageId: string, status: string, updatedAt: string): Promise<boolean> { return this.delegate.updateStageStatus(stageId, status, updatedAt); }
+  async updateStageStatus(stageId: string, status: any, updatedAt: string): Promise<boolean> { return this.delegate.updateStageStatus(stageId, status, updatedAt); }
   async updateStageBaseCommit(stageId: string, commit: string): Promise<boolean> { return this.delegate.updateStageBaseCommit(stageId, commit); }
   async updateStageIntegrationBranch(stageId: string, branch: string): Promise<boolean> { return this.delegate.updateStageIntegrationBranch(stageId, branch); }
   async listStages(runId: string): Promise<any[]> { return this.delegate.listStages(runId); }
   async createAttempt(input: any): Promise<any> { return this.delegate.createAttempt(input); }
   async getAttempt(attemptId: string): Promise<any> { return this.delegate.getAttempt(attemptId); }
-  async updateAttemptStatus(attemptId: string, status: string, updatedAt: string): Promise<boolean> { return this.delegate.updateAttemptStatus(attemptId, status, updatedAt); }
+  async updateAttemptStatus(attemptId: string, status: any, updatedAt: string): Promise<boolean> { return this.delegate.updateAttemptStatus(attemptId, status, updatedAt); }
+  async retryReviewAtomically(input: any): Promise<boolean> { return this.delegate.retryReviewAtomically(input); }
   async updateAttemptResult(attemptId: string, updates: any): Promise<boolean> { return this.delegate.updateAttemptResult(attemptId, updates); }
   async listAttempts(taskId: string): Promise<any[]> { return this.delegate.listAttempts(taskId); }
   async listAttemptsByStage(stageId: string): Promise<any[]> { return this.delegate.listAttemptsByStage(stageId); }
   async getLatestAttempt(taskId: string): Promise<any> { return this.delegate.getLatestAttempt(taskId); }
+  async recordAttemptProvenance(input: any): Promise<any> { return this.delegate.recordAttemptProvenance(input); }
+  async getAttemptProvenance(attemptId: string): Promise<any> { return this.delegate.getAttemptProvenance(attemptId); }
   async createPathLock(input: any): Promise<any> { return this.delegate.createPathLock(input); }
   async acquirePathLocksAtomic(input: any): Promise<any> { return this.delegate.acquirePathLocksAtomic(input); }
   async getPathLock(lockId: string): Promise<any> { return this.delegate.getPathLock(lockId); }
   async releasePathLock(lockId: string, releasedAt: string): Promise<boolean> { return this.delegate.releasePathLock(lockId, releasedAt); }
   async getActiveLocksForRun(runId: string): Promise<any[]> { return this.delegate.getActiveLocksForRun(runId); }
   async getConflictingLocks(taskId: string, filePaths: string[], runId: string): Promise<any[]> { return this.delegate.getConflictingLocks(taskId, filePaths, runId); }
+  async claimActualPathsAtomic(input: any): Promise<any> { return this.delegate.claimActualPathsAtomic(input); }
+  async listActualPathClaims(stageId: string): Promise<any[]> { return this.delegate.listActualPathClaims(stageId); }
+  async releaseActualPathClaimsForStage(stageId: string, releasedAt: string): Promise<number> { return this.delegate.releaseActualPathClaimsForStage(stageId, releasedAt); }
   async createReview(input: any): Promise<any> { return this.delegate.createReview(input); }
   async getReview(reviewId: string): Promise<any> { return this.delegate.getReview(reviewId); }
   async updateReviewResult(reviewId: string, updates: any): Promise<boolean> { return this.delegate.updateReviewResult(reviewId, updates); }
@@ -498,7 +505,9 @@ describe('Scheduler Race: lifecycle convergence', () => {
       await store.updateAttemptStatus(aid, 'failed', now);
       await store.updateAttemptResult(aid, { exitReason: 'review: failure ' + i, stoppedAt: now });
     }
-    await store.updateTaskStatus(taskId, 'failed' as any, now);
+    await store.updateTaskStatus(taskId, 'ready', now);
+    await store.updateTaskStatus(taskId, 'running', now);
+    await store.updateTaskStatus(taskId, 'rework_required', now);
 
     const scheduler = new StageScheduler(store, {
       projectRoot: tmpDir, sessionDir: tmpDir, logDir: tmpDir,
@@ -542,7 +551,7 @@ describe('Scheduler Race: lifecycle convergence', () => {
     await store.createAttempt({ id: aid, taskId, stageId, attemptNumber: 1, status: 'running' });
     await store.updateAttemptStatus(aid, 'failed', now);
     await store.updateAttemptResult(aid, { exitReason: 'scope: wrote to forbidden/', stoppedAt: now });
-    await store.updateTaskStatus(taskId, 'failed' as any, now);
+    await store.updateTaskStatus(taskId, 'waiting_decision', now);
 
     const scheduler = new StageScheduler(store, {
       projectRoot: tmpDir, sessionDir: tmpDir, logDir: tmpDir,
@@ -682,6 +691,7 @@ class HangingWriteStore implements StateStore {
   async getRun(runId: string): Promise<any> { return this.delegate.getRun(runId); }
   async getActiveRunByProject(projectRoot: string): Promise<any> { return this.delegate.getActiveRunByProject(projectRoot); }
   async updateRunStatus(runId: string, status: any, updatedAt: string): Promise<boolean> { return this.delegate.updateRunStatus(runId, status, updatedAt); }
+  async failRunForConvergenceAtomically(input: any): Promise<boolean> { return this.delegate.failRunForConvergenceAtomically(input); }
   async updateRunFinishedAt(runId: string, finishedAt: string): Promise<boolean> { return this.delegate.updateRunFinishedAt(runId, finishedAt); }
   async createTask(input: any): Promise<any> { return this.delegate.createTask(input); }
   async getTask(taskId: string): Promise<any> { return this.delegate.getTask(taskId); }
@@ -691,23 +701,29 @@ class HangingWriteStore implements StateStore {
   async listTasksByStage(stageId: string): Promise<any[]> { return this.delegate.listTasksByStage(stageId); }
   async createStage(input: any): Promise<any> { return this.delegate.createStage(input); }
   async getStage(stageId: string): Promise<any> { return this.delegate.getStage(stageId); }
-  async updateStageStatus(stageId: string, status: string, updatedAt: string): Promise<boolean> { return this.delegate.updateStageStatus(stageId, status, updatedAt); }
+  async updateStageStatus(stageId: string, status: any, updatedAt: string): Promise<boolean> { return this.delegate.updateStageStatus(stageId, status, updatedAt); }
   async updateStageBaseCommit(stageId: string, commit: string): Promise<boolean> { return this.delegate.updateStageBaseCommit(stageId, commit); }
   async updateStageIntegrationBranch(stageId: string, branch: string): Promise<boolean> { return this.delegate.updateStageIntegrationBranch(stageId, branch); }
   async listStages(runId: string): Promise<any[]> { return this.delegate.listStages(runId); }
   async createAttempt(input: any): Promise<any> { return this.delegate.createAttempt(input); }
   async getAttempt(attemptId: string): Promise<any> { return this.delegate.getAttempt(attemptId); }
-  async updateAttemptStatus(attemptId: string, status: string, updatedAt: string): Promise<boolean> { return this.delegate.updateAttemptStatus(attemptId, status, updatedAt); }
+  async updateAttemptStatus(attemptId: string, status: any, updatedAt: string): Promise<boolean> { return this.delegate.updateAttemptStatus(attemptId, status, updatedAt); }
+  async retryReviewAtomically(input: any): Promise<boolean> { return this.delegate.retryReviewAtomically(input); }
   async updateAttemptResult(attemptId: string, updates: any): Promise<boolean> { return this.delegate.updateAttemptResult(attemptId, updates); }
   async listAttempts(taskId: string): Promise<any[]> { return this.delegate.listAttempts(taskId); }
   async listAttemptsByStage(stageId: string): Promise<any[]> { return this.delegate.listAttemptsByStage(stageId); }
   async getLatestAttempt(taskId: string): Promise<any> { return this.delegate.getLatestAttempt(taskId); }
+  async recordAttemptProvenance(input: any): Promise<any> { return this.delegate.recordAttemptProvenance(input); }
+  async getAttemptProvenance(attemptId: string): Promise<any> { return this.delegate.getAttemptProvenance(attemptId); }
   async createPathLock(input: any): Promise<any> { return this.delegate.createPathLock(input); }
   async acquirePathLocksAtomic(input: any): Promise<any> { return this.delegate.acquirePathLocksAtomic(input); }
   async getPathLock(lockId: string): Promise<any> { return this.delegate.getPathLock(lockId); }
   async releasePathLock(lockId: string, releasedAt: string): Promise<boolean> { return this.delegate.releasePathLock(lockId, releasedAt); }
   async getActiveLocksForRun(runId: string): Promise<any[]> { return this.delegate.getActiveLocksForRun(runId); }
   async getConflictingLocks(taskId: string, filePaths: string[], runId: string): Promise<any[]> { return this.delegate.getConflictingLocks(taskId, filePaths, runId); }
+  async claimActualPathsAtomic(input: any): Promise<any> { return this.delegate.claimActualPathsAtomic(input); }
+  async listActualPathClaims(stageId: string): Promise<any[]> { return this.delegate.listActualPathClaims(stageId); }
+  async releaseActualPathClaimsForStage(stageId: string, releasedAt: string): Promise<number> { return this.delegate.releaseActualPathClaimsForStage(stageId, releasedAt); }
   async createReview(input: any): Promise<any> { return this.delegate.createReview(input); }
   async getReview(reviewId: string): Promise<any> { return this.delegate.getReview(reviewId); }
   async updateReviewResult(reviewId: string, updates: any): Promise<boolean> { return this.delegate.updateReviewResult(reviewId, updates); }
@@ -1001,7 +1017,9 @@ describe('P0-A Fault Injection: normal path regression guard', () => {
       await store.updateAttemptStatus(aid, 'failed', now);
       await store.updateAttemptResult(aid, { exitReason: 'failure ' + i, stoppedAt: now });
     }
-    await store.updateTaskStatus(taskId, 'failed' as any, now);
+    await store.updateTaskStatus(taskId, 'ready', now);
+    await store.updateTaskStatus(taskId, 'running', now);
+    await store.updateTaskStatus(taskId, 'rework_required', now);
 
     const sampler = new FakeResourceSampler({ cpuUsagePercent: 10, piCount: 0, memTotalMb: 16384, memUsedMb: 4000 });
     const scheduler = new StageScheduler(store, {
@@ -1046,7 +1064,7 @@ describe('P0-A Fault Injection: normal path regression guard', () => {
     await store.createAttempt({ id: aid, taskId, stageId, attemptNumber: 1, status: 'running' });
     await store.updateAttemptStatus(aid, 'failed', now);
     await store.updateAttemptResult(aid, { exitReason: 'scope: wrote to forbidden/', stoppedAt: now });
-    await store.updateTaskStatus(taskId, 'failed' as any, now);
+    await store.updateTaskStatus(taskId, 'waiting_decision', now);
 
     const sampler = new FakeResourceSampler({ cpuUsagePercent: 10, piCount: 0, memTotalMb: 16384, memUsedMb: 4000 });
     const scheduler = new StageScheduler(store, {

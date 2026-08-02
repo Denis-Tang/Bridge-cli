@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execSync } from 'node:child_process';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { SqliteStateStore } from '../../src/state/sqlite-store.js';
@@ -115,9 +115,23 @@ describe('M2 Hard Blockers', () => {
     await store.createStage({ id: rid + '-s1', runId: rid, stageNumber: 1, title: 'S', status: 'running' });
     await store.createTask({ id: rid + '-t1', runId: rid, title: 'T', status: 'pending', specJson: { stageNumber: 1, dependencies: [], estimatedWritePaths: ['c/'] }, createdAt: now, updatedAt: now });
 
-    // Create a running attempt with a non-existent PID
+    // Create a checkpoint branch for a running attempt with a non-existent PID.
+    // Recovery should preserve and reuse this paid progress.
+    const targetBranch = execSync('git branch --show-current', { cwd: tmpDir, encoding: 'utf-8' }).trim();
+    const checkpointBranch = `brainctl/${rid}/checkpoint`;
+    const checkpointFile = path.join(tmpDir, 'c', `${rid}.txt`);
+    execSync(`git checkout -b "${checkpointBranch}"`, { cwd: tmpDir, stdio: 'pipe' });
+    mkdirSync(path.dirname(checkpointFile), { recursive: true });
+    writeFileSync(checkpointFile, 'preserved worker checkpoint');
+    execSync(`git add "c/${rid}.txt"`, { cwd: tmpDir, stdio: 'pipe' });
+    execSync('git commit -m "checkpoint interrupted work"', { cwd: tmpDir, stdio: 'pipe' });
+    execSync(`git checkout "${targetBranch}"`, { cwd: tmpDir, stdio: 'pipe' });
+
     await store.createAttempt({ id: rid + '-att-ghost', taskId: rid + '-t1', stageId: rid + '-s1', attemptNumber: 1, status: 'running' });
-    await store.updateAttemptResult(rid + '-att-ghost', { piPid: 9999999 }); // PID that doesn't exist
+    await store.updateAttemptResult(rid + '-att-ghost', {
+      piPid: 9999999,
+      branchName: checkpointBranch,
+    }); // PID that doesn't exist
 
     // Start scheduler - reconciliation should catch it
     const s = makeScheduler(store, tmpDir);
@@ -128,8 +142,11 @@ describe('M2 Hard Blockers', () => {
     expect(att!.exitReason).toContain('reconciled');
 
     // Check event was recorded
-    const events = await store.listEvents(rid, 'attempt_interrupted');
+    const events = await store.listEvents(rid, 'reconciled_mark_attempt_interrupted');
     expect(events.length).toBeGreaterThanOrEqual(1);
+    expect(existsSync(checkpointFile)).toBe(true);
+    const reusedEvents = await store.listEvents(rid, 'retry_branch_reused');
+    expect(reusedEvents.some((event) => event.attemptId !== rid + '-att-ghost')).toBe(true);
   });
 
   it('quality gates: no-config marks attempt failed and stage paused (not completed)', async () => {

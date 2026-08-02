@@ -99,6 +99,9 @@ export function buildMinimalTaskPacket(
     dependencyHash: depHash,
     dependencySummary,
     acceptanceCommands: spec.acceptanceChecks || [],
+    allowedCommands: spec.allowedCommands || [],
+    productDecisionsLocked: spec.productDecisionsLocked,
+    expectedOutputs: spec.expectedOutputs || [],
     outputFormat: 'worker_result_json',
     riskLevel: spec.riskLevel,
     heavyCommandSlotsRequired: spec.heavyCommandSlotsRequired ?? 0,
@@ -118,6 +121,7 @@ export function buildRetryPacket(
   findings: string[],
   diffDelta: string,
   repairGoal: string,
+  spec: StructuredTaskSpec,
 ): RetryPacket {
   return {
     originalTaskId: previousAttempt.taskId,
@@ -126,6 +130,11 @@ export function buildRetryPacket(
     findings,
     diffDelta,
     repairGoal,
+    allowedPaths: spec.allowedPaths,
+    forbiddenPaths: spec.forbiddenPaths,
+    acceptanceCommands: spec.acceptanceChecks || [],
+    allowedCommands: spec.allowedCommands || [],
+    productDecisionsLocked: spec.productDecisionsLocked,
   };
 }
 
@@ -138,6 +147,7 @@ export function buildMinimalPacketPrompt(packet: MinimalTaskPacket): string {
   ).join('\n');
 
   const acceptanceLines = packet.acceptanceCommands.map((c, i) => `${i + 1}. ${c}`).join('\n');
+  const commandLines = packet.allowedCommands.map((c) => `- \`${c}\``).join('\n');
 
   return [
     '# 最小施工包 - ' + packet.taskId,
@@ -166,7 +176,13 @@ export function buildMinimalPacketPrompt(packet: MinimalTaskPacket): string {
     packet.dependencySummary,
     '',
     '## 验收命令',
-    acceptanceLines,
+    acceptanceLines || '(无；由编排器质量门兜底)',
+    '',
+    '## 允许命令',
+    commandLines || '(仅允许只读检查与 Git 基本操作)',
+    '',
+    `## 产品决策已锁定: ${packet.productDecisionsLocked ? '是' : '否'}`,
+    packet.expectedOutputs.length > 0 ? `预期产物: ${packet.expectedOutputs.join(', ')}` : '预期产物: 以任务目标为准',
     '',
     '## 输出合约',
     '必须输出 `BEGIN_WORKER_RESULT_JSON` … `END_WORKER_RESULT_JSON` 标记块。',
@@ -191,6 +207,19 @@ export function buildRetryPacketPrompt(packet: RetryPacket): string {
     '## 修复目标',
     packet.repairGoal,
     '',
+    '## 不可变范围',
+    '允许路径:',
+    ...packet.allowedPaths.map((p) => `- \`${p}\``),
+    '禁止路径:',
+    ...(packet.forbiddenPaths.length > 0 ? packet.forbiddenPaths.map((p) => `- \`${p}\``) : ['(无)']),
+    '',
+    '## 验收命令',
+    ...(packet.acceptanceCommands.length > 0 ? packet.acceptanceCommands.map((c, i) => `${i + 1}. ${c}`) : ['(无；由编排器质量门兜底)']),
+    '',
+    '## 允许命令',
+    ...(packet.allowedCommands.length > 0 ? packet.allowedCommands.map((c) => `- \`${c}\``) : ['(仅允许只读检查与 Git 基本操作)']),
+    `产品决策已锁定: ${packet.productDecisionsLocked ? '是' : '否'}`,
+    '',
     '## 差异增量',
     '```diff',
     packet.diffDelta,
@@ -199,5 +228,6 @@ export function buildRetryPacketPrompt(packet: RetryPacket): string {
     '## 输出合约',
     '必须输出 `BEGIN_WORKER_RESULT_JSON` … `END_WORKER_RESULT_JSON` 标记块。',
     `taskId 必须为 "${packet.originalTaskId}"。`,
+    '必须包含 taskId, status, summary, filesChanged, commitHash, checks, scopeViolations, risks, unresolvedQuestions, productDecisionRequired, tokenUsage。',
   ].join('\n');
 }

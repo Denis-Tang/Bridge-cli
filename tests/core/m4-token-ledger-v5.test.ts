@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { SqliteStateStore } from '../../src/state/sqlite-store.js';
 import { SqliteMigrationRunner } from '../../src/state/sqlite-migration-runner.js';
 import type { SqliteConfig } from '../../src/state/sqlite-config.js';
@@ -49,6 +50,11 @@ function workerResult(taskId: string): WorkerResult {
     productDecisionRequired: false,
     tokenUsage: { inputTokens: 12_000, outputTokens: 9_000, cacheHitTokens: 0 },
   };
+}
+
+function recoveryPathHash(paths: string[]): string {
+  const canonical = [...new Set(paths.map((value) => value.replace(/\\/g, '/').replace(/^\.\//, '')))].sort();
+  return createHash('sha256').update(canonical.join('\n')).digest('hex');
 }
 
 class WritingFakePiRunner extends FakeProcessRunner {
@@ -186,7 +192,23 @@ async function resumeBudget(store: SqliteStateStore, runId: string, stageId: str
     eventData: { resumedAt: new Date().toISOString() },
   });
   await store.updateRunStatus(runId, 'running', new Date().toISOString());
-  await store.updateStageStatus(stageId, 'ready', new Date().toISOString());
+  const activePause = await store.getActivePauseForStage(stageId);
+  if (!activePause) throw new Error(`Stage ${stageId} is paused without an active PauseRecord`);
+  if (activePause.decisionId) {
+    const approved = await store.updateApprovalDecisionStatus(
+      activePause.decisionId,
+      'approved',
+      new Date().toISOString(),
+    );
+    if (!approved) throw new Error(`Failed to approve ${activePause.decisionId}`);
+  }
+  const resolved = await store.resolveStagePause({
+    pauseId: activePause.id,
+    stageId,
+    approvalDecisionId: activePause.decisionId,
+    resolutionNote: `Synthetic test confirmed PauseRecord ${activePause.id}`,
+  });
+  if (!resolved) throw new Error(`Failed to resolve active PauseRecord ${activePause.id}`);
 }
 
 async function preparePausedRun(runId: string): Promise<{
@@ -237,7 +259,8 @@ describe('M4 Token Ledger v5 StageScheduler fake integration', () => {
       await ctx.scheduler.startRun(runId);
 
       expect(ctx.piRunner.calls).toBe(1);
-      expect(ctx.codexRunner.calls).toBe(1);
+      // One task review plus the mandatory final integrated-tree review.
+      expect(ctx.codexRunner.calls).toBe(2);
 
       const attempt = await ctx.store.getLatestAttempt(ctx.taskId);
       expect(attempt?.status).toBe('approved');
@@ -249,6 +272,7 @@ describe('M4 Token Ledger v5 StageScheduler fake integration', () => {
       const batches = await ctx.store.listIntegrationBatches(ctx.stageId);
       expect(batches).toHaveLength(1);
       expect(batches[0].status).toBe('completed');
+      expect(batches[0].reviewCoverageStatus).toBe('complete');
       expect(batches[0].targetMergeCommit).toBeTruthy();
       expect(execSync('git rev-parse HEAD', { cwd: ctx.projectRoot, encoding: 'utf-8' }).trim()).not.toBe(ctx.baseHead);
 
@@ -260,6 +284,52 @@ describe('M4 Token Ledger v5 StageScheduler fake integration', () => {
       expect(reviewLedger).toHaveLength(1);
       expect(reviewLedger[0].status).toBe('confirmed');
       expect(reviewLedger[0].actualTotal).toBe(420);
+    } finally {
+      await ctx.store.close();
+      try { rmSync(ctx.tmp, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('resumes an integrity-proven recovery expansion without reopening the frozen TaskSpec decision', async () => {
+    const runId = 'v5-recovery-expansion';
+    const ctx = await preparePausedRun(runId);
+    try {
+      const attempt = await ctx.store.getLatestAttempt(ctx.taskId);
+      const worktree = attempt!.worktreePath!;
+      mkdirSync(path.join(worktree, 'tests'), { recursive: true });
+      writeFileSync(path.join(worktree, 'tests', 'approved.test.ts'), 'export const recovered = true;\n', 'utf-8');
+      execSync('git add tests/approved.test.ts', { cwd: worktree, stdio: 'pipe' });
+      execSync('git commit -m "approved recovery expansion"', { cwd: worktree, stdio: 'pipe' });
+      const adoptedCommit = execSync('git rev-parse HEAD', { cwd: worktree, encoding: 'utf-8' }).trim();
+      const changedFiles = ['src/allowed.ts', 'tests/approved.test.ts'];
+      const expansionFiles = ['tests/approved.test.ts'];
+      const result = JSON.parse(attempt!.workerResultJson!) as WorkerResult;
+      result.filesChanged = changedFiles;
+      result.commitHash = adoptedCommit;
+      await ctx.store.updateAttemptResult(attempt!.id, {
+        workerResultJson: JSON.stringify(result),
+        resultSource: 'manual',
+        adoptedCommit,
+        adoptionMetadataJson: JSON.stringify({
+          changedFilesHash: recoveryPathHash(changedFiles),
+          changedFileCount: changedFiles.length,
+          scopeExpansionFilesHash: recoveryPathHash(expansionFiles),
+          scopeExpansionFileCount: expansionFiles.length,
+        }),
+      });
+      const lockResult = await ctx.store.acquirePathLocksAtomic({
+        runId, taskId: ctx.taskId, filePaths: expansionFiles, lockType: 'exclusive',
+      });
+      expect(lockResult.acquired).toBe(true);
+
+      await resumeBudget(ctx.store, runId, ctx.stageId);
+      await ctx.scheduler.startRun(runId);
+
+      expect(ctx.piRunner.calls).toBe(1);
+      expect(ctx.codexRunner.calls).toBe(2);
+      expect((await ctx.store.getLatestAttempt(ctx.taskId))?.status).toBe('approved');
+      expect((await ctx.store.getRun(runId))?.status).toBe('completed');
+      expect(await ctx.store.listEvents(runId, 'scope_expansion')).toHaveLength(0);
     } finally {
       await ctx.store.close();
       try { rmSync(ctx.tmp, { recursive: true, force: true }); } catch {}
@@ -285,6 +355,52 @@ describe('M4 Token Ledger v5 StageScheduler fake integration', () => {
       const pausedEvents = await ctx.store.listEvents(runId, 'stage_paused');
       expect(pausedEvents.some((event) => event.eventDataJson?.includes('resume_path_lock_invalid') && event.eventDataJson.includes('not_active'))).toBe(true);
       expect(await ctx.store.listIntegrationBatches(ctx.stageId)).toHaveLength(0);
+    } finally {
+      await ctx.store.close();
+      try { rmSync(ctx.tmp, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('safe-pauses recovery resume when an approved expanded-path lock is missing', async () => {
+    const runId = 'v5-recovery-lock-missing';
+    const ctx = await preparePausedRun(runId);
+    try {
+      const attempt = await ctx.store.getLatestAttempt(ctx.taskId);
+      const adoptedCommit = execSync('git rev-parse HEAD', { cwd: attempt!.worktreePath!, encoding: 'utf-8' }).trim();
+      const changedFiles = ['src/allowed.ts', 'tests/approved.test.ts'];
+      const expansionFiles = ['tests/approved.test.ts'];
+      const result = JSON.parse(attempt!.workerResultJson!) as WorkerResult;
+      result.filesChanged = changedFiles;
+      result.commitHash = adoptedCommit;
+      await ctx.store.updateAttemptResult(attempt!.id, {
+        workerResultJson: JSON.stringify(result),
+        resultSource: 'manual',
+        adoptedCommit,
+        adoptionMetadataJson: JSON.stringify({
+          changedFilesHash: recoveryPathHash(changedFiles),
+          changedFileCount: changedFiles.length,
+          scopeExpansionFilesHash: recoveryPathHash(expansionFiles),
+          scopeExpansionFileCount: expansionFiles.length,
+        }),
+      });
+      const acquired = await ctx.store.acquirePathLocksAtomic({
+        runId, taskId: ctx.taskId, filePaths: expansionFiles, lockType: 'exclusive',
+      });
+      expect(acquired.acquired).toBe(true);
+      for (const lock of acquired.locks) {
+        await ctx.store.releasePathLock(lock.id, new Date().toISOString());
+      }
+
+      await resumeBudget(ctx.store, runId, ctx.stageId);
+      await ctx.scheduler.startRun(runId);
+
+      expect(ctx.piRunner.calls).toBe(1);
+      expect(ctx.codexRunner.calls).toBe(0);
+      expect((await ctx.store.getLatestAttempt(ctx.taskId))?.status).toBe('worker_completed');
+      const pausedEvents = await ctx.store.listEvents(runId, 'stage_paused');
+      expect(pausedEvents.some((event) => event.eventDataJson?.includes('resume_path_lock_invalid')
+        && event.eventDataJson.includes('not_active')
+        && event.eventDataJson.includes('tests/approved.test.ts'))).toBe(true);
     } finally {
       await ctx.store.close();
       try { rmSync(ctx.tmp, { recursive: true, force: true }); } catch {}
@@ -358,7 +474,8 @@ describe('M4 Token Ledger v5 StageScheduler fake integration', () => {
         await scheduler.startRun(runId);
 
         expect(piRunner.calls).toBe(1);
-        expect(codexRunner.calls).toBe(1);
+        // Governance telemetry may be off, but final integrated-tree review is not optional.
+        expect(codexRunner.calls).toBe(2);
         expect((await store.getLatestAttempt(taskId))?.status).toBe('approved');
         expect((await store.getStage(stageId))?.status).toBe('completed');
         expect(await store.listTokenLedgerEntries(runId)).toHaveLength(0);

@@ -49,31 +49,3 @@ export function shouldDoTaskLevelReview(
   // Unknown mode: be conservative
   return true;
 }
-
-/**
- * Determine if a stage should receive aggregated Codex review.
- */
-export function shouldDoStageLevelReview(
-  stageTasks: Array<{ spec: StructuredTaskSpec; reviewSkipped: boolean }>,
-  mode: ExecutionMode,
-): boolean {
-  if (mode === 'default') return false;
-  if (mode === 'simple') return false;
-
-  // Token-efficient: run stage review if any task had review skipped
-  if (mode === 'token-efficient') {
-    return stageTasks.some((t) => t.reviewSkipped);
-  }
-
-  return false;
-}
-
-/**
- * Signal that stage review failed and task-level upgrade is needed.
- */
-export function isUpgradeNeeded(
-  stageReviewPassed: boolean,
-  skippedTaskCount: number,
-): boolean {
-  return !stageReviewPassed && skippedTaskCount > 0;
-}

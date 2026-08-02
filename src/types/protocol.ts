@@ -75,6 +75,15 @@ export interface ReviewResult {
   mergeAllowed: boolean;
   /** Reviewer identifier: 'local-rule', 'codex-cli', 'codex-sdk' */
   reviewer?: string;
+  /** True only when the reviewer process itself failed; this is not a code finding. */
+  reviewerUnavailable?: boolean;
+  /** Sanitized subprocess metadata. Never contains stdout/stderr bodies. */
+  executionMetadata?: {
+    errorCategory?: 'timeout' | 'nonzero_exit' | 'spawn_failure' | 'unexpected';
+    exitCode?: number | null;
+    durationMs?: number;
+    stderrHash?: string | null;
+  };
 }
 
 export interface DecisionRequest {

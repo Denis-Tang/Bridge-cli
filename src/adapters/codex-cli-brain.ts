@@ -108,7 +108,15 @@ export class CodexCliBrain {
 
     const startTime = Date.now();
     try {
-      const result = await this.processRunner.run('codex', ['review', '-'], {
+      const result = await this.processRunner.run('codex', [
+        'exec',
+        '--ephemeral',
+        '--sandbox',
+        'read-only',
+        '--ignore-user-config',
+        '--ignore-rules',
+        '-',
+      ], {
         cwd: this.config.workDir,
         timeoutMs: this.config.timeoutMs,
         input: planPrompt,
@@ -213,8 +221,9 @@ Output a JSON plan with stages, tasks, and dependencies using EXACTLY this forma
 
 Rules:
 - Each stage groups tasks that can run in parallel.
-- Tasks in later stages depend on ALL tasks in earlier stages (implicit dependency).
-- Within a stage, tasks with explicit dependencies must wait.
+- Stage barriers already make every later stage wait for all earlier stages; do not encode that order in task dependencies.
+- A task's dependencies array MUST contain only task IDs from the same stage. Use [] when it has no same-stage dependency. NEVER list a task from an earlier or later stage.
+- Within a stage, tasks with same-stage explicit dependencies must wait.
 - estimatedWritePaths must list ALL files the task will likely modify.
 - Multiple tasks must NOT write to the same file in the same stage.
 - allowedPaths limits which directories the worker can modify.

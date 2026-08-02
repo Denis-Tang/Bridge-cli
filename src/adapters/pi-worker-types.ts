@@ -30,6 +30,29 @@ export interface PiWorkerConfig {
   requireClarification?: boolean;
   /** Codex responder for technical-only questions. Required when clarification is enabled. */
   clarificationResponder?: TechnicalClarificationResponder;
+  /** R3: guard self-check hooks (zero-inference probe before real clarification). */
+  guardSelfCheck?: {
+    enabled?: boolean;
+    markerDir?: string;
+    timeoutMs?: number;
+    verifiedPiVersion?: string;
+    /** Injectable runner for tests; omitted → real Pi spawn (zero-inference probe). */
+    runner?: import('./pi-worker-types.js').ProcessRunner;
+    /** Reports the self-check outcome (audit sink; e.g. scheduler writes SQLite event). */
+    onResult?: (result: import('./pi-guard-selfcheck.js').GuardSelfCheckResult) => void | Promise<void>;
+    /** B (authorized): block-semantics probe — ONE minimal inference, cost-gated. */
+    inferenceProbe?: {
+      enabled?: boolean;
+      model?: string;
+      timeoutMs?: number;
+      runner?: import('./pi-worker-types.js').ProcessRunner;
+      reserveCost?: () => Promise<{ allowed: boolean; reason?: string }>;
+      settleCost?: (outcome: 'released' | 'unavailable', terminationEvidence: string) => Promise<boolean>;
+      cacheGet?: (piVersion: string) => Promise<{ outcome: string; failureCategory: string | null; checkedAt: string } | null>;
+      cacheSet?: (piVersion: string, outcome: string, failureCategory: string | null) => Promise<void>;
+      onResult?: (result: import('./pi-guard-block-probe.js').GuardBlockProbeResult) => void | Promise<void>;
+    };
+  };
 }
 
 /**
@@ -37,6 +60,8 @@ export interface PiWorkerConfig {
  */
 export interface PiWorkerTaskInput {
   taskSpec: TaskSpec;
+  /** Optional bounded implementation prompt. Clarification still uses the full immutable TaskSpec. */
+  implementationPrompt?: string;
   worktreePath: string;
   runId: string;
 }
@@ -91,6 +116,10 @@ export interface ProcessRunInput {
   env?: Record<string, string | undefined>;
   timeoutMs: number;
   stdin?: string;
+  /** Keep only the newest N stdout characters in ProcessRunResult. */
+  maxCapturedStdoutChars?: number;
+  /** Keep only the newest N stderr characters in ProcessRunResult. */
+  maxCapturedStderrChars?: number;
   /**
    * Optional callback invoked on each stdout/stderr chunk.
    * Return a ProcessEarlyCompletion to terminate the process early.
@@ -106,6 +135,10 @@ export interface ProcessRunResult {
   exitCode: number | null;
   stdout: string;
   stderr: string;
+  /** Total characters observed before bounded capture was applied. */
+  stdoutLength?: number;
+  /** Total characters observed before bounded capture was applied. */
+  stderrLength?: number;
   timedOut: boolean;
   aborted: boolean;
   terminatedAfterWorkerResult: boolean;

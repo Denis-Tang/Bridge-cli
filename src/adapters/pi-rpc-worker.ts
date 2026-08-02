@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, writeFileSync, appendFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { mkdirSync, writeFileSync, appendFileSync, mkdtempSync, rmSync, existsSync, realpathSync } from 'node:fs';
+import { isAbsolute, relative, resolve } from 'node:path';
 import type { PiWorkerConfig, PiWorkerTaskInput, PiWorkerExecutionResult, PiProviderUsage, ProcessRunner, ProcessRunInput, ProcessRunResult, ProcessEarlyCompletion } from './pi-worker-types.js';
 import type { WorkerResult } from '../types/protocol.js';
 import type { LedgerSink, InvocationContext } from '../core/token-telemetry.js';
@@ -20,8 +20,156 @@ import {
   type ClarificationTranscriptEntry,
 } from './pi-clarification.js';
 import { resolveWindowsCliCommand } from './windows-cli-resolver.js';
+import { runGuardSelfCheckCached, detectPiVersion as detectPiVersionFull } from './pi-guard-selfcheck.js';
+import { runGuardBlockProbe, decideProbeSettleOutcome } from './pi-guard-block-probe.js';
 
 type JsonRecord = Record<string, unknown>;
+
+export const PI_CLARIFICATION_READ_TOOLS = ['read', 'grep', 'find', 'ls'] as const;
+
+export interface PiClarificationToolPolicy {
+  root: string;
+  allowedPatterns: string[];
+  forbiddenPatterns: string[];
+}
+
+const HARD_CLARIFICATION_FORBIDDEN_PATTERNS = [
+  '.env', '.env.*', '**/.env', '**/.env.*',
+  '.git/', '**/.git/', '.brainctl/', '**/.brainctl/', '.brainctl-dev/', '**/.brainctl-dev/',
+  'node_modules/', '**/node_modules/', '**/*.pem', '**/*.key', '**/id_rsa', '**/id_ed25519',
+  '**/credentials', '**/credentials.*', '**/secrets', '**/secrets.*',
+];
+
+function pathComparisonValue(value: string): string {
+  const normalized = resolve(value).replace(/\\/g, '/').replace(/\/$/, '');
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function normalizeRelativePattern(value: string): string {
+  return value.trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').toLowerCase();
+}
+
+function globPatternToRegExp(pattern: string): RegExp {
+  let expression = '^';
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index];
+    if (char === '*' && pattern[index + 1] === '*') {
+      expression += '.*';
+      index += 1;
+      if (pattern[index + 1] === '/') index += 1;
+    } else if (char === '*') {
+      expression += '[^/]*';
+    } else if (char === '?') {
+      expression += '[^/]';
+    } else {
+      expression += char.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  return new RegExp(`${expression}$`, 'i');
+}
+
+function matchesClarificationPattern(relativePath: string, rawPattern: string): boolean {
+  const candidate = normalizeRelativePattern(relativePath || '.');
+  const pattern = normalizeRelativePattern(rawPattern);
+  if (!pattern) return false;
+  if (candidate === pattern || (!pattern.includes('*') && candidate.startsWith(`${pattern.replace(/\/$/, '')}/`))) return true;
+  return pattern.includes('*') ? globPatternToRegExp(pattern).test(candidate) : false;
+}
+
+function staticPatternPrefix(rawPattern: string): string {
+  const pattern = normalizeRelativePattern(rawPattern);
+  const wildcard = pattern.search(/[?*]/);
+  return (wildcard < 0 ? pattern : pattern.slice(0, wildcard)).replace(/\/$/, '');
+}
+
+function requestedPathCouldTraversePattern(relativePath: string, rawPattern: string): boolean {
+  const candidate = normalizeRelativePattern(relativePath || '.').replace(/\/$/, '');
+  const prefix = staticPatternPrefix(rawPattern);
+  if (!prefix || candidate === '.') return prefix.length > 0;
+  return prefix === candidate || prefix.startsWith(`${candidate}/`);
+}
+
+function resolveClarificationCandidate(root: string, requestedPath: string): { absolute: string; relative: string } | null {
+  const lexical = resolve(root, requestedPath || '.');
+  const canonicalRoot = existsSync(root) ? realpathSync.native(root) : resolve(root);
+  const canonicalCandidate = existsSync(lexical) ? realpathSync.native(lexical) : lexical;
+  const comparableRoot = pathComparisonValue(canonicalRoot);
+  const comparableCandidate = pathComparisonValue(canonicalCandidate);
+  if (comparableCandidate !== comparableRoot && !comparableCandidate.startsWith(`${comparableRoot}/`)) return null;
+  const relativePath = relative(canonicalRoot, canonicalCandidate).replace(/\\/g, '/') || '.';
+  if (relativePath === '..' || relativePath.startsWith('../') || isAbsolute(relativePath)) return null;
+  return { absolute: canonicalCandidate, relative: relativePath };
+}
+
+export function buildPiClarificationToolPolicy(
+  root: string,
+  taskSpec: PiWorkerTaskInput['taskSpec'],
+): PiClarificationToolPolicy {
+  return {
+    root: resolve(root),
+    allowedPatterns: [...(taskSpec.allowedPaths ?? []), ...(taskSpec.contextFiles ?? [])],
+    forbiddenPatterns: [...(taskSpec.forbiddenPaths ?? []), ...HARD_CLARIFICATION_FORBIDDEN_PATTERNS],
+  };
+}
+
+export function inspectPiClarificationToolRequest(
+  event: JsonRecord,
+  policy: PiClarificationToolPolicy,
+): string | null {
+  if (event.type !== 'tool_execution_start') return null;
+  const toolName = typeof event.toolName === 'string' ? event.toolName : '';
+  if (!(PI_CLARIFICATION_READ_TOOLS as readonly string[]).includes(toolName)) {
+    return `non-read-only tool requested: ${toolName || '(missing)'}`;
+  }
+  const args = event.args && typeof event.args === 'object' ? event.args as JsonRecord : {};
+  const requestedPath = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : '.';
+  const candidate = resolveClarificationCandidate(policy.root, requestedPath);
+  if (!candidate) return 'path escapes the task worktree';
+  if (policy.forbiddenPatterns.some((pattern) => matchesClarificationPattern(candidate.relative, pattern))) {
+    return `forbidden path requested: ${candidate.relative}`;
+  }
+  if (['grep', 'find', 'ls'].includes(toolName)
+    && policy.forbiddenPatterns.some((pattern) => requestedPathCouldTraversePattern(candidate.relative, pattern))) {
+    return `directory request could traverse a forbidden path: ${candidate.relative}`;
+  }
+  if (policy.allowedPatterns.length > 0
+    && !policy.allowedPatterns.some((pattern) => matchesClarificationPattern(candidate.relative, pattern))) {
+    return `path is outside the bounded clarification context: ${candidate.relative}`;
+  }
+  return null;
+}
+
+/**
+ * Build the one-shot Pi extension used only during clarification. Pi's native
+ * tool allowlist removes write-capable tools; this pre-execution hook adds a
+ * path boundary for the remaining read tools. The adapter independently
+ * validates streamed tool_execution_start events and fails the gate on any
+ * violation, so this is enforcement rather than a prompt convention.
+ */
+export function buildPiClarificationGuardExtensionSource(
+  policy: PiClarificationToolPolicy,
+  violationMarkerPath: string,
+): string {
+  const serializedPolicy = JSON.stringify(policy);
+  const serializedMarker = JSON.stringify(violationMarkerPath);
+  const serializedTools = JSON.stringify(PI_CLARIFICATION_READ_TOOLS);
+  return [
+    `import { existsSync, realpathSync, writeFileSync } from 'node:fs';`,
+    `import { isAbsolute, relative, resolve } from 'node:path';`,
+    `const policy = ${serializedPolicy};`,
+    `const marker = ${serializedMarker};`,
+    `const allowedTools = new Set(${serializedTools});`,
+    `const cmp = (value) => { const normalized = resolve(value).replace(/\\\\/g, '/').replace(/\\/$/, ''); return process.platform === 'win32' ? normalized.toLowerCase() : normalized; };`,
+    `const norm = (value) => String(value || '').trim().replace(/\\\\/g, '/').replace(/^\\.\\//, '').replace(/^\\/+/, '').toLowerCase();`,
+    `const glob = (pattern) => { let out = '^'; for (let i = 0; i < pattern.length; i += 1) { const ch = pattern[i]; if (ch === '*' && pattern[i + 1] === '*') { out += '.*'; i += 1; if (pattern[i + 1] === '/') i += 1; } else if (ch === '*') out += '[^/]*'; else if (ch === '?') out += '[^/]'; else out += ch.replace(/[.*+?^$(){}|[\\]\\\\]/g, '\\\\$&'); } return new RegExp(out + '$', 'i'); };`,
+    `const matches = (value, raw) => { const candidate = norm(value || '.'); const pattern = norm(raw); if (!pattern) return false; if (candidate === pattern || (!pattern.includes('*') && candidate.startsWith(pattern.replace(/\\/$/, '') + '/'))) return true; return pattern.includes('*') ? glob(pattern).test(candidate) : false; };`,
+    `const prefix = (raw) => { const pattern = norm(raw); const at = pattern.search(/[?*]/); return (at < 0 ? pattern : pattern.slice(0, at)).replace(/\\/$/, ''); };`,
+    `const canTraverse = (value, raw) => { const candidate = norm(value || '.').replace(/\\/$/, ''); const fixed = prefix(raw); if (!fixed || candidate === '.') return fixed.length > 0; return fixed === candidate || fixed.startsWith(candidate + '/'); };`,
+    `const inspect = (toolName, input, cwd) => { if (!allowedTools.has(toolName)) return 'non-read-only tool requested'; if (cmp(cwd) !== cmp(policy.root)) return 'clarification cwd mismatch'; const requested = input && typeof input.path === 'string' && input.path.trim() ? input.path.trim() : '.'; const lexical = resolve(policy.root, requested); const rootReal = existsSync(policy.root) ? realpathSync.native(policy.root) : resolve(policy.root); const targetReal = existsSync(lexical) ? realpathSync.native(lexical) : lexical; const rootCmp = cmp(rootReal); const targetCmp = cmp(targetReal); if (targetCmp !== rootCmp && !targetCmp.startsWith(rootCmp + '/')) return 'path escapes the task worktree'; const rel = relative(rootReal, targetReal).replace(/\\\\/g, '/') || '.'; if (rel === '..' || rel.startsWith('../') || isAbsolute(rel)) return 'path escapes the task worktree'; if (policy.forbiddenPatterns.some((item) => matches(rel, item))) return 'forbidden path requested'; if (['grep', 'find', 'ls'].includes(toolName) && policy.forbiddenPatterns.some((item) => canTraverse(rel, item))) return 'directory request could traverse a forbidden path'; if (policy.allowedPatterns.length > 0 && !policy.allowedPatterns.some((item) => matches(rel, item))) return 'path is outside the bounded clarification context'; return null; };`,
+    `export default function bridgeClarificationGuard(pi) { pi.on('tool_call', (event, ctx) => { const reason = inspect(event.toolName, event.input, ctx.cwd); if (!reason) return; try { writeFileSync(marker, 'blocked', { encoding: 'utf8', flag: 'wx' }); } catch (error) { if (!existsSync(marker)) throw error; } return { block: true, reason: 'BRIDGE_CLARIFICATION_POLICY_BLOCK: ' + reason }; }); }`,
+    '',
+  ].join('\n');
+}
 
 function finiteNonNegative(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
@@ -63,6 +211,108 @@ function sumUsage(items: PiProviderUsage[]): PiProviderUsage | null {
   }), { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0, costTotal: 0 });
 }
 
+class JsonlLineAccumulator {
+  private parts: string[] = [];
+
+  push(chunk: string): string[] {
+    if (!chunk) return [];
+    const segments = chunk.split('\n');
+    if (segments.length === 1) {
+      this.parts.push(chunk);
+      return [];
+    }
+
+    const lines: string[] = [];
+    for (let index = 0; index < segments.length - 1; index += 1) {
+      this.parts.push(segments[index]);
+      let line = this.parts.join('');
+      if (line.endsWith('\r')) line = line.slice(0, -1);
+      lines.push(line);
+      this.parts = [];
+    }
+    const tail = segments.at(-1);
+    if (tail) this.parts.push(tail);
+    return lines;
+  }
+
+  finish(): string | null {
+    if (this.parts.length === 0) return null;
+    let line = this.parts.join('');
+    this.parts = [];
+    if (line.endsWith('\r')) line = line.slice(0, -1);
+    return line;
+  }
+}
+
+const MAX_STREAMED_RESULT_CHARS = 1_048_576;
+const MAX_CAPTURED_STDOUT_CHARS = 1_048_576;
+const MAX_CAPTURED_STDERR_CHARS = 262_144;
+
+class MarkedTextAccumulator {
+  private prefixTail = '';
+  private captured = '';
+  private capturing = false;
+
+  constructor(
+    private readonly begin: string,
+    private readonly end: string,
+    private readonly maxChars = MAX_STREAMED_RESULT_CHARS,
+  ) {}
+
+  push(text: string): string | null {
+    if (!text) return null;
+    if (!this.capturing) {
+      const candidate = this.prefixTail + text;
+      const start = candidate.lastIndexOf(this.begin);
+      if (start < 0) {
+        this.prefixTail = candidate.slice(-Math.max(0, this.begin.length - 1));
+        return null;
+      }
+      this.capturing = true;
+      this.captured = candidate.slice(start);
+      this.prefixTail = '';
+    } else {
+      this.captured += text;
+    }
+
+    if (this.captured.length > this.maxChars) {
+      const restart = this.captured.lastIndexOf(this.begin, this.captured.length - 1);
+      if (restart > 0) this.captured = this.captured.slice(restart);
+      if (this.captured.length > this.maxChars) {
+        this.prefixTail = this.captured.slice(-Math.max(0, this.begin.length - 1));
+        this.captured = '';
+        this.capturing = false;
+        return null;
+      }
+    }
+
+    const finish = this.captured.indexOf(this.end, this.begin.length);
+    if (finish < 0) return null;
+    return this.captured.slice(0, finish + this.end.length);
+  }
+}
+
+function parseJsonlEvent(line: string): JsonRecord | null {
+  if (!line.trim()) return null;
+  try {
+    const event = JSON.parse(line) as unknown;
+    return event && typeof event === 'object' ? event as JsonRecord : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractAssistantTextDeltas(event: JsonRecord | null, rawLine: string): string[] {
+  if (!event) return rawLine.trim() ? [`${rawLine}\n`] : [];
+  const assistantEvent = event.assistantMessageEvent as JsonRecord | undefined;
+  if (event.type === 'message_update'
+    && assistantEvent?.type === 'text_delta'
+    && typeof assistantEvent.delta === 'string') {
+    return [assistantEvent.delta];
+  }
+  return [];
+}
+
 export async function cleanupTemporaryPiSession(sessionRoot: string): Promise<boolean> {
   const delays = [25, 75, 200, 500, 1000];
   for (const delayMs of delays) {
@@ -87,43 +337,49 @@ export async function cleanupTemporaryPiSession(sessionRoot: string): Promise<bo
  * agent_end is a complete snapshot and may repeat earlier message_end events, so the
  * largest final snapshot wins instead of double-counting streamed duplicates.
  */
-export function parsePiProviderUsageFromJsonl(output: string): PiProviderUsage | null {
-  const finalSnapshots: PiProviderUsage[] = [];
-  const completedMessages = new Map<string, PiProviderUsage>();
+export class PiProviderUsageAccumulator {
+  private bestFinalSnapshot: PiProviderUsage | null = null;
+  private completedMessages = new Map<string, PiProviderUsage>();
 
-  for (const line of output.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    let event: JsonRecord;
-    try {
-      const parsed = JSON.parse(line) as unknown;
-      if (!parsed || typeof parsed !== 'object') continue;
-      event = parsed as JsonRecord;
-    } catch {
-      continue;
-    }
-
+  pushEvent(event: JsonRecord): void {
     if (event.type === 'agent_end' && Array.isArray(event.messages)) {
       const snapshot = sumUsage(event.messages.map(usageFromMessage).filter((item): item is PiProviderUsage => item !== null));
-      if (snapshot) finalSnapshots.push(snapshot);
-      continue;
-    }
-
-    if (event.type === 'message_end') {
-      const usage = usageFromMessage(event.message);
-      if (usage) {
-        const message = event.message as JsonRecord;
-        const identity = typeof message.id === 'string'
-          ? `id:${message.id}`
-          : JSON.stringify([message.timestamp ?? null, message.model ?? null, usage]);
-        completedMessages.set(identity, usage);
+      if (snapshot && (!this.bestFinalSnapshot || snapshot.totalTokens > this.bestFinalSnapshot.totalTokens)) {
+        this.bestFinalSnapshot = snapshot;
       }
+      return;
     }
+
+    if (event.type !== 'message_end') return;
+    const usage = usageFromMessage(event.message);
+    if (!usage) return;
+    const message = event.message as JsonRecord;
+    const identity = typeof message.id === 'string'
+      ? `id:${message.id}`
+      : JSON.stringify([message.timestamp ?? null, message.model ?? null, usage]);
+    this.completedMessages.set(identity, usage);
   }
 
-  if (finalSnapshots.length > 0) {
-    return finalSnapshots.reduce((best, item) => item.totalTokens > best.totalTokens ? item : best);
+  result(): PiProviderUsage | null {
+    return this.bestFinalSnapshot ?? sumUsage([...this.completedMessages.values()]);
   }
-  return sumUsage([...completedMessages.values()]);
+}
+
+export function parsePiProviderUsageFromJsonl(output: string): PiProviderUsage | null {
+  const accumulator = new PiProviderUsageAccumulator();
+
+  for (const line of output.split(/\r?\n/)) {
+    const event = parseJsonlEvent(line);
+    if (event) accumulator.pushEvent(event);
+  }
+  return accumulator.result();
+}
+
+function appendBounded(current: string, chunk: string, limit?: number): string {
+  if (limit === undefined) return current + chunk;
+  if (limit <= 0) return '';
+  if (chunk.length >= limit) return chunk.slice(-limit);
+  return current.slice(-Math.max(0, limit - chunk.length)) + chunk;
 }
 
 /**
@@ -142,6 +398,8 @@ export class RealProcessRunner implements ProcessRunner {
     });
     let stdout = '';
     let stderr = '';
+    let stdoutLength = 0;
+    let stderrLength = 0;
     let timedOut = false;
     let aborted = false;
     let terminatedAfterWorkerResult = false;
@@ -158,27 +416,14 @@ export class RealProcessRunner implements ProcessRunner {
       child.stdin.write(input.stdin);
     }
 
-    // Helper to check for early completion on accumulated output
-    const checkEarlyComplete = (accStdout: string, _accStderr: string): boolean => {
-      if (input.onStdoutChunk) {
-        const signal = input.onStdoutChunk('', accStdout);
-        if (signal && signal.terminateProcess) {
-          terminatedAfterWorkerResult = true;
-          return true;
-        }
-      }
-      return false;
-    };
-
     // Collect stdout
     child.stdout?.on('data', (data: Buffer) => {
       const chunk = data.toString('utf-8');
-      stdout += chunk;
-      // Check for early completion after each chunk
-      if (checkEarlyComplete(stdout, stderr)) {
-        terminateTree('SIGTERM');
-      }
-      // Also call per-chunk callback if provided
+      stdoutLength += chunk.length;
+      stdout = appendBounded(stdout, chunk, input.maxCapturedStdoutChars);
+      // Call the observer exactly once per chunk. The observer receives the
+      // accumulated output for compatibility, but streaming parsers should use
+      // the chunk argument so a long JSONL session stays O(n).
       if (input.onStdoutChunk) {
         const signal = input.onStdoutChunk(chunk, stdout);
         if (signal && signal.terminateProcess) {
@@ -191,7 +436,8 @@ export class RealProcessRunner implements ProcessRunner {
     // Collect stderr
     child.stderr?.on('data', (data: Buffer) => {
       const chunk = data.toString('utf-8');
-      stderr += chunk;
+      stderrLength += chunk.length;
+      stderr = appendBounded(stderr, chunk, input.maxCapturedStderrChars);
     });
 
     const terminateTree = (signal: NodeJS.Signals = 'SIGTERM') => {
@@ -240,6 +486,8 @@ export class RealProcessRunner implements ProcessRunner {
           exitCode,
           stdout,
           stderr,
+          stdoutLength,
+          stderrLength,
           timedOut,
           aborted,
           terminatedAfterWorkerResult,
@@ -250,12 +498,16 @@ export class RealProcessRunner implements ProcessRunner {
       child.on('error', (err) => {
         clearTimeout(timeoutId);
         const durationMs = Date.now() - startTime;
-        stderr += `\nProcess error: ${err.message}`;
+        const errorChunk = `\nProcess error: ${err.message}`;
+        stderrLength += errorChunk.length;
+        stderr = appendBounded(stderr, errorChunk, input.maxCapturedStderrChars);
         resolvePromise({
           pid: childPid,
           exitCode: null,
           stdout,
           stderr,
+          stdoutLength,
+          stderrLength,
           timedOut,
           aborted,
           terminatedAfterWorkerResult,
@@ -367,7 +619,7 @@ export class PiRpcWorker {
     mkdirSync(this.config.sessionDirectory, { recursive: true });
 
     // Build the prompt
-    const prompt = buildPiWorkerPrompt({ taskSpec: input.taskSpec });
+    const prompt = input.implementationPrompt ?? buildPiWorkerPrompt({ taskSpec: input.taskSpec });
 
     // Safe/mock mode leaves a prompt artifact for manual inspection. Real mode
     // sends it only over stdin and persists numeric/hash metadata, never text.
@@ -457,8 +709,122 @@ export class PiRpcWorker {
   ): Promise<PiWorkerExecutionResult> {
     if (!this.config.allowRealPiExecution) return this.runInternal(input, workerPrompt);
 
+    if (pathComparisonValue(this.config.workingDirectory) !== pathComparisonValue(input.worktreePath)) {
+      return this.pauseForClarification(input, [], null, 'Pi 澄清工作目录与 task worktree 不一致', []);
+    }
+
+    // ── R3: guard runtime self-check (zero inference). If the guard extension
+    // cannot be PROVEN loaded + registered, refuse to start the clarification
+    // session — never downgrade to second-layer-only. Cached per process/version.
+    const selfCheckCfg = this.config.guardSelfCheck;
+    // Fail closed by DEFAULT: a real clarification gate that cannot prove its
+    // read-only guard is missing → refuse to run. Explicit `enabled: false`
+    // remains the only opt-out (tests), but absence is NOT opt-out — otherwise
+    // any future PiRpcWorker construction site silently inherits the hole.
+    if (selfCheckCfg === undefined) {
+      return this.pauseForClarification(
+        input,
+        [],
+        null,
+        'Pi guard 自检未配置（guardSelfCheck 缺失）：真实 Pi 澄清会话禁止在未验证只读 guard 的情况下启动',
+        [],
+      );
+    }
+    if (selfCheckCfg.enabled === false) {
+      // Explicit opt-out (tests / deliberate choice): skip the probe, proceed.
+    } else {
+      const probeMarkerDir = selfCheckCfg.markerDir
+        ?? resolve(this.config.sessionDirectory, 'guard-selfcheck');
+      const probeResult = await runGuardSelfCheckCached({
+        markerDir: probeMarkerDir,
+        piCommand: this.config.command,
+        piArgs: this.config.args,
+        timeoutMs: selfCheckCfg.timeoutMs ?? 20_000,
+        verifiedPiVersion: selfCheckCfg.verifiedPiVersion ?? '0.82.1',
+        runner: selfCheckCfg.runner,
+        env: this.config.env,
+      });
+      if (selfCheckCfg.onResult) {
+        try { await selfCheckCfg.onResult(probeResult); } catch { /* audit sink failure is not fatal */ }
+      }
+      if (probeResult.versionMismatch) {
+        console.warn(`[Scheduler] Pi CLI 版本漂移：检测到 ${probeResult.piVersion}，已验证版本为 ${probeResult.verifiedPiVersion}。guard 自检必须通过才能继续。`);
+      }
+      if (!probeResult.ok) {
+        return this.pauseForClarification(
+          input,
+          [],
+          null,
+          `Pi guard 自检失败（${probeResult.failureCategory}）：无法证明只读 guard 扩展被加载。可能是 Pi CLI 版本变更；升级后需重新核对 tool_call 语义。`,
+          [],
+        );
+      }
+
+      // ── B (authorized): block-semantics probe — ONE minimal inference. ──
+      // Persistently cached per full Pi CLI version: a version already verified
+      // as pass is reused (no money spent again). Requires explicit
+      // authorization (inferenceProbe.enabled) — absence is NOT opt-in.
+      const inferenceProbe = selfCheckCfg.inferenceProbe;
+      if (inferenceProbe && inferenceProbe.enabled === true) {
+        const probeVersion = detectPiVersionFull(this.config.command);
+        const cached = probeVersion ? (await inferenceProbe.cacheGet?.(probeVersion)) ?? null : null;
+        if (cached && cached.outcome === 'pass') {
+          // Reuse: this Pi version was already verified end-to-end.
+        } else {
+          const gate = inferenceProbe.reserveCost
+            ? await inferenceProbe.reserveCost()
+            : { allowed: false, reason: 'reserve_cost_unavailable' };
+          if (!gate.allowed) {
+            return this.pauseForClarification(
+              input, [], null,
+              `Pi guard 推理探针成本预留失败（${gate.reason}）：无法验证阻断语义，暂停。`,
+              [],
+            );
+          }
+          const blockResult = await runGuardBlockProbe({
+            markerDir: probeMarkerDir,
+            piCommand: this.config.command,
+            piArgs: this.config.args,
+            model: inferenceProbe.model,
+            timeoutMs: inferenceProbe.timeoutMs ?? 60_000,
+            runner: inferenceProbe.runner,
+            env: this.config.env,
+          });
+          // Ledger settlement is EVIDENCE-BASED, not outcome-string based:
+          // real provider usage is a hard veto on `released`; `released` only
+          // when the probe provably never reached the Provider.
+          const settleOutcome = decideProbeSettleOutcome(blockResult);
+          await inferenceProbe.settleCost?.(settleOutcome, `guard_block_probe_${blockResult.outcome}`);
+          if (probeVersion) {
+            await inferenceProbe.cacheSet?.(probeVersion, blockResult.outcome, blockResult.failureCategory);
+          }
+          if (inferenceProbe.onResult) {
+            try { await inferenceProbe.onResult(blockResult); } catch { /* audit sink failure is not fatal */ }
+          }
+          if (!blockResult.ok) {
+            if (blockResult.outcome === 'guard_ineffective') {
+              return this.pauseForClarification(
+                input, [], null,
+                'Pi guard 阻断失效（guard_ineffective）：tool_call 未被第一层拦截，只读边界已破坏，禁止启动澄清会话。',
+                [],
+              );
+            }
+            return this.pauseForClarification(
+              input, [], null,
+              `Pi guard 阻断无法验证（${blockResult.outcome}）：可能是 Provider 不可用、超时或模型未发起工具调用，不是 guard 失效结论；暂停待重试。`,
+              [],
+            );
+          }
+        }
+      }
+    }
+
     const sessionRoot = mkdtempSync(resolve(this.config.sessionDirectory, 'pi-clarify-'));
     const sessionId = randomUUID();
+    const policy = buildPiClarificationToolPolicy(input.worktreePath, input.taskSpec);
+    const guardPath = resolve(sessionRoot, 'bridge-clarification-guard.mjs');
+    const violationMarkerPath = resolve(sessionRoot, 'clarification-policy-violation');
+    writeFileSync(guardPath, buildPiClarificationGuardExtensionSource(policy, violationMarkerPath), { encoding: 'utf8', flag: 'wx' });
     const transcript: ClarificationTranscriptEntry[] = [];
     const usage: PiProviderUsage[] = [];
     let lastPid: number | null = null;
@@ -468,10 +834,15 @@ export class PiRpcWorker {
         const turn = await this.runClarificationTurn(
           input,
           buildPiClarificationPrompt(input.taskSpec, transcript),
-          this.buildSessionArgs(sessionId, sessionRoot, true),
+          this.buildSessionArgs(sessionId, sessionRoot, true, guardPath),
+          policy,
+          violationMarkerPath,
         );
         lastPid = turn.pid;
         if (turn.providerUsage) usage.push(turn.providerUsage);
+        if (turn.policyViolation) {
+          return this.pauseForClarification(input, usage, lastPid, `Pi 澄清工具策略违规：${turn.policyViolation}`, []);
+        }
         if (!turn.clarification) {
           return this.pauseForClarification(
             input,
@@ -540,10 +911,15 @@ export class PiRpcWorker {
       const finalTurn = await this.runClarificationTurn(
         input,
         buildPiClarificationPrompt(input.taskSpec, transcript, true),
-        this.buildSessionArgs(sessionId, sessionRoot, true),
+        this.buildSessionArgs(sessionId, sessionRoot, true, guardPath),
+        policy,
+        violationMarkerPath,
       );
       lastPid = finalTurn.pid;
       if (finalTurn.providerUsage) usage.push(finalTurn.providerUsage);
+      if (finalTurn.policyViolation) {
+        return this.pauseForClarification(input, usage, lastPid, `Pi 澄清工具策略违规：${finalTurn.policyViolation}`, []);
+      }
       if (!finalTurn.clarification || !isReadyToImplement(finalTurn.clarification)) {
         return this.pauseForClarification(
           input,
@@ -587,12 +963,44 @@ export class PiRpcWorker {
     input: PiWorkerTaskInput,
     prompt: string,
     args: string[],
+    policy: PiClarificationToolPolicy,
+    violationMarkerPath: string,
   ): Promise<{
     clarification: ReturnType<typeof parsePiClarification>;
     providerUsage: PiProviderUsage | null;
     pid: number | null;
+    policyViolation: string | null;
   }> {
     let clarification: ReturnType<typeof parsePiClarification> = null;
+    const clarificationLines = new JsonlLineAccumulator();
+    const clarificationText = new MarkedTextAccumulator('BEGIN_CLARIFICATION_JSON', 'END_CLARIFICATION_JSON');
+    const providerUsageAccumulator = new PiProviderUsageAccumulator();
+    let policyViolation: string | null = null;
+    let sawStreamChunk = false;
+    const consumeLine = (line: string): ProcessEarlyCompletion | void => {
+      const event = parseJsonlEvent(line);
+      if (event) providerUsageAccumulator.pushEvent(event);
+      if (event) {
+        const violation = inspectPiClarificationToolRequest(event, policy);
+        if (violation) {
+          policyViolation = violation;
+          return { reason: 'user_abort', terminateProcess: true };
+        }
+      }
+      for (const delta of extractAssistantTextDeltas(event, line)) {
+        const marked = clarificationText.push(delta);
+        if (!marked) continue;
+        const parsed = parsePiClarification(marked, input.taskSpec.taskId);
+        if (!parsed) continue;
+        clarification = parsed;
+        return { reason: 'worker_result_found', terminateProcess: true };
+      }
+      if (!event || (event.type !== 'agent_end' && event.type !== 'message_end')) return;
+      const parsed = this.extractClarificationFromEvent(event, input.taskSpec.taskId);
+      if (!parsed) return;
+      clarification = parsed;
+      return { reason: 'worker_result_found', terminateProcess: true };
+    };
     const rpcPrompt = JSON.stringify({
       id: `clarify-${input.taskSpec.taskId}-${randomUUID()}`,
       type: 'prompt',
@@ -605,26 +1013,39 @@ export class PiRpcWorker {
       cwd: this.config.workingDirectory,
       env: this.config.env,
       timeoutMs: this.config.timeoutMs,
+      maxCapturedStdoutChars: MAX_CAPTURED_STDOUT_CHARS,
+      maxCapturedStderrChars: MAX_CAPTURED_STDERR_CHARS,
       stdin: rpcPrompt,
       signal: this.abortController?.signal,
       onSpawn: this.config.onProcessSpawn,
-      onStdoutChunk: (_chunk, accumulated) => {
-        const parsed = parsePiClarification(accumulated, input.taskSpec.taskId);
-        if (!parsed) return;
-        clarification = parsed;
-        return { reason: 'worker_result_found' as const, terminateProcess: true };
+      onStdoutChunk: (chunk) => {
+        if (!chunk) return;
+        sawStreamChunk = true;
+        for (const line of clarificationLines.push(chunk)) {
+          const signal = consumeLine(line);
+          if (signal) return signal;
+        }
       },
     });
+    if (!sawStreamChunk) {
+      for (const line of clarificationLines.push(result.stdout)) consumeLine(line);
+    }
+    const trailingLine = clarificationLines.finish();
+    if (trailingLine) consumeLine(trailingLine);
     clarification = clarification ?? parsePiClarification(result.stdout, input.taskSpec.taskId);
-    const providerUsage = parsePiProviderUsageFromJsonl(result.stdout);
+    const providerUsage = providerUsageAccumulator.result();
+    if (!policyViolation && existsSync(violationMarkerPath)) {
+      policyViolation = 'pre-execution guard blocked a tool request';
+    }
+    const stdoutLength = result.stdoutLength ?? result.stdout.length;
     this.appendLog([
       'Clarification turn completed',
       `Exit code: ${result.exitCode}`,
       `Timed out: ${result.timedOut}`,
-      `Output length: ${result.stdout.length}`,
+      `Output length: ${stdoutLength}`,
       `Provider usage: ${providerUsage ? JSON.stringify(providerUsage) : 'unavailable'}`,
     ].join('\n'));
-    return { clarification, providerUsage, pid: result.pid };
+    return { clarification: policyViolation ? null : clarification, providerUsage, pid: result.pid, policyViolation };
   }
 
   private pauseForClarification(
@@ -656,13 +1077,25 @@ export class PiRpcWorker {
     };
   }
 
-  private buildSessionArgs(sessionId: string, sessionRoot: string, readOnly: boolean): string[] {
-    const withValue = new Set(['--session', '--session-id', '--session-dir', '--tools', '-t']);
-    const withoutValue = new Set(['--no-session', '--no-tools', '-nt']);
+  private buildSessionArgs(sessionId: string, sessionRoot: string, readOnly: boolean, guardPath?: string): string[] {
+    const sessionWithValue = new Set(['--session', '--session-id', '--session-dir']);
+    const sessionWithoutValue = new Set(['--no-session']);
+    const clarificationWithValue = new Set([
+      '--tools', '-t', '--exclude-tools', '-xt', '--extension', '-e', '--skill',
+      '--prompt-template', '--system-prompt', '--append-system-prompt',
+    ]);
+    const clarificationWithoutValue = new Set([
+      '--no-tools', '-nt', '--no-builtin-tools', '-nbt', '--no-extensions', '-ne',
+      '--no-skills', '-ns', '--no-prompt-templates', '-np', '--no-context-files', '-nc',
+      '--approve', '-a', '--no-approve', '-na',
+    ]);
     const cleaned: string[] = [];
     for (let index = 0; index < this.config.args.length; index += 1) {
       const arg = this.config.args[index];
-      if (withoutValue.has(arg)) continue;
+      if (sessionWithoutValue.has(arg) || (readOnly && clarificationWithoutValue.has(arg))) continue;
+      const withValue = readOnly
+        ? new Set([...sessionWithValue, ...clarificationWithValue])
+        : sessionWithValue;
       if (withValue.has(arg)) {
         index += 1;
         continue;
@@ -671,7 +1104,14 @@ export class PiRpcWorker {
       cleaned.push(arg);
     }
     const sessionArgs = [...cleaned, '--session-id', sessionId, '--session-dir', sessionRoot];
-    return readOnly ? [...sessionArgs, '--tools', 'read,grep,find,ls'] : sessionArgs;
+    if (!readOnly) return sessionArgs;
+    if (!guardPath) throw new Error('clarification guard path is required for read-only Pi execution');
+    return [
+      ...sessionArgs,
+      '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-approve',
+      '--extension', guardPath,
+      '--tools', PI_CLARIFICATION_READ_TOOLS.join(','),
+    ];
   }
 
   /**
@@ -717,7 +1157,28 @@ export class PiRpcWorker {
 
       // Use onStdoutChunk for early WorkerResult detection
       let earlyWorkerResult: WorkerResult | null = null;
+      const implementationLines = new JsonlLineAccumulator();
+      const workerResultText = new MarkedTextAccumulator('BEGIN_WORKER_RESULT_JSON', 'END_WORKER_RESULT_JSON');
+      const providerUsageAccumulator = new PiProviderUsageAccumulator();
+      let sawStreamChunk = false;
       const self = this;
+      const consumeLine = (line: string): ProcessEarlyCompletion | void => {
+        const event = parseJsonlEvent(line);
+        if (event) providerUsageAccumulator.pushEvent(event);
+        for (const delta of extractAssistantTextDeltas(event, line)) {
+          const marked = workerResultText.push(delta);
+          if (!marked) continue;
+          const parseResult = parseWorkerResult(marked);
+          if (!parseResult.success || !parseResult.workerResult) continue;
+          earlyWorkerResult = parseResult.workerResult;
+          return { reason: 'worker_result_found', terminateProcess: true };
+        }
+        if (!event || (event.type !== 'agent_end' && event.type !== 'message_end')) return;
+        const parseResult = self.extractWorkerResultFromEvent(event);
+        if (!parseResult.success || !parseResult.workerResult) return;
+        earlyWorkerResult = parseResult.workerResult;
+        return { reason: 'worker_result_found', terminateProcess: true };
+      };
 
       const abortSignal = this.abortController?.signal;
       const result = await this.processRunner.run({
@@ -726,27 +1187,33 @@ export class PiRpcWorker {
         cwd: this.config.workingDirectory,
         env: this.config.env,
         timeoutMs: this.config.timeoutMs,
+        maxCapturedStdoutChars: MAX_CAPTURED_STDOUT_CHARS,
+        maxCapturedStderrChars: MAX_CAPTURED_STDERR_CHARS,
         stdin: rpcPrompt,
         signal: abortSignal,
         onSpawn: this.config.onProcessSpawn,
-        onStdoutChunk(chunk: string, accStdout: string) {
-          // Skip empty chunks
-          if (!accStdout) return;
-          // Only check agent_end events to reduce overhead
-          if (!accStdout.includes('agent_end')) return;
-          // Try to extract WorkerResult from accumulated JSONL output
-          const parseResult = self.extractWorkerResultFromJsonlEvents(accStdout);
-          if (parseResult.success && parseResult.workerResult) {
-            earlyWorkerResult = parseResult.workerResult;
-            return { reason: 'worker_result_found' as const, terminateProcess: true };
+        onStdoutChunk(chunk: string) {
+          if (!chunk) return;
+          sawStreamChunk = true;
+          for (const line of implementationLines.push(chunk)) {
+            const signal = consumeLine(line);
+            if (signal) return signal;
           }
         },
       });
 
+      if (!sawStreamChunk) {
+        for (const line of implementationLines.push(result.stdout)) consumeLine(line);
+      }
+      const trailingLine = implementationLines.finish();
+      if (trailingLine) consumeLine(trailingLine);
+
       // Combine stdout and stderr for result extraction
       const fullOutput = `${result.stdout}\n${result.stderr}`;
 
-      const providerUsage = parsePiProviderUsageFromJsonl(result.stdout);
+      const providerUsage = providerUsageAccumulator.result();
+      const stdoutLength = result.stdoutLength ?? result.stdout.length;
+      const stderrLength = result.stderrLength ?? result.stderr.length;
 
       // Persist only bounded diagnostics and numeric usage, never raw provider output.
       const logOutput = [
@@ -756,8 +1223,8 @@ export class PiRpcWorker {
         `Aborted: ${result.aborted}`,
         `Duration: ${result.durationMs}ms`,
         `---`,
-        `Stdout length: ${result.stdout.length} chars`,
-        `Stderr length: ${result.stderr.length} chars`,
+        `Stdout length: ${stdoutLength} chars (captured ${result.stdout.length})`,
+        `Stderr length: ${stderrLength} chars (captured ${result.stderr.length})`,
         `Provider usage: ${providerUsage ? JSON.stringify(providerUsage) : 'unavailable'}`,
       ];
       this.appendLog(logOutput.join('\n'));
@@ -788,7 +1255,7 @@ export class PiRpcWorker {
         this.appendLog('WorkerResult status: ' + parseResult.workerResult!.status);
       } else {
         this.appendLog(`WorkerResult parsing failed: ${parseResult.errors.join('; ')}`);
-        this.appendLog(`Stdout length: ${result.stdout.length} chars`);
+        this.appendLog(`Stdout length: ${stdoutLength} chars`);
       }
 
       return {
@@ -817,6 +1284,78 @@ export class PiRpcWorker {
         errorMessage: errMsg,
       };
     }
+  }
+
+  private eventAssistantTextCandidates(event: JsonRecord): string[] {
+    const messages: unknown[] = event.type === 'agent_end' && Array.isArray(event.messages)
+      ? event.messages
+      : event.type === 'message_end' && event.message
+        ? [event.message]
+        : [];
+    const candidates: string[] = [];
+    for (const value of messages) {
+      if (!value || typeof value !== 'object') continue;
+      const message = value as JsonRecord;
+      if (message.role !== 'assistant') continue;
+      const content = message.content;
+      if (typeof content === 'string') {
+        candidates.push(content);
+        continue;
+      }
+      if (!Array.isArray(content)) continue;
+      for (const block of content) {
+        if (typeof block === 'string') {
+          candidates.push(block);
+          continue;
+        }
+        if (!block || typeof block !== 'object') continue;
+        const record = block as JsonRecord;
+        if (record.type === 'text' && typeof record.text === 'string') candidates.push(record.text);
+      }
+    }
+    return candidates;
+  }
+
+  private boundedMarkedCandidate(text: string, begin: string, end: string): string | null {
+    if (text.length <= MAX_STREAMED_RESULT_CHARS) return text;
+    const start = text.lastIndexOf(begin);
+    if (start < 0) return null;
+    const finish = text.indexOf(end, start + begin.length);
+    if (finish < 0) return null;
+    const candidate = text.slice(start, finish + end.length);
+    return candidate.length <= MAX_STREAMED_RESULT_CHARS ? candidate : null;
+  }
+
+  private extractClarificationFromEvent(
+    event: JsonRecord,
+    taskId: string,
+  ): ReturnType<typeof parsePiClarification> {
+    for (const text of this.eventAssistantTextCandidates(event)) {
+      const candidate = this.boundedMarkedCandidate(text, 'BEGIN_CLARIFICATION_JSON', 'END_CLARIFICATION_JSON');
+      if (!candidate) continue;
+      const parsed = parsePiClarification(candidate, taskId);
+      if (parsed) return parsed;
+    }
+    return null;
+  }
+
+  private extractWorkerResultFromEvent(event: JsonRecord): ReturnType<typeof parseWorkerResult> {
+    const errors: string[] = [];
+    for (const text of this.eventAssistantTextCandidates(event)) {
+      const candidate = this.boundedMarkedCandidate(text, 'BEGIN_WORKER_RESULT_JSON', 'END_WORKER_RESULT_JSON');
+      if (!candidate) continue;
+      let parsed = parseWorkerResult(candidate);
+      if (parsed.success) return parsed;
+      errors.push(...parsed.errors);
+      parsed = this.tryParseWithCodeFenceUnwrap(candidate);
+      if (parsed.success) return parsed;
+      errors.push(...parsed.errors);
+    }
+    return {
+      success: false,
+      workerResult: null,
+      errors: errors.length > 0 ? errors : ['No bounded WorkerResult candidate in completed assistant event'],
+    };
   }
 
   /**

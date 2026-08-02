@@ -1124,7 +1124,7 @@ describe('D — Worktree/SQLite Cleanup & State Consistency', () => {
       await teardownRecovery(ctx);
     });
 
-    it('merge_blocked task is terminal → no action required', () => {
+    it('merge_blocked task requires explicit recovery → no automatic crash action', () => {
       const facts: ReconciliationFactSnapshot = {
         run: makeBaseFacts(ctx.runId),
         stages: [{
@@ -1149,7 +1149,8 @@ describe('D — Worktree/SQLite Cleanup & State Consistency', () => {
       };
 
       const findings = classifyFacts(facts, false);
-      // merge_blocked is a terminal task status; no crash recovery needed
+      // merge_blocked is recoverable only by an explicit Task transition; the
+      // crash reconciler must not infer that decision from a missing PID.
       const actionableFindings = findings.filter(f => f.severity !== 'info');
       // Any findings should NOT include pid_missing or similar recovery actions for this task
       expect(actionableFindings.filter(f => f.entityId === attemptId && f.kind === 'pid_missing').length, 'no pid_missing for merge_blocked task').toBe(0);

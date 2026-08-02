@@ -216,8 +216,11 @@ describe('BENCH-CORRECTNESS — Completion Invariants', () => {
       const allAttempts = await ctx.store.listAttemptsByStage(pausedStages[0].id);
       expect(allAttempts, 'pre-spawn conflict must create no attempts').toHaveLength(0);
       expect(ctx.piRunner.calls, 'pre-spawn conflict must call no worker').toBe(0);
+      expect(await ctx.store.getActivePauseForStage(pausedStages[0].id)).toMatchObject({
+        reasonCode: 'declared_write_conflict_missing_dependency',
+      });
       const pausedEvents = await ctx.store.listEvents(ctx.runId, 'stage_paused');
-      expect(pausedEvents.some((event) => event.eventDataJson?.includes('undeclared_same_path_conflict')))
+      expect(pausedEvents.some((event) => event.eventDataJson?.includes('declared_preventable')))
         .toBe(true);
 
       // If run IS completed (shouldn't happen with CONFLICT_DAG), then ALL non-canceled stages must be completed

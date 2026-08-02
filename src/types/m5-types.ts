@@ -47,6 +47,9 @@ export interface AttemptFacts {
   stageId: string;
   pid: number | null;
   pidAlive: 'alive' | 'gone' | 'unknown';
+  dispatchLeaseExpiresAt: string | null;
+  spawnEventObserved: boolean;
+  attemptUpdatedAt: string;
   worktreePath: string | null;   // in-memory only, not persisted
   worktreeExists: boolean;
   worktreeRegistered: boolean;
@@ -128,6 +131,8 @@ export type FindingKind =
   | 'pid_missing'
   | 'pid_alive'
   | 'no_pid_recorded'
+  | 'no_pid_active_window'
+  | 'no_pid_stale'
   | 'worker_result_missing'
   | 'worktree_missing'
   | 'worktree_unregistered'
@@ -213,7 +218,7 @@ export interface SafeAction {
 
 export type ReconciliationPhase = 'dry_run' | 'applied';
 
-export type ReconciliationInitiatedBy = 'user_direct' | 'approve_preflight' | 'resume_preflight';
+export type ReconciliationInitiatedBy = 'user_direct' | 'approve_preflight' | 'resume_preflight' | 'scheduler';
 
 export interface ReconciliationReport {
   reportId: string;

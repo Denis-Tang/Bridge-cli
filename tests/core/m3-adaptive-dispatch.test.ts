@@ -495,7 +495,7 @@ describe('M3 Adaptive Dispatch v2', () => {
     const atts = await store.listAttemptsByStage(runId + '-s1');
     expect(atts).toHaveLength(0);
     const pausedEvents = await store.listEvents(runId, 'stage_paused');
-    expect(pausedEvents.some((event) => event.eventDataJson?.includes('undeclared_same_path_conflict'))).toBe(true);
+    expect(pausedEvents.some((event) => event.eventDataJson?.includes('declared_write_conflict_missing_dependency'))).toBe(true);
   });
 
   it('dispatch_decisions only on state change, resource_samples every cycle', async () => {

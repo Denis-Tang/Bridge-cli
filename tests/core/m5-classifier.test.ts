@@ -43,6 +43,9 @@ function makeAttemptFacts(overrides: Partial<AttemptFacts> = {}): AttemptFacts {
     stageId: 'stage-001',
     pid: 12345,
     pidAlive: 'alive',
+    dispatchLeaseExpiresAt: null,
+    spawnEventObserved: false,
+    attemptUpdatedAt: new Date().toISOString(),
     worktreePath: '/tmp/wt-001',
     worktreeExists: true,
     worktreeRegistered: true,
@@ -205,7 +208,7 @@ describe('M5 Classifier', () => {
       expect(actions).toHaveLength(0);
     });
 
-    it('M5-04: running attempt + no PID recorded → warning', () => {
+    it('M5-04: running attempt + no PID and no stale proof → blocking without mutation', () => {
       const snap = makeSnapshot(
         { runStatus: 'running' },
         [{ tasks: [makeTaskFacts({
@@ -215,10 +218,32 @@ describe('M5 Classifier', () => {
       const findings = classifyFacts(snap, true);
       const noPid = findings.filter((f) => f.kind === 'no_pid_recorded');
       expect(noPid.length).toBeGreaterThanOrEqual(1);
-      expect(noPid[0].severity).toBe('warning');
+      expect(noPid[0].severity).toBe('blocking');
 
       const actions = deriveSafeActions(findings);
-      expect(actions.some((a) => a.actionType === 'mark_attempt_interrupted')).toBe(true);
+      expect(actions.some((a) => a.actionType === 'mark_attempt_interrupted')).toBe(false);
+    });
+
+    it('keeps an active no-PID dispatch lease alive and interrupts only a proven stale lease', () => {
+      const active = makeSnapshot({ runStatus: 'running' }, [{ tasks: [makeTaskFacts({
+        attempts: [makeAttemptFacts({
+          pid: null, pidAlive: 'unknown',
+          dispatchLeaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        })],
+      })] }]);
+      expect(classifyFacts(active, true).some((finding) => finding.kind === 'no_pid_active_window')).toBe(true);
+      expect(deriveSafeActions(classifyFacts(active, true))).toHaveLength(0);
+
+      const stale = makeSnapshot({ runStatus: 'running' }, [{ tasks: [makeTaskFacts({
+        attempts: [makeAttemptFacts({
+          pid: null, pidAlive: 'unknown', spawnEventObserved: false,
+          dispatchLeaseExpiresAt: new Date(Date.now() - 120_000).toISOString(),
+          attemptUpdatedAt: new Date(Date.now() - 120_000).toISOString(),
+        })],
+      })] }]);
+      const staleFindings = classifyFacts(stale, true);
+      expect(staleFindings.some((finding) => finding.kind === 'no_pid_stale')).toBe(true);
+      expect(deriveSafeActions(staleFindings).some((action) => action.actionType === 'mark_attempt_interrupted')).toBe(true);
     });
   });
 

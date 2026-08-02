@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PiRpcWorker, FakeProcessRunner, RealProcessRunner, parsePiProviderUsageFromJsonl } from '../../src/adapters/pi-rpc-worker.js';
-import type { PiWorkerConfig, PiWorkerTaskInput } from '../../src/adapters/pi-worker-types.js';
+import type { PiWorkerConfig, PiWorkerTaskInput, ProcessRunInput, ProcessRunResult, ProcessRunner } from '../../src/adapters/pi-worker-types.js';
 import type { TaskSpec } from '../../src/types/protocol.js';
 
 let tmpDir: string;
@@ -300,6 +300,121 @@ describe('PiRpcWorker', () => {
   });
 
   describe('early-complete and timeout handling', () => {
+    it('processes a multi-megabyte agent_end line once and keeps only bounded stdout', async () => {
+      const highVolumeLogPath = path.join(sessionDir, 'high-volume-stream.log');
+      class HighVolumeJsonlRunner implements ProcessRunner {
+        observedCaptureLimit: number | undefined;
+
+        async run(input: ProcessRunInput): Promise<ProcessRunResult> {
+          this.observedCaptureLimit = input.maxCapturedStdoutChars;
+          const markedResult = 'BEGIN_WORKER_RESULT_JSON\n' + JSON.stringify(validWorkerResultJson) + '\nEND_WORKER_RESULT_JSON';
+          const assistantMessage = {
+            role: 'assistant', id: 'high-volume-provider-message',
+            content: [
+              { type: 'text', text: 'x'.repeat(6 * 1024 * 1024) },
+              { type: 'text', text: markedResult },
+            ],
+            usage: { input: 900, output: 100, cacheRead: 500, cacheWrite: 0, totalTokens: 1000, cost: { total: 0.0025 } },
+          };
+          const jsonl = JSON.stringify({ type: 'agent_end', messages: [assistantMessage] }) + '\n';
+          let terminated = false;
+          for (let offset = 0; offset < jsonl.length; offset += 4096) {
+            const chunk = jsonl.slice(offset, offset + 4096);
+            const signal = input.onStdoutChunk?.(chunk, '');
+            if (signal?.terminateProcess) {
+              terminated = true;
+              break;
+            }
+          }
+          const captureLimit = input.maxCapturedStdoutChars ?? jsonl.length;
+          return {
+            pid: 24680,
+            exitCode: terminated ? null : 0,
+            stdout: jsonl.slice(-captureLimit),
+            stderr: '',
+            stdoutLength: jsonl.length,
+            stderrLength: 0,
+            timedOut: false,
+            aborted: false,
+            terminatedAfterWorkerResult: terminated,
+            durationMs: 25,
+          };
+        }
+      }
+
+      const runner = new HighVolumeJsonlRunner();
+      const worker = new PiRpcWorker(createWorkerConfig({
+        allowRealPiExecution: true,
+        rawLogPath: highVolumeLogPath,
+      }), runner);
+      const result = await worker.executeTask(createTaskInput());
+
+      expect(runner.observedCaptureLimit).toBe(1_048_576);
+      expect(result.workerResult?.status).toBe('completed');
+      expect(result.providerUsage).toEqual({
+        inputTokens: 900, outputTokens: 100, cacheReadTokens: 500,
+        cacheWriteTokens: 0, totalTokens: 1000, costTotal: 0.0025,
+      });
+      const log = readFileSync(highVolumeLogPath, 'utf-8');
+      expect(log).toContain('captured 1048576');
+      expect(log).not.toContain('high-volume-provider-message');
+    }, 15_000);
+
+    it('keeps WorkerResult detection bounded after historical agent_end events', async () => {
+      const boundedLogPath = path.join(sessionDir, 'bounded-stream.log');
+      class ChunkedJsonlRunner implements ProcessRunner {
+        async run(input: ProcessRunInput): Promise<ProcessRunResult> {
+          const historical = JSON.stringify({
+            type: 'agent_end',
+            messages: [{ role: 'assistant', content: [{ type: 'text', text: 'Historical clarification only' }] }],
+          }) + '\n';
+          const noise = Array.from({ length: 200 }, (_, index) => JSON.stringify({
+            type: 'message_update',
+            assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: `noise-${index}` },
+          }) + '\n');
+          const markedResult = 'BEGIN_WORKER_RESULT_JSON\n' + JSON.stringify(validWorkerResultJson) + '\nEND_WORKER_RESULT_JSON';
+          const finalSplit = [markedResult.slice(0, 17), markedResult.slice(17, 71), markedResult.slice(71)]
+            .map((delta) => JSON.stringify({
+              type: 'message_update',
+              assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta },
+            }) + '\n');
+          let stdout = '';
+          let terminated = false;
+          for (const chunk of [historical, ...noise, ...finalSplit]) {
+            stdout += chunk;
+            const signal = input.onStdoutChunk?.(chunk, stdout);
+            if (signal?.terminateProcess) {
+              terminated = true;
+              break;
+            }
+          }
+          return {
+            pid: 12345,
+            exitCode: terminated ? null : 0,
+            stdout,
+            stderr: '',
+            timedOut: false,
+            aborted: false,
+            terminatedAfterWorkerResult: terminated,
+            durationMs: 10,
+          };
+        }
+      }
+
+      const config = createWorkerConfig({
+        allowRealPiExecution: true,
+        rawLogPath: boundedLogPath,
+      });
+      const worker = new PiRpcWorker(config, new ChunkedJsonlRunner());
+      const result = await worker.executeTask(createTaskInput());
+      const debugChecks = (readFileSync(boundedLogPath, 'utf-8').match(/DEBUG parse check:/g) ?? []).length;
+
+      expect(result.workerResult?.status).toBe('completed');
+      expect(result.workerResult?.taskId).toBe('test-task-001');
+      expect(result.errorMessage).toBeUndefined();
+      expect(debugChecks).toBeLessThan(10);
+    });
+
     it('parses WorkerResult from JSONL agent_end event', async () => {
       const fakeRunner = new FakeProcessRunner();
       const agentEndEvent = JSON.stringify({
@@ -390,6 +505,47 @@ describe('PiRpcWorker', () => {
         return false;
       }
     }
+
+    it('delivers each stdout chunk to the observer exactly once', async () => {
+      const runner = new RealProcessRunner();
+      const observedChunks: string[] = [];
+      const script = [
+        'process.stdout.write("one\\n");',
+        'setTimeout(() => { process.stdout.write("two\\n"); }, 40);',
+        'setTimeout(() => process.exit(0), 100);',
+      ].join('');
+
+      const result = await runner.run({
+        command: process.execPath,
+        args: ['-e', script],
+        cwd: tmpDir,
+        timeoutMs: 5000,
+        onStdoutChunk(chunk) {
+          observedChunks.push(chunk);
+        },
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(observedChunks.length).toBeGreaterThan(0);
+      expect(observedChunks.every((chunk) => chunk.length > 0)).toBe(true);
+      expect(observedChunks.join('')).toBe(result.stdout);
+    });
+
+    it('bounds retained stdout while reporting the full observed length', async () => {
+      const runner = new RealProcessRunner();
+      const totalChars = 2 * 1024 * 1024;
+      const result = await runner.run({
+        command: process.execPath,
+        args: ['-e', `process.stdout.write('x'.repeat(${totalChars}))`],
+        cwd: tmpDir,
+        timeoutMs: 5000,
+        maxCapturedStdoutChars: 64 * 1024,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdoutLength).toBe(totalChars);
+      expect(result.stdout.length).toBe(64 * 1024);
+    });
 
     it('CANCEL-02 aborts a controlled process tree and waits for exit', async () => {
       const pidFile = path.join(tmpDir, `child-${Date.now()}.txt`);

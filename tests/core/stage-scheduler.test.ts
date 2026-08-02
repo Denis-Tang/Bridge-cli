@@ -7,6 +7,7 @@ import { SqliteStateStore } from '../../src/state/sqlite-store.js';
 import { SqliteMigrationRunner } from '../../src/state/sqlite-migration-runner.js';
 import { readSqliteConfigFromEnv } from '../../src/state/sqlite-config.js';
 import { StageScheduler } from '../../src/core/stage-scheduler.js';
+import { WorktreeManager } from '../../src/git/worktree-manager.js';
 import type { WorkerResult, ReviewResult } from '../../src/types/protocol.js';
 
 let tmpDir: string;
@@ -96,7 +97,12 @@ describe('StageScheduler Integration', () => {
     expect(stages[0].status).toBe('completed');
     const atts = await store.listAttemptsByStage(stages[0].id);
     expect(atts.length).toBe(2);
-    for (const a of atts) expect(a.status).toBe('approved');
+    for (const a of atts) {
+      expect(a.status).toBe('approved');
+      expect(await store.getAttemptProvenance(a.id)).toMatchObject({
+        attemptId: a.id, runId, stageId: stages[0].id, taskId: a.taskId,
+      });
+    }
     const tasks = await store.listTasks(runId);
     for (const task of tasks) expect(task.status).toBe('merged');
     const worktreeList = execFileSync('git', ['worktree', 'list', '--porcelain'], {
@@ -134,7 +140,7 @@ describe('StageScheduler Integration', () => {
 
     expect((await store.getRun(runId))!.status).not.toBe('completed');
     expect((await store.getStage(stageId))!.status).toBe('paused');
-    expect((await store.getTask(taskId))!.status).toBe('failed');
+    expect((await store.getTask(taskId))!.status).toBe('waiting_decision');
     expect((await store.getLatestAttempt(taskId))!.status).toBe('failed');
     const failures = await store.listEvents(runId, 'attempt_failed');
     expect(failures.some((event) => (event.eventDataJson || '').includes('worker_completed_without_verifiable_diff'))).toBe(true);
@@ -188,6 +194,64 @@ describe('StageScheduler Integration', () => {
     }
   });
 
+  it('defensively blocks different-hunk writes to the same file even when Git could merge them', async () => {
+    const now = new Date().toISOString();
+    const runId = 'e2e-actual-conflict-' + Date.now();
+    const currentBranch = execFileSync('git', ['branch', '--show-current'], { cwd: tmpDir, encoding: 'utf8' }).trim();
+    mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    writeFileSync(path.join(tmpDir, 'src', 'shared.ts'), 'one\ntwo\nthree\nfour\n');
+    execFileSync('git', ['add', 'src/shared.ts'], { cwd: tmpDir });
+    execFileSync('git', ['commit', '-m', 'conflict defense base'], { cwd: tmpDir });
+    const base = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: tmpDir, encoding: 'utf8' }).trim();
+    const firstBranch = `fixture/${runId}/first`;
+    const secondBranch = `fixture/${runId}/second`;
+    execFileSync('git', ['checkout', '-b', firstBranch, base], { cwd: tmpDir });
+    writeFileSync(path.join(tmpDir, 'src', 'shared.ts'), 'ONE\ntwo\nthree\nfour\n');
+    execFileSync('git', ['add', 'src/shared.ts'], { cwd: tmpDir });
+    execFileSync('git', ['commit', '-m', 'first hunk'], { cwd: tmpDir });
+    execFileSync('git', ['checkout', '-b', secondBranch, base], { cwd: tmpDir });
+    writeFileSync(path.join(tmpDir, 'src', 'shared.ts'), 'one\ntwo\nTHREE\nfour\n');
+    execFileSync('git', ['add', 'src/shared.ts'], { cwd: tmpDir });
+    execFileSync('git', ['commit', '-m', 'second hunk'], { cwd: tmpDir });
+    execFileSync('git', ['checkout', currentBranch], { cwd: tmpDir });
+
+    const stageId = `${runId}-s1`;
+    await store.createRun({ id: runId, projectId: 'p1', projectRoot: tmpDir, requestText: 'actual conflict', status: 'running', createdAt: now, updatedAt: now });
+    await store.createStage({ id: stageId, runId, stageNumber: 1, title: 'S1', status: 'running', baseCommit: base });
+    for (const [taskId, branchName, estimatedPath] of [
+      [`${runId}-t1`, firstBranch, 'src/declared-a.ts'],
+      [`${runId}-t2`, secondBranch, 'src/declared-b.ts'],
+    ] as const) {
+      await store.createTask({
+        id: taskId, runId, title: taskId, status: 'approved',
+        specJson: { taskId, stageNumber: 1, dependencies: [], estimatedWritePaths: [estimatedPath], allowedPaths: ['src/'], forbiddenPaths: [] },
+        createdAt: now, updatedAt: now,
+      });
+      const attemptId = `${taskId}-a1`;
+      await store.createAttempt({ id: attemptId, taskId, stageId, attemptNumber: 1, status: 'approved' });
+      await store.updateAttemptResult(attemptId, { branchName, worktreePath: tmpDir });
+      await store.createEvent({ id: `${attemptId}-diff-base`, runId, stageId, taskId, attemptId, eventType: 'task_diff_base_captured', eventData: { diffBaseCommit: base } });
+    }
+
+    const scheduler = new StageScheduler(store, {
+      projectRoot: tmpDir, sessionDir: tmpDir, logDir: tmpDir, worktreeBaseDir: '.brainctl-dev/wt',
+      allowRealWorker: false, allowRealReviewer: false, workerTimeoutMs: 30000, maxParallelTasks: 2,
+      targetBranch: currentBranch, qualityGates: PASS_THROUGH_GATE, fakeWorkerResult: fakeCompleted, fakeReviewResult: fakeApproved,
+    });
+    const stage = (await store.getStage(stageId))!;
+    const integrated = await (scheduler as any).integrate(stage, runId, new WorktreeManager(tmpDir, { worktreeBaseDir: '.brainctl-dev/wt' }), base);
+    expect(integrated).toBe(false);
+    expect(await store.getStage(stageId)).toMatchObject({ status: 'paused' });
+    expect(await store.getActivePauseForStage(stageId)).toMatchObject({ reasonCode: 'runtime_undeclared_actual_path_conflict' });
+    expect(execFileSync('git', ['rev-parse', currentBranch], { cwd: tmpDir, encoding: 'utf8' }).trim()).toBe(base);
+
+    const integrationPath = path.join(tmpDir, '.brainctl-dev', 'wt', runId, 'int', 'stage-1', 'a1');
+    try { execFileSync('git', ['worktree', 'remove', '--force', integrationPath], { cwd: tmpDir }); } catch {}
+    for (const branch of [firstBranch, secondBranch, `brainctl/int/${runId}/stage-1/a1`]) {
+      try { execFileSync('git', ['branch', '-D', branch], { cwd: tmpDir }); } catch {}
+    }
+  });
+
   it('pauses stage when rework limit exceeded', async () => {
     const now = new Date().toISOString();
     const runId = 'e2e-rework-' + Date.now();
@@ -209,7 +273,9 @@ describe('StageScheduler Integration', () => {
       await store.createAttempt({ id: tid + '-a' + i, taskId: tid, stageId: sid, attemptNumber: i, status: 'failed' });
       await store.updateAttemptResult(tid + '-a' + i, { exitReason: 'review: rework ' + i, stoppedAt: now });
     }
-    await store.updateTaskStatus(tid, 'failed' as any, now);
+    await store.updateTaskStatus(tid, 'ready', now);
+    await store.updateTaskStatus(tid, 'running', now);
+    await store.updateTaskStatus(tid, 'rework_required', now);
 
     const scheduler = new StageScheduler(store, {
       projectRoot: tmpDir, sessionDir: tmpDir, logDir: tmpDir,

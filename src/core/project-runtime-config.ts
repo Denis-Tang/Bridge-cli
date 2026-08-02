@@ -44,6 +44,7 @@ export function schedulerConfigFromResolved(resolved: SchedulerResolvedConfig, g
     workerTimeoutMs: resolved.workerTimeoutMs,
     maxParallelTasks: resolved.maxParallelTasks,
     maxReworkCount: 2,
+    executionMode: resolved.executionMode,
     defaultLockedPaths: resolved.sharedLocks,
     targetBranch: resolved.targetBranch,
     qualityGates: stageQualityGates,
@@ -55,5 +56,6 @@ export function schedulerConfigFromResolved(resolved: SchedulerResolvedConfig, g
     resourceSampler: createPlatformSampler(),
     samplingIntervalMs: resolved.resourceSampling.intervalMs,
     governanceEnabled,
+    costBudget: resolved.costBudget,
   };
 }

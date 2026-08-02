@@ -17,6 +17,9 @@ export interface StageReviewRunnerConfig {
   timeoutMs: number;
   command?: string;
   args?: string[];
+  /** Privacy-filtered environment for the real Codex reviewer. */
+  env?: Record<string, string>;
+  signal?: AbortSignal;
   /** Injected Codex process runner (e.g., BenchCodexRunner for tests) */
   codexProcessRunner?: import('../adapters/codex-process-runner.js').CodexProcessRunner;
   /** Ledger sink for recording token usage */
@@ -28,6 +31,52 @@ export interface StageReviewResult {
   passed: boolean;
   reviewResult: ReviewResult;
   cacheHit: boolean;
+}
+
+export interface StageReviewInputLimits {
+  /** UTF-8 bytes are an operational proxy ceiling, not a Provider token count. */
+  maxBytes: number;
+  /** Lines are an operational proxy ceiling, not a Provider token count. */
+  maxLines: number;
+}
+
+export interface StageReviewInputCoverage {
+  complete: boolean;
+  inputBytes: number;
+  inputLines: number;
+  limits: StageReviewInputLimits;
+  reason: string | null;
+  metricKind: 'proxy_not_token';
+}
+
+export const DEFAULT_STAGE_REVIEW_INPUT_LIMITS: StageReviewInputLimits = {
+  maxBytes: 524_288,
+  maxLines: 20_000,
+};
+
+export function assessStageReviewInputCoverage(
+  input: StageReviewInput,
+  overrides: Partial<StageReviewInputLimits> = {},
+): StageReviewInputCoverage {
+  const limits = { ...DEFAULT_STAGE_REVIEW_INPUT_LIMITS, ...overrides };
+  if (!Number.isSafeInteger(limits.maxBytes) || limits.maxBytes <= 0
+    || !Number.isSafeInteger(limits.maxLines) || limits.maxLines <= 0) {
+    throw new Error('stage review input limits must be positive safe integers');
+  }
+  const prompt = buildStageReviewPrompt(input);
+  const inputBytes = Buffer.byteLength(prompt, 'utf8');
+  const inputLines = prompt.split(/\r?\n/).length;
+  const exceeded: string[] = [];
+  if (inputBytes > limits.maxBytes) exceeded.push(`bytes ${inputBytes}>${limits.maxBytes}`);
+  if (inputLines > limits.maxLines) exceeded.push(`lines ${inputLines}>${limits.maxLines}`);
+  return {
+    complete: exceeded.length === 0,
+    inputBytes,
+    inputLines,
+    limits,
+    reason: exceeded.length > 0 ? `review_input_limit_exceeded: ${exceeded.join(', ')}` : null,
+    metricKind: 'proxy_not_token',
+  };
 }
 
 /**
@@ -48,11 +97,10 @@ export function prepareStageReviewInput(
 }
 
 /**
- * Format a Codex review prompt for stage-level aggregated review.
- * Uses three-tier structure:
- *   1. diffstat + file list + quality gate summary
- *   2. API/config/security file full diff
- *   3. Normal files only on anomaly or Codex request
+ * Format the complete final integration diff for mandatory review. This
+ * function never truncates. Callers must pause with partial coverage when
+ * assessStageReviewInputCoverage() reports that the operational input ceiling
+ * was exceeded.
  */
 export function buildStageReviewPrompt(input: StageReviewInput): string {
   const gateSummary = input.qualityGateResults
@@ -147,6 +195,8 @@ export async function runStageReview(
         timeoutMs: config.timeoutMs,
         command: config.command,
         args: config.args,
+        env: config.env,
+        signal: config.signal,
       },
       {
         processRunner: config.codexProcessRunner,

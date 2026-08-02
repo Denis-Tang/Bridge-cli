@@ -141,6 +141,8 @@ export interface RunSnapshot {
   finishedAt: string | null;
   stages: StageSnapshot[];
   pausedReason: string | null;
+  nextAction: string | null;
+  cost: { currency: 'CNY' | 'USD'; limit: number; committed: number; remaining: number; unavailableCalls: number } | null;
   events: EventSnapshot[];
 }
 
@@ -182,6 +184,8 @@ export interface AttemptSnapshot {
   durationMs: number | null;
   reviewStatus: string | null;
   qualityGatePassed: boolean | null;
+  resultSource: string;
+  adoptedCommit: string | null;
 }
 
 export interface IntegrationSnapshot {
@@ -192,6 +196,10 @@ export interface IntegrationSnapshot {
   targetBranch: string | null;
   conflictSummary: string | null;
   qualityGatePassed: boolean | null;
+  reviewedThroughCommit: string | null;
+  finalCommit: string | null;
+  reviewCoverageStatus: 'partial' | 'complete';
+  reviewerUnavailable: boolean;
 }
 
 export interface LockSnapshot {
@@ -213,6 +221,10 @@ export interface ReviewSnapshot {
   mergeAllowed: boolean;
   summary: string;
   finishedAt: string | null;
+  reviewedThroughCommit: string | null;
+  finalCommit: string | null;
+  coverageStatus: 'partial' | 'complete';
+  reviewerUnavailable: boolean;
 }
 
 // ══════════════════════════════════════════════════════════════

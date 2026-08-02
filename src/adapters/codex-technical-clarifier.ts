@@ -13,6 +13,7 @@ export interface CodexTechnicalClarifierConfig {
   args: string[];
   timeoutMs: number;
   env?: Record<string, string>;
+  signal?: AbortSignal;
 }
 
 export class CodexTechnicalClarifier implements TechnicalClarificationResponder {
@@ -37,6 +38,7 @@ export class CodexTechnicalClarifier implements TechnicalClarificationResponder 
       input: prompt,
       maxBuffer: 2 * 1024 * 1024,
       env: this.config.env,
+      signal: this.config.signal,
     });
     if (result.exitCode !== 0 || result.timedOut) {
       return {

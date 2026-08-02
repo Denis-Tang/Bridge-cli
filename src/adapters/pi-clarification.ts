@@ -102,17 +102,18 @@ export function isReadyToImplement(result: PiClarificationResult): boolean {
 }
 
 export function clarificationPauseResult(taskId: string, questions: string[], reason: string): WorkerResult {
+  const productDecisionRequired = questions.length > 0;
   return {
     taskId,
-    status: 'needs_decision',
+    status: productDecisionRequired ? 'needs_decision' : 'failed',
     summary: `理解阶段暂停：${reason}`,
     filesChanged: [],
     commitHash: '',
     checks: [{ name: '95% clarification gate', status: 'failed', summary: reason }],
     scopeViolations: [],
     risks: [reason],
-    unresolvedQuestions: questions.length > 0 ? questions : [reason],
-    productDecisionRequired: true,
+    unresolvedQuestions: questions,
+    productDecisionRequired,
     tokenUsage: { inputTokens: 0, outputTokens: 0, cacheHitTokens: 0 },
   };
 }

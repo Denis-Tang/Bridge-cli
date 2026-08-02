@@ -1,4 +1,9 @@
-import type { RunStatus, TaskStatus } from '../core/state-machine.js';
+import type {
+  RunStatus,
+  StageStatus,
+  TaskStatus,
+  AttemptStatus,
+} from '../core/state-machine.js';
 import type {
   StageRecord, CreateStageInput,
   AttemptRecord, CreateAttemptInput,
@@ -6,6 +11,7 @@ import type {
   ReviewRecord, CreateReviewInput,
   IntegrationBatchRecord, CreateIntegrationBatchInput,
   EventRecord, CreateEventInput,
+  ActualPathClaimRecord, AttemptProvenanceRecord,
 } from '../types/m2-types.js';
 import type {
   ResourceSampleRecord,
@@ -16,6 +22,7 @@ import type {
   TokenLedgerEntry,
   BudgetPolicy,
   RiskAssessment,
+  CostReservation,
 } from '../types/m4-types.js';
 import type {
   ReconciliationReportRecord,
@@ -23,6 +30,11 @@ import type {
   CreateReconciliationReportInput,
   CreateReconciliationFindingInput,
 } from '../types/m5-types.js';
+import type {
+  PauseRecord,
+  CreateStagePauseInput,
+  ResolveStagePauseInput,
+} from '../types/pause-types.js';
 
 export interface CreateRunInput {
   id: string;
@@ -61,6 +73,21 @@ export interface TaskRecord extends CreateTaskInput {
   finishedAt?: string | null;
 }
 
+export interface ReviewRetryInput {
+  runId: string;
+  stageId: string;
+  taskId: string;
+  attemptId: string;
+  reason: string;
+  updatedAt: string;
+}
+
+export interface RunConvergenceFailureInput {
+  runId: string;
+  reason: string;
+  failedAt: string;
+}
+
 export interface StateStore {
   close(): Promise<void>;
 
@@ -69,6 +96,7 @@ export interface StateStore {
   getRun(runId: string): Promise<RunRecord | null>;
   getActiveRunByProject(projectRoot: string): Promise<RunRecord | null>;
   updateRunStatus(runId: string, status: RunStatus, updatedAt: string): Promise<boolean>;
+  failRunForConvergenceAtomically(input: RunConvergenceFailureInput): Promise<boolean>;
   updateRunFinishedAt(runId: string, finishedAt: string): Promise<boolean>;
 
   // Task operations
@@ -82,16 +110,21 @@ export interface StateStore {
   // Stage operations
   createStage(input: CreateStageInput): Promise<StageRecord>;
   getStage(stageId: string): Promise<StageRecord | null>;
-  updateStageStatus(stageId: string, status: string, updatedAt: string): Promise<boolean>;
+  updateStageStatus(stageId: string, status: StageStatus, updatedAt: string): Promise<boolean>;
   updateStageBaseCommit(stageId: string, commit: string): Promise<boolean>;
   updateStageIntegrationBranch(stageId: string, branch: string): Promise<boolean>;
   listStages(runId: string): Promise<StageRecord[]>;
+  createStagePause(input: CreateStagePauseInput): Promise<PauseRecord>;
+  getPauseRecord(pauseId: string): Promise<PauseRecord | null>;
+  getActivePauseForStage(stageId: string): Promise<PauseRecord | null>;
+  resolveStagePause(input: ResolveStagePauseInput): Promise<boolean>;
 
   // Attempt operations
   createAttempt(input: CreateAttemptInput): Promise<AttemptRecord>;
   getAttempt(attemptId: string): Promise<AttemptRecord | null>;
-  updateAttemptStatus(attemptId: string, status: string, updatedAt: string): Promise<boolean>;
-  updateAttemptResult(attemptId: string, updates: Partial<Pick<AttemptRecord, 'piPid' | 'startedAt' | 'stoppedAt' | 'worktreePath' | 'branchName' | 'promptHash' | 'workerResultJson' | 'exitReason' | 'logPath' | 'rawLogPath'>>): Promise<boolean>;
+  updateAttemptStatus(attemptId: string, status: AttemptStatus, updatedAt: string): Promise<boolean>;
+  retryReviewAtomically(input: ReviewRetryInput): Promise<boolean>;
+  updateAttemptResult(attemptId: string, updates: Partial<Pick<AttemptRecord, 'piPid' | 'startedAt' | 'stoppedAt' | 'worktreePath' | 'branchName' | 'promptHash' | 'workerResultJson' | 'exitReason' | 'logPath' | 'rawLogPath' | 'resultSource' | 'adoptedCommit' | 'adoptionMetadataJson'>>): Promise<boolean>;
   listAttempts(taskId: string): Promise<AttemptRecord[]>;
   listAttemptsByStage(stageId: string): Promise<AttemptRecord[]>;
   getLatestAttempt(taskId: string): Promise<AttemptRecord | null>;
@@ -103,18 +136,25 @@ export interface StateStore {
   releasePathLock(lockId: string, releasedAt: string): Promise<boolean>;
   getActiveLocksForRun(runId: string): Promise<PathLockRecord[]>;
   getConflictingLocks(taskId: string, filePaths: string[], runId: string): Promise<PathLockRecord[]>;
+  claimActualPathsAtomic(input: ClaimActualPathsInput): Promise<ClaimActualPathsResult>;
+  listActualPathClaims(stageId: string): Promise<ActualPathClaimRecord[]>;
+  releaseActualPathClaimsForStage(stageId: string, releasedAt: string): Promise<number>;
+
+  // Immutable attempt identity, persisted before any worker process spawn.
+  recordAttemptProvenance(input: CreateAttemptProvenanceInput): Promise<AttemptProvenanceRecord>;
+  getAttemptProvenance(attemptId: string): Promise<AttemptProvenanceRecord | null>;
 
   // Review operations
   createReview(input: CreateReviewInput): Promise<ReviewRecord>;
   getReview(reviewId: string): Promise<ReviewRecord | null>;
-  updateReviewResult(reviewId: string, updates: Partial<Pick<ReviewRecord, 'status' | 'reviewJson' | 'findingsJson' | 'requiredReworkJson' | 'reworkCount' | 'mergeAllowed' | 'startedAt' | 'finishedAt'>>): Promise<boolean>;
+  updateReviewResult(reviewId: string, updates: Partial<Pick<ReviewRecord, 'status' | 'reviewJson' | 'findingsJson' | 'requiredReworkJson' | 'reworkCount' | 'mergeAllowed' | 'startedAt' | 'finishedAt' | 'reviewedThroughCommit' | 'finalCommit' | 'coverageStatus' | 'reviewerUnavailable' | 'errorCategory' | 'exitCode' | 'durationMs' | 'stderrHash'>>): Promise<boolean>;
   listReviewsByAttempt(attemptId: string): Promise<ReviewRecord[]>;
   listReviewsByTask(taskId: string): Promise<ReviewRecord[]>;
 
   // Integration batch operations
   createIntegrationBatch(input: CreateIntegrationBatchInput): Promise<IntegrationBatchRecord>;
   getIntegrationBatch(batchId: string): Promise<IntegrationBatchRecord | null>;
-  updateIntegrationBatch(batchId: string, updates: Partial<Pick<IntegrationBatchRecord, 'status' | 'baseCommit' | 'mergeCommitHash' | 'targetMergeCommit' | 'conflictsJson' | 'finishedAt'>>): Promise<boolean>;
+  updateIntegrationBatch(batchId: string, updates: Partial<Pick<IntegrationBatchRecord, 'status' | 'baseCommit' | 'mergeCommitHash' | 'targetMergeCommit' | 'conflictsJson' | 'finishedAt' | 'reviewedThroughCommit' | 'finalCommit' | 'reviewCoverageStatus' | 'reviewerUnavailable' | 'reviewMetadataJson'>>): Promise<boolean>;
   listIntegrationBatches(stageId: string): Promise<IntegrationBatchRecord[]>;
 
   // Event operations
@@ -151,6 +191,19 @@ export interface StateStore {
   getTokenLedgerEntry(id: string): Promise<TokenLedgerEntry | null>;
   listTokenLedgerEntries(runId: string, callType?: string): Promise<TokenLedgerEntry[]>;
   getTokenUsageSummary(runId: string): Promise<TokenUsageSummary>;
+  reserveCost?(input: CreateCostReservationInput): Promise<CostReservationResult>;
+  settleCostReservation?(id: string, actualCost: number | null): Promise<boolean>;
+  markCostReservationSpawned?(id: string, ownerId: string, spawnedAt: string): Promise<boolean>;
+  heartbeatCostReservation?(id: string, ownerId: string, heartbeatAt: string, leaseExpiresAt: string): Promise<boolean>;
+  finalizeCostReservation?(input: FinalizeCostReservationInput): Promise<boolean>;
+  /** Manual, explicit, auditable write-off of an `unavailable` reservation. */
+  writeOffCostReservation?(input: WriteOffCostReservationInput): Promise<boolean>;
+  reconcileStaleCostReservations?(runId: string, now: string): Promise<number>;
+  listCostReservations?(runId: string): Promise<CostReservation[]>;
+
+  // B (authorized): persistent guard block-probe cache (keyed by full Pi CLI version)
+  getGuardProbeCache?(piVersion: string): Promise<{ outcome: string; failureCategory: string | null; checkedAt: string } | null>;
+  setGuardProbeCache?(piVersion: string, outcome: string, failureCategory: string | null, checkedAt: string): Promise<void>;
 
   // Budget policies
   createBudgetPolicy(input: CreateBudgetPolicyInput): Promise<BudgetPolicy>;
@@ -189,6 +242,29 @@ export interface StateStore {
    */
   applyReconciliationAtomically(input: AtomicApplyInput): Promise<AtomicApplyResult>;
 }
+
+export type StateQueryStore = Pick<StateStore,
+  | 'close'
+  | 'getRun'
+  | 'getTask'
+  | 'listTasks'
+  | 'listTasksByStage'
+  | 'getStage'
+  | 'listStages'
+  | 'getAttempt'
+  | 'listAttempts'
+  | 'listAttemptsByStage'
+  | 'getLatestAttempt'
+  | 'getPathLock'
+  | 'getActiveLocksForRun'
+  | 'listReviewsByAttempt'
+  | 'listReviewsByTask'
+  | 'getIntegrationBatch'
+  | 'listIntegrationBatches'
+  | 'listEvents'
+  | 'getPendingApprovals'
+  | 'listCostReservations'
+>;
 
 // ══════════════════════════════════════════════════════════════
 // M3 Input Types
@@ -260,6 +336,48 @@ export interface CreateTokenLedgerEntryInput {
   status?: string;
 }
 
+export interface CreateCostReservationInput {
+  id: string;
+  runId: string;
+  stageId?: string | null;
+  taskId?: string | null;
+  attemptId?: string | null;
+  callType: string;
+  callId: string;
+  currency: 'CNY' | 'USD';
+  budgetLimit: number;
+  reservedCost: number;
+  pricingVersion: string;
+  ownerId?: string | null;
+  leaseExpiresAt?: string | null;
+  heartbeatAt?: string | null;
+}
+
+export interface FinalizeCostReservationInput {
+  id: string;
+  outcome: 'released' | 'confirmed' | 'unavailable';
+  actualCost?: number | null;
+  ownerId?: string | null;
+  terminationEvidence: string;
+  settledAt?: string;
+}
+
+export interface WriteOffCostReservationInput {
+  id: string;
+  /** Mandatory auditable reason. Missing/blank → fail closed. */
+  decisionNote: string;
+  ownerId?: string | null;
+  writtenOffAt?: string;
+}
+
+export interface CostReservationResult {
+  allowed: boolean;
+  reservation: CostReservation | null;
+  committedCost: number;
+  remaining: number;
+  reason?: string;
+}
+
 export interface CreateBudgetPolicyInput {
   id: string;
   runId?: string | null;
@@ -328,4 +446,41 @@ export interface AcquirePathLocksResult {
   locks: PathLockRecord[];
   conflicts: PathLockRecord[];
   violations: string[];
+}
+
+export interface ClaimActualPathsInput {
+  runId: string;
+  stageId: string;
+  taskId: string;
+  attemptId: string;
+  filePaths: string[];
+}
+
+export interface ActualPathConflict {
+  conflictingTaskId: string;
+  conflictingAttemptId: string | null;
+  candidatePath: string;
+  conflictingPath: string;
+  conflictLayer: 'estimated' | 'actual';
+}
+
+export interface ClaimActualPathsResult {
+  claimed: boolean;
+  claims: ActualPathClaimRecord[];
+  conflicts: ActualPathConflict[];
+  violations: string[];
+}
+
+export interface CreateAttemptProvenanceInput {
+  attemptId: string;
+  runId: string;
+  stageId: string;
+  taskId: string;
+  baseCommit: string;
+  expectedBranch: string;
+  expectedWorktree: string;
+  taskPacketHash: string;
+  implementationPromptHash: string;
+  workerId: string;
+  sessionId: string;
 }

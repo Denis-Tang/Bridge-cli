@@ -60,6 +60,9 @@ describe('CodexCliReviewer', () => {
       const log = readFileSync(join(sessionDir, 'privacy-test_codex-review.log'), 'utf8');
 
       expect(result.reviewSummary).toContain('timed out after 1234ms');
+      expect(result.reviewerUnavailable).toBe(true);
+      expect(result.executionMetadata).toMatchObject({ errorCategory: 'timeout', exitCode: 1, durationMs: 55 });
+      expect(result.executionMetadata?.stderrHash).toMatch(/^[a-f0-9]{64}$/);
       expect(JSON.stringify(result)).not.toContain('PRIVATE_SOURCE');
       expect(log).not.toContain('PRIVATE_SOURCE');
       expect(log).not.toContain('PRIVATE_DIFF_CONTENT');

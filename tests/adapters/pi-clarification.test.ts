@@ -1,11 +1,18 @@
 import { describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { PiRpcWorker, cleanupTemporaryPiSession } from '../../src/adapters/pi-rpc-worker.js';
+import { pathToFileURL } from 'node:url';
+import {
+  PiRpcWorker,
+  buildPiClarificationGuardExtensionSource,
+  buildPiClarificationToolPolicy,
+  cleanupTemporaryPiSession,
+} from '../../src/adapters/pi-rpc-worker.js';
 import { CodexTechnicalClarifier } from '../../src/adapters/codex-technical-clarifier.js';
 import { FakeCodexProcessRunner } from '../../src/adapters/codex-process-runner.js';
 import {
+  clarificationPauseResult,
   isReadyToImplement,
   parseCodexClarificationAnswer,
   parsePiClarification,
@@ -85,6 +92,37 @@ class QueuePiRunner implements ProcessRunner {
   }
 }
 
+class StreamingQueuePiRunner implements ProcessRunner {
+  readonly calls: ProcessRunInput[] = [];
+  constructor(private readonly outputs: string[]) {}
+
+  async run(input: ProcessRunInput): Promise<ProcessRunResult> {
+    this.calls.push(input);
+    const output = this.outputs.shift() ?? '';
+    const chunks = output.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+    let stdout = '';
+    let terminated = false;
+    for (const chunk of chunks) {
+      stdout += chunk;
+      const signal = input.onStdoutChunk?.(chunk, stdout);
+      if (signal?.terminateProcess) {
+        terminated = true;
+        break;
+      }
+    }
+    return {
+      pid: 2000 + this.calls.length,
+      exitCode: terminated ? null : 0,
+      stdout,
+      stderr: '',
+      timedOut: false,
+      aborted: false,
+      terminatedAfterWorkerResult: terminated,
+      durationMs: 1,
+    };
+  }
+}
+
 class FixedResponder implements TechnicalClarificationResponder {
   calls = 0;
   constructor(private readonly answers: CodexClarificationAnswer[]) {}
@@ -108,10 +146,26 @@ function config(root: string, responder: TechnicalClarificationResponder): PiWor
     allowRealPiExecution: true,
     requireClarification: true,
     clarificationResponder: responder,
+    // R3: these tests exercise the clarification protocol itself, not the
+    // guard self-check — explicitly opt out (fail-closed default otherwise
+    // refuses to start a real clarification session without guardSelfCheck).
+    guardSelfCheck: { enabled: false },
   };
 }
 
 describe('Pi 95% clarification protocol', () => {
+  it('retries no-question uncertainty but keeps real questions behind a user decision', () => {
+    const uncertain = clarificationPauseResult(task.taskId, [], 'Pi 理解度为 93%，但没有提出可回答的问题');
+    expect(uncertain.status).toBe('failed');
+    expect(uncertain.productDecisionRequired).toBe(false);
+    expect(uncertain.unresolvedQuestions).toEqual([]);
+
+    const protectedQuestion = clarificationPauseResult(task.taskId, ['是否扩大修改范围？'], '需要用户决定');
+    expect(protectedQuestion.status).toBe('needs_decision');
+    expect(protectedQuestion.productDecisionRequired).toBe(true);
+    expect(protectedQuestion.unresolvedQuestions).toEqual(['是否扩大修改范围？']);
+  });
+
   it('parses only the assistant clarification and enforces protected categories', () => {
     const parsed = parsePiClarification(clarification(96, []), task.taskId);
     expect(parsed?.confidencePercent).toBe(96);
@@ -147,6 +201,13 @@ describe('Pi 95% clarification protocol', () => {
       expect(pi.calls[0].args).toContain('read,grep,find,ls');
       expect(pi.calls[1].args).toContain('read,grep,find,ls');
       expect(pi.calls[2].args).not.toContain('read,grep,find,ls');
+      for (const call of pi.calls.slice(0, 2)) {
+        expect(call.args).toEqual(expect.arrayContaining([
+          '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-approve',
+        ]));
+        const extensionPath = call.args[call.args.indexOf('--extension') + 1];
+        expect(extensionPath).toMatch(/bridge-clarification-guard\.mjs$/);
+      }
       const sessionIds = pi.calls.map((call) => call.args[call.args.indexOf('--session-id') + 1]);
       expect(new Set(sessionIds).size).toBe(1);
       expect(pi.calls.every((call) => !call.args.includes('--no-session'))).toBe(true);
@@ -156,7 +217,91 @@ describe('Pi 95% clarification protocol', () => {
     }
   });
 
-  it('pauses before implementation after two unanswered rounds and final confirmation below 95%', async () => {
+  it('native allowlist plus pre-execution guard fails closed on a forbidden tool request', async () => {
+    const root = path.join(tmpdir(), `bridge-clarify-${Date.now()}-tool-block`);
+    mkdirSync(root, { recursive: true });
+    try {
+      const rogueToolEvent = JSON.stringify({
+        type: 'tool_execution_start', toolCallId: 'call-write', toolName: 'write',
+        args: { path: 'docs/guide.md', content: 'must never execute' },
+      }) + '\n' + clarification(99, []) + '\n';
+      const pi = new StreamingQueuePiRunner([rogueToolEvent]);
+      const worker = new PiRpcWorker(config(root, new FixedResponder([])), pi);
+      const result = await worker.executeTask({ taskSpec: task, worktreePath: root, runId: 'run-tool-block' });
+
+      expect(result.workerResult?.status).toBe('failed');
+      expect(result.errorMessage).toContain('澄清工具策略违规');
+      expect(pi.calls).toHaveLength(1);
+      expect(existsSync(path.join(root, 'docs', 'guide.md'))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('generated guard blocks forbidden, external, and write paths before tool execution', async () => {
+    const root = path.join(tmpdir(), `bridge-clarify-${Date.now()}-guard`);
+    mkdirSync(path.join(root, 'docs'), { recursive: true });
+    const marker = path.join(root, 'guard-blocked');
+    const extensionPath = path.join(root, 'guard.mjs');
+    writeFileSync(
+      extensionPath,
+      buildPiClarificationGuardExtensionSource(buildPiClarificationToolPolicy(root, task), marker),
+      'utf8',
+    );
+    try {
+      type GuardHandler = (
+        event: { toolName: string; input: Record<string, unknown> },
+        context: { cwd: string },
+      ) => { block?: boolean; reason?: string } | undefined;
+      let handler: GuardHandler | null = null;
+      const module = await import(`${pathToFileURL(extensionPath).href}?${Date.now()}`) as {
+        default: (pi: { on: (event: string, callback: GuardHandler) => void }) => void;
+      };
+      module.default({ on: (_event, callback) => { handler = callback; } });
+      expect(handler).not.toBeNull();
+      const invoke = (toolName: string, input: Record<string, unknown>) => handler!({ toolName, input }, { cwd: root });
+
+      expect(invoke('read', { path: 'docs/guide.md' })).toBeUndefined();
+      expect(invoke('read', { path: '.env' })?.block).toBe(true);
+      expect(invoke('read', { path: '..' })?.block).toBe(true);
+      expect(invoke('write', { path: 'docs/guide.md' })?.block).toBe(true);
+      expect(existsSync(marker)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts a complete clarification streamed only through text_delta events', async () => {
+    const root = path.join(tmpdir(), `bridge-clarify-${Date.now()}-delta`);
+    mkdirSync(root, { recursive: true });
+    try {
+      const body: PiClarificationResult = {
+        taskId: task.taskId,
+        understandingSummary: '只修改授权文档并运行精确测试',
+        confidencePercent: 97,
+        questions: [],
+        categories: ['technical'],
+      };
+      const marked = `BEGIN_CLARIFICATION_JSON\n${JSON.stringify(body)}\nEND_CLARIFICATION_JSON`;
+      const split = [marked.slice(0, 11), marked.slice(11, 67), marked.slice(67)];
+      const deltaOutput = split.map((delta) => JSON.stringify({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta },
+      })).join('\n') + '\n';
+      const pi = new StreamingQueuePiRunner([deltaOutput, completedWorkerOutput() + '\n']);
+      const responder = new FixedResponder([]);
+      const worker = new PiRpcWorker(config(root, responder), pi);
+      const result = await worker.executeTask({ taskSpec: task, worktreePath: root, runId: 'run-delta' });
+
+      expect(result.workerResult?.status).toBe('completed');
+      expect(responder.calls).toBe(0);
+      expect(pi.calls).toHaveLength(2);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed before implementation and permits a fresh bounded retry when final confidence stays below 95% without questions', async () => {
     const root = path.join(tmpdir(), `bridge-clarify-${Date.now()}-pause`);
     mkdirSync(root, { recursive: true });
     try {
@@ -172,8 +317,9 @@ describe('Pi 95% clarification protocol', () => {
       const worker = new PiRpcWorker(config(root, responder), pi);
       const result = await worker.executeTask({ taskSpec: task, worktreePath: root, runId: 'run-pause' });
 
-      expect(result.workerResult?.status).toBe('needs_decision');
-      expect(result.workerResult?.productDecisionRequired).toBe(true);
+      expect(result.workerResult?.status).toBe('failed');
+      expect(result.workerResult?.productDecisionRequired).toBe(false);
+      expect(result.workerResult?.unresolvedQuestions).toEqual([]);
       expect(responder.calls).toBe(2);
       expect(pi.calls).toHaveLength(3);
       expect(pi.calls.every((call) => call.args.includes('read,grep,find,ls'))).toBe(true);

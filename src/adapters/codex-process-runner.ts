@@ -2,7 +2,7 @@
 // Allows fake injection for testing without real CLI.
 // Supports optional tokenUsage metadata extraction for ledger integration.
 
-import { execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { buildMinimalSubprocessEnv } from '../privacy/env-allowlist.js';
 import { resolveWindowsCliCommand } from './windows-cli-resolver.js';
 
@@ -12,6 +12,8 @@ export interface CodexProcessRunResult {
   exitCode: number;
   durationMs: number;
   timedOut?: boolean;
+  aborted?: boolean;
+  errorCategory?: 'timeout' | 'aborted' | 'max_buffer' | 'spawn_error' | 'nonzero_exit';
   /** Optional structured token usage metadata from the provider (if available) */
   tokenUsage?: {
     inputTokens: number;
@@ -30,51 +32,123 @@ export interface CodexProcessRunner {
       input?: string;
       maxBuffer?: number;
       env?: Record<string, string>;
+      signal?: AbortSignal;
     },
   ): Promise<CodexProcessRunResult>;
 }
 
 /**
- * RealCodexProcessRunner — wraps Node's execSync for production use.
+ * RealCodexProcessRunner — asynchronous, shell-free Codex process execution.
  * Does NOT attempt to parse token usage from Codex CLI output (no structured metadata available).
  */
 export class RealCodexProcessRunner implements CodexProcessRunner {
   async run(
     command: string,
     args: string[],
-    opts: { cwd: string; timeoutMs: number; input?: string; maxBuffer?: number; env?: Record<string, string> },
+    opts: { cwd: string; timeoutMs: number; input?: string; maxBuffer?: number; env?: Record<string, string>; signal?: AbortSignal },
   ): Promise<CodexProcessRunResult> {
     const start = Date.now();
-    try {
-      const subprocessEnv = opts.env ?? buildMinimalSubprocessEnv();
-      const resolvedCommand = resolveWindowsCliCommand(command, args, subprocessEnv);
-      const stdout = execFileSync(resolvedCommand.command, resolvedCommand.args, {
+    const subprocessEnv = opts.env ?? buildMinimalSubprocessEnv();
+    const resolvedCommand = resolveWindowsCliCommand(command, args, subprocessEnv);
+    const maxBuffer = opts.maxBuffer ?? 10 * 1024 * 1024;
+    if (opts.signal?.aborted) {
+      return { stdout: '', stderr: 'Codex process aborted before spawn', exitCode: 1, durationMs: 0, aborted: true, errorCategory: 'aborted' };
+    }
+
+    return new Promise<CodexProcessRunResult>((resolve) => {
+      const stdoutChunks: Buffer[] = [];
+      const stderrChunks: Buffer[] = [];
+      let bufferedBytes = 0;
+      let terminalReason: 'timeout' | 'aborted' | 'max_buffer' | null = null;
+      let settled = false;
+      let timer: NodeJS.Timeout | null = null;
+
+      const child = spawn(resolvedCommand.command, resolvedCommand.args, {
         cwd: opts.cwd,
-        timeout: opts.timeoutMs,
-        input: opts.input,
-        maxBuffer: opts.maxBuffer || 10 * 1024 * 1024,
-        encoding: 'utf-8',
-        stdio: 'pipe',
+        stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
         env: subprocessEnv,
+        shell: false,
       });
-      return {
-        stdout: String(stdout),
-        stderr: '',
-        exitCode: 0,
-        durationMs: Date.now() - start,
-        timedOut: false,
+
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        opts.signal?.removeEventListener('abort', onAbort);
+        process.removeListener('exit', onParentExit);
       };
-    } catch (err: any) {
-      return {
-        stdout: err.stdout ? String(err.stdout) : '',
-        stderr: err.stderr ? String(err.stderr) : err.message || String(err),
-        exitCode: err.status || 1,
-        durationMs: Date.now() - start,
-        timedOut: err.code === 'ETIMEDOUT' || (err.status == null && err.signal === 'SIGTERM'),
+      const finish = (exitCode: number, fallbackError = '') => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        const stdout = Buffer.concat(stdoutChunks).toString('utf8');
+        let stderr = Buffer.concat(stderrChunks).toString('utf8');
+        if (!stderr && fallbackError) stderr = fallbackError;
+        const errorCategory = terminalReason ?? (exitCode === 0 ? undefined : 'nonzero_exit');
+        resolve({
+          stdout,
+          stderr,
+          exitCode,
+          durationMs: Date.now() - start,
+          timedOut: terminalReason === 'timeout',
+          aborted: terminalReason === 'aborted',
+          errorCategory,
+        });
       };
-    }
+      const terminate = (reason: 'timeout' | 'aborted' | 'max_buffer') => {
+        if (terminalReason || settled) return;
+        terminalReason = reason;
+        if (child.pid) {
+          void terminateProcessTree(child.pid).finally(() => {
+            if (!child.killed) child.kill('SIGKILL');
+          });
+        } else {
+          finish(1, `Codex process ${reason}`);
+        }
+      };
+      const capture = (target: Buffer[], chunk: Buffer | string) => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        if (terminalReason === 'max_buffer') return;
+        bufferedBytes += buffer.length;
+        if (bufferedBytes > maxBuffer) {
+          const remaining = Math.max(0, maxBuffer - (bufferedBytes - buffer.length));
+          if (remaining > 0) target.push(buffer.subarray(0, remaining));
+          stderrChunks.push(Buffer.from('\nCodex process output exceeded maxBuffer'));
+          terminate('max_buffer');
+          return;
+        }
+        target.push(buffer);
+      };
+      const onAbort = () => terminate('aborted');
+      const onParentExit = () => { if (child.pid) child.kill('SIGKILL'); };
+
+      child.stdout.on('data', (chunk) => capture(stdoutChunks, chunk));
+      child.stderr.on('data', (chunk) => capture(stderrChunks, chunk));
+      child.once('error', (error) => finish(1, error.message));
+      child.once('close', (code) => finish(code ?? 1, terminalReason ? `Codex process ${terminalReason}` : ''));
+      child.stdin.on('error', () => { /* child may close stdin before the write finishes */ });
+      if (opts.input !== undefined) child.stdin.end(opts.input);
+      else child.stdin.end();
+
+      opts.signal?.addEventListener('abort', onAbort, { once: true });
+      process.once('exit', onParentExit);
+      timer = setTimeout(() => terminate('timeout'), Math.max(1, opts.timeoutMs));
+      timer.unref();
+    });
   }
+}
+
+async function terminateProcessTree(pid: number): Promise<void> {
+  if (process.platform !== 'win32') {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ }
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], {
+      stdio: 'ignore', windowsHide: true, shell: false,
+    });
+    killer.once('error', () => resolve());
+    killer.once('close', () => resolve());
+  });
 }
 
 /**
@@ -105,7 +179,7 @@ export class FakeCodexProcessRunner implements CodexProcessRunner {
   async run(
     command: string,
     args: string[],
-    _opts: { cwd: string; timeoutMs: number; input?: string; maxBuffer?: number; env?: Record<string, string> },
+    _opts: { cwd: string; timeoutMs: number; input?: string; maxBuffer?: number; env?: Record<string, string>; signal?: AbortSignal },
   ): Promise<CodexProcessRunResult> {
     const key = `${command} ${args.join(' ')}`;
     return this.results.get(key) ?? { ...this.defaultResult };
