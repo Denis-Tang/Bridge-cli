@@ -1,6 +1,7 @@
 import type { TaskSpec } from '../types/protocol.js';
 import type { CodexProcessRunner } from './codex-process-runner.js';
 import { RealCodexProcessRunner } from './codex-process-runner.js';
+import { estimateForCallType, type InvocationContext, type LedgerSink } from '../core/token-telemetry.js';
 import {
   parseCodexClarificationAnswer,
   type CodexClarificationAnswer,
@@ -17,10 +18,26 @@ export interface CodexTechnicalClarifierConfig {
 }
 
 export class CodexTechnicalClarifier implements TechnicalClarificationResponder {
+  private ledgerSink: LedgerSink | null;
+  private invocationContext: InvocationContext | null;
+
   constructor(
     private readonly config: CodexTechnicalClarifierConfig,
     private readonly processRunner: CodexProcessRunner = new RealCodexProcessRunner(),
-  ) {}
+    options?: {
+      ledgerSink?: LedgerSink | null;
+      invocationContext?: InvocationContext | null;
+    },
+  ) {
+    this.ledgerSink = options?.ledgerSink ?? null;
+    this.invocationContext = options?.invocationContext ?? null;
+  }
+
+  /** Attach a ledger sink after construction (one context per clarification round). */
+  setLedger(sink: LedgerSink | null, ctx: InvocationContext | null): void {
+    this.ledgerSink = sink;
+    this.invocationContext = ctx;
+  }
 
   async answerTechnicalQuestions(input: {
     taskSpec: TaskSpec;
@@ -32,28 +49,57 @@ export class CodexTechnicalClarifier implements TechnicalClarificationResponder 
     const args = this.config.args.length > 0
       ? this.config.args
       : ['exec', '--ephemeral', '--sandbox', 'read-only', '--ignore-user-config', '--ignore-rules', '-'];
-    const result = await this.processRunner.run(this.config.command || 'codex', args, {
-      cwd: input.worktreePath,
-      timeoutMs: this.config.timeoutMs,
-      input: prompt,
-      maxBuffer: 2 * 1024 * 1024,
-      env: this.config.env,
-      signal: this.config.signal,
-    });
-    if (result.exitCode !== 0 || result.timedOut) {
-      return {
+
+    // Write the estimate BEFORE spawning, so a crashed/killed call still leaves
+    // evidence that a paid clarification round was attempted.
+    let entryId: string | null = null;
+    const ctx = this.invocationContext;
+    const sink = this.ledgerSink;
+    if (sink && ctx) {
+      const est = estimateForCallType('codex_clarification', { promptChars: prompt.length });
+      try {
+        entryId = await sink.writeEstimate(ctx, est.total, est.input, est.output, prompt);
+      } catch {
+        // Sink failure must not change business semantics.
+      }
+    }
+
+    const startTime = Date.now();
+    try {
+      const result = await this.processRunner.run(this.config.command || 'codex', args, {
+        cwd: input.worktreePath,
+        timeoutMs: this.config.timeoutMs,
+        input: prompt,
+        maxBuffer: 2 * 1024 * 1024,
+        env: this.config.env,
+        signal: this.config.signal,
+      });
+      if (result.exitCode !== 0 || result.timedOut) {
+        return {
+          status: 'requires_user',
+          answers: [],
+          reason: result.timedOut ? 'Codex 技术答疑超时' : 'Codex 技术答疑调用失败',
+          categories: ['technical'],
+        };
+      }
+      return parseCodexClarificationAnswer(result.stdout) ?? {
         status: 'requires_user',
         answers: [],
-        reason: result.timedOut ? 'Codex 技术答疑超时' : 'Codex 技术答疑调用失败',
+        reason: 'Codex 技术答疑输出无法验证，按失败闭锁处理',
         categories: ['technical'],
       };
+    } finally {
+      // Codex CLI returns no structured usage, so actuals stay unavailable by
+      // design — never invent confirmed numbers. The record still proves the
+      // call happened and how long it took.
+      if (sink && entryId) {
+        try {
+          await sink.markUnavailable(entryId, Date.now() - startTime);
+        } catch {
+          // Sink failure must not change business semantics.
+        }
+      }
     }
-    return parseCodexClarificationAnswer(result.stdout) ?? {
-      status: 'requires_user',
-      answers: [],
-      reason: 'Codex 技术答疑输出无法验证，按失败闭锁处理',
-      categories: ['technical'],
-    };
   }
 
   private buildPrompt(taskSpec: TaskSpec, clarification: PiClarificationResult, round: number): string {

@@ -7,7 +7,7 @@ import { randomBytes } from 'node:crypto';
 import type { StateStore } from '../state/state-store.js';
 import type { TokenLedgerEntry, CallType, LedgerStatus } from '../types/m4-types.js';
 import { promptHash } from '../utils/sanitize.js';
-import { estimateCodexPlanTokens, estimateCodexReviewTokens, estimatePiWorkerTokens, estimateStageReviewTokens } from './token-ledger.js';
+import { estimateCodexClarificationTokens, estimateCodexPlanTokens, estimateCodexReviewTokens, estimatePiWorkerTokens, estimateStageReviewTokens } from './token-ledger.js';
 
 // ══════════════════════════════════════════════════════════════
 // Invocation Context
@@ -99,11 +99,13 @@ export class SqliteLedgerSink implements LedgerSink {
 
 export function estimateForCallType(
   callType: CallType,
-  context: { requestText?: string; diffLines?: number; goalLength?: number; pathCount?: number },
+  context: { requestText?: string; diffLines?: number; goalLength?: number; pathCount?: number; promptChars?: number },
 ): { total: number; input: number; output: number } {
   switch (callType) {
     case 'codex_plan':
       return estimateCodexPlanTokens(context.requestText || '');
+    case 'codex_clarification':
+      return estimateCodexClarificationTokens(context.promptChars || 0);
     case 'codex_review':
       return estimateCodexReviewTokens(context.diffLines || 0);
     case 'stage_review':

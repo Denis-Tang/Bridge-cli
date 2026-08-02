@@ -31,8 +31,19 @@ export interface OrchestratorConfig {
 }
 
 /**
- * Orchestrator — coordinates the end-to-end M1 workflow.
- * Manages the full lifecycle: submit → plan → execute → review → merge → record.
+ * Orchestrator — the original single-pass M1 workflow
+ * (submit → plan → execute → review → merge → record).
+ *
+ * NOT A PRODUCTION PATH. No CLI command constructs this class; `brainctl`
+ * routes every real run through StageScheduler → PostWorkerHandler →
+ * StageIntegrationCoordinator, which add staged DAG execution, path locks,
+ * pause/resume, cost reservations and the mandatory integrated-tree review
+ * that this class has none of.
+ *
+ * It is retained solely because `tests/e2e/smoke.test.ts` uses it to exercise
+ * the WorktreeManager / QualityGateRunner / DiffScopeValidator / recorder
+ * combination end to end with fakes. Do not extend it, and do not read it as
+ * a description of how Bridge actually runs.
  */
 export class Orchestrator {
   private config: OrchestratorConfig;

@@ -228,30 +228,3 @@ export async function runStageReview(
 
   return { passed, reviewResult, cacheHit: false };
 }
-
-/**
- * Build an upgrade prompt for task-level review after stage review failure.
- */
-export function buildStageReviewFailureUpgradePrompt(
-  taskId: string,
-  taskDiff: string,
-  stageFindings: string[],
-): string {
-  return [
-    '# 升级审查 — 阶段审查失败，逐任务审查',
-    '',
-    `## 任务: ${taskId}`,
-    '',
-    '## 阶段审查发现',
-    ...stageFindings.map((f) => `- ${f}`),
-    '',
-    '## 任务差异',
-    '```diff',
-    taskDiff,
-    '```',
-    '',
-    '## 审查指令',
-    '阶段审查发现上述问题。请审查此任务的差异，确认是否可合并。',
-    '输出结构化 ReviewResult。',
-  ].join('\n');
-}

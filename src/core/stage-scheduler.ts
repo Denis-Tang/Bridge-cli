@@ -1364,7 +1364,18 @@ export class StageScheduler {
           timeoutMs: this.config.reviewerConfig?.timeoutMs ?? 120_000,
           env: this.config.privacyService?.buildProviderEnv('codex'),
           signal: this.abortController?.signal,
-        }, this.config.codexProcessRunner),
+        }, this.config.codexProcessRunner, {
+          // H3: the 95%-understanding gate spends real Codex calls. Give them a
+          // ledger record so the gate's added cost is at least visible.
+          ledgerSink: this.config.governanceEnabled ? new SqliteLedgerSink(this.store) : null,
+          invocationContext: this.config.governanceEnabled
+            ? {
+              runId, stageId: stage.id, taskId: tid, attemptId: aid,
+              callType: 'codex_clarification', callId: `${aid}-clarify`,
+              model: this.config.reviewerConfig?.model || 'codex-cli',
+            }
+            : null,
+        }),
         onProcessSpawn: async (spawnedPid) => {
           if (piCostReservationId && this.store.markCostReservationSpawned) {
             await this.store.markCostReservationSpawned(piCostReservationId, costGate.ownerId ?? '', new Date().toISOString());

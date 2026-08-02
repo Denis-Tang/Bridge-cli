@@ -161,6 +161,22 @@ export function estimateCodexReviewTokens(diffLines: number): TokenEstimate {
 }
 
 /**
+ * Estimate tokens for one Codex technical-clarification answer during the
+ * 95%-understanding gate. The prompt is a bounded task summary plus Pi's
+ * questions, so it is far smaller than a diff review.
+ * Default: 800 + 20 per prompt char
+ */
+export function estimateCodexClarificationTokens(promptChars: number): TokenEstimate {
+  const base = 800;
+  const perChar = 20;
+  return {
+    total: base + promptChars * perChar,
+    input: base + promptChars * perChar * 0.75,
+    output: promptChars * perChar * 0.25,
+  };
+}
+
+/**
  * Estimate tokens for a Pi worker execution based on task complexity.
  * Default: 2000 + 500 per estimatedWritePath
  */

@@ -44,7 +44,11 @@ export interface ApprovalDecision {
 // TokenLedgerEntry — sanitized token usage record
 // ══════════════════════════════════════════════════════════════
 
-export type CallType = 'codex_plan' | 'codex_review' | 'codex_review_skipped' | 'stage_review' | 'pi_worker';
+// `codex_clarification` covers the 95%-understanding gate's Codex answers.
+// These are real paid calls (up to two rounds per attempt, repeated on rework)
+// and were previously invisible to the ledger entirely — which made the gate's
+// net added cost the one thing that could not be measured.
+export type CallType = 'codex_plan' | 'codex_review' | 'codex_review_skipped' | 'stage_review' | 'pi_worker' | 'codex_clarification';
 
 export type LedgerStatus = 'estimated' | 'confirmed' | 'unavailable';
 
