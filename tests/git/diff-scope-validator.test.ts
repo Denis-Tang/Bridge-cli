@@ -41,6 +41,23 @@ describe('DiffScopeValidator', () => {
       expect(result.valid).toBe(true);
     });
 
+    it('fail-closes when allowedPaths is empty (no write path is authorized)', () => {
+      const files = ['docs/README.md'];
+      const result = validator.validate(files, [], []);
+      expect(result.valid).toBe(false);
+      expect(result.allowedFiles).toEqual([]);
+      expect(result.violations.some((v) => v.includes('allowedPaths is empty'))).toBe(true);
+      // Root cause must be visible, not just a per-file "not in any allowed path"
+      expect(result.violations[0]).toContain('allowedPaths is empty');
+    });
+
+    it('still flags forbidden files when allowedPaths is empty', () => {
+      const result = validator.validate(['.env'], [], ['.env']);
+      expect(result.valid).toBe(false);
+      expect(result.forbiddenFiles).toContain('.env');
+      expect(result.violations.some((v) => v.includes('allowedPaths is empty'))).toBe(true);
+    });
+
     it('rejects absolute paths even when they point at allowed content', () => {
       const files = ['C:/fake-project/docs/README.md'];  // fake absolute path, 已脱敏
       const result = validator.validate(files, ['docs/'], []);

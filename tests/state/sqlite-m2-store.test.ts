@@ -161,6 +161,35 @@ describe('SqliteM2Store', () => {
       expect(result.violations.join('\n')).toContain('.. escape');
       expect(await store.getActiveLocksForRun('lock-unsafe-run')).toHaveLength(0);
     });
+
+    it('LOCK-04 no id collision for paths differing only in non-alphanumeric chars', async () => {
+      await createTestRun('lock-collide-run');
+      await store.createStage({ id: 'lk-collide-stage', runId: 'lock-collide-run', stageNumber: 1, title: 'S1' });
+      await store.createTask({ id: 'lk-collide-t1', runId: 'lock-collide-run', title: 'T1', status: 'running', specJson: {}, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+
+      // The old lossy id (`[^a-zA-Z0-9]` -> `_`) collapsed both of these onto
+      // one lock row id and silently overwrote the first path's lock.
+      const result = await store.acquirePathLocksAtomic({
+        runId: 'lock-collide-run', taskId: 'lk-collide-t1',
+        filePaths: ['src/api-v2/x', 'src/api_v2/x'],
+      });
+      expect(result.acquired).toBe(true);
+      expect(result.locks).toHaveLength(2);
+      expect(new Set(result.locks.map((lock) => lock.id)).size).toBe(2);
+      const active = await store.getActiveLocksForRun('lock-collide-run');
+      expect(active).toHaveLength(2);
+      expect(active.map((lock) => lock.filePath).sort()).toEqual(['src/api-v2/x', 'src/api_v2/x']);
+    });
+
+    it('fail-closes on corrupt task spec_json instead of silently degrading', async () => {
+      await createTestRun('spec-corrupt-run');
+      const tid = 'spec-corrupt-task';
+      await store.createTask({ id: tid, runId: 'spec-corrupt-run', title: 'T', status: 'running', specJson: {}, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+      store.getDatabase().prepare('UPDATE tasks SET spec_json = ? WHERE id = ?').run('{not valid json', tid);
+      // One corrupt spec_json must surface loudly (fail closed), never silently
+      // degrade to null where `?? []` would disable the allowedPaths guard.
+      await expect(store.getTask(tid)).rejects.toThrow(/spec_json/);
+    });
   });
 
   describe('Review CRUD', () => {

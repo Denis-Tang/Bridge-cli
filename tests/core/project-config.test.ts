@@ -23,11 +23,61 @@ describe('ProjectAdapter and universal configuration', () => {
     try {
       writeFileSync(join(root, 'package.json'), JSON.stringify({ scripts: { test: 'node -e ""' } }));
       const suggested = suggestProjectConfig(root);
+      // Schema now requires a non-empty allowedPaths (fail closed); a suggested
+      // config must carry an explicit write scope to be loadable.
+      suggested.allowedPaths = ['src/'];
       writeFileSync(join(root, '.brainctl', 'project.json'), JSON.stringify(suggested));
       const loaded = new ProjectAdapter().load(root);
       expect(loaded.projectId).toBeTruthy();
       expect(loaded.defaultBaseBranch).toBe(detectBranch(root));
       expect(loaded.qualityGates.task?.[0].args).toEqual(['test']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('CONFIG-01B rejects an empty allowedPaths at schema level (fail closed)', () => {
+    const root = fixture();
+    try {
+      writeFileSync(join(root, '.brainctl', 'project.json'), JSON.stringify({
+        schemaVersion: 1, projectId: 'x', projectRoot: root,
+        allowedPaths: [],
+      }));
+      expect(() => new ProjectAdapter().load(root)).toThrow(/allowedPaths/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('REVIEWER-01 codex-cli reviewer without --sandbox read-only is rejected at startup', () => {
+    const root = fixture();
+    try {
+      const project = defaults(root);
+      project.reviewer = { ...project.reviewer, type: 'codex-cli', args: ['exec', '--ephemeral', '-'] };
+      expect(() => resolveConfig({ projectConfig: project, detectedBranch: 'main' })).toThrow(/--sandbox read-only/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('REVIEWER-02 codex-cli reviewer with --sandbox read-only passes', () => {
+    const root = fixture();
+    try {
+      const project = defaults(root);
+      project.reviewer = { ...project.reviewer, type: 'codex-cli', args: ['exec', '--ephemeral', '--sandbox', 'read-only', '-'] };
+      const resolved = resolveConfig({ projectConfig: project, detectedBranch: 'main' });
+      expect(resolved.reviewer.type).toBe('codex-cli');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('REVIEWER-03 non-codex-cli reviewers are not sandbox-gated', () => {
+    const root = fixture();
+    try {
+      const project = defaults(root);
+      project.reviewer = { ...project.reviewer, type: 'local-rule', args: ['anything'] };
+      expect(() => resolveConfig({ projectConfig: project, detectedBranch: 'main' })).not.toThrow();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

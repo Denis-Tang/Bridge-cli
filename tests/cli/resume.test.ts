@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { requireMatchingPauseConfirmation } from '../../src/cli/commands/resume.js';
+import { requireMatchingPauseConfirmation, isCostBudgetPauseReason } from '../../src/cli/commands/resume.js';
 import type { PauseRecord } from '../../src/types/pause-types.js';
 
 const activePause: PauseRecord = {
@@ -27,5 +27,22 @@ describe('resume pause confirmation', () => {
   it('fails closed for a legacy paused Stage without a PauseRecord', () => {
     expect(() => requireMatchingPauseConfirmation(null, 'pause-123'))
       .toThrow(/PauseRecord|结构化暂停记录/);
+  });
+});
+
+describe('cost-budget pause detection (H3b)', () => {
+  it('flags cost (amount) budget pause reason codes', () => {
+    expect(isCostBudgetPauseReason('cost_budget_exceeded')).toBe(true);
+    expect(isCostBudgetPauseReason('cost_ledger_unavailable')).toBe(true);
+    expect(isCostBudgetPauseReason('cost_budget_missing')).toBe(true);
+    expect(isCostBudgetPauseReason('cost_budget_exceeded: 10 requested, 5 remaining')).toBe(true);
+  });
+
+  it('does not flag token-budget or unrelated pauses', () => {
+    expect(isCostBudgetPauseReason('token_budget_exceeded')).toBe(false);
+    expect(isCostBudgetPauseReason('temporary_failure')).toBe(false);
+    expect(isCostBudgetPauseReason(null)).toBe(false);
+    expect(isCostBudgetPauseReason(undefined)).toBe(false);
+    expect(isCostBudgetPauseReason('')).toBe(false);
   });
 });

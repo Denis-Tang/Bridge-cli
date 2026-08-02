@@ -13,7 +13,10 @@ function initGitRepo(dir: string): void {
   execSync('git config user.email t@t.com', { cwd: dir, stdio: 'pipe' });
   execSync('git config user.name T', { cwd: dir, stdio: 'pipe' });
   writeFileSync(path.join(dir, 'README.md'), '# Test');
-  execSync('git add README.md', { cwd: dir, stdio: 'pipe' });
+  // The fixture's state DB lives inside the repo root; ignore it so the
+  // P0-2 dirty-worktree gate sees a genuinely clean repo.
+  writeFileSync(path.join(dir, '.gitignore'), '*.db\n*.db-wal\n*.db-shm\n');
+  execSync('git add README.md .gitignore', { cwd: dir, stdio: 'pipe' });
   execSync('git commit -m init', { cwd: dir, stdio: 'pipe' });
 }
 
@@ -113,7 +116,7 @@ describe('M2 Hard Blockers', () => {
     const rid = 'rec-' + Date.now();
     await store.createRun({ id: rid, projectId: 'p', projectRoot: tmpDir, requestText: 't', status: 'running', createdAt: now, updatedAt: now });
     await store.createStage({ id: rid + '-s1', runId: rid, stageNumber: 1, title: 'S', status: 'running' });
-    await store.createTask({ id: rid + '-t1', runId: rid, title: 'T', status: 'pending', specJson: { stageNumber: 1, dependencies: [], estimatedWritePaths: ['c/'] }, createdAt: now, updatedAt: now });
+    await store.createTask({ id: rid + '-t1', runId: rid, title: 'T', status: 'pending', specJson: { stageNumber: 1, dependencies: [], estimatedWritePaths: ['c/'], allowedPaths: ['c/'], forbiddenPaths: [] }, createdAt: now, updatedAt: now });
 
     // Create a checkpoint branch for a running attempt with a non-existent PID.
     // Recovery should preserve and reuse this paid progress.

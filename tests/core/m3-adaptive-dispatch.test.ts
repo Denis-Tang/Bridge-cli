@@ -18,7 +18,10 @@ function initGitRepo(dir: string): void {
   execSync('git config user.email test@test.com', { cwd: dir, stdio: 'pipe' });
   execSync('git config user.name Test', { cwd: dir, stdio: 'pipe' });
   writeFileSync(path.join(dir, 'README.md'), '# Test\n');
-  execSync('git add README.md', { cwd: dir, stdio: 'pipe' });
+  // The fixture's state DB lives inside the repo root; ignore it so the
+  // P0-2 dirty-worktree gate sees a genuinely clean repo.
+  writeFileSync(path.join(dir, '.gitignore'), '*.db\n*.db-wal\n*.db-shm\n');
+  execSync('git add README.md .gitignore', { cwd: dir, stdio: 'pipe' });
   execSync('git commit -m "init"', { cwd: dir, stdio: 'pipe' });
 }
 

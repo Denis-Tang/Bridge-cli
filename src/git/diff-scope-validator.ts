@@ -32,6 +32,14 @@ export class DiffScopeValidator {
     const allowed = this.normalizePatternList('allowedPaths', allowedPaths, violations);
     const forbidden = this.normalizePatternList('forbiddenPaths', forbiddenPaths, violations, repositoryRoot);
 
+    // Fail closed on an empty allowedPaths: an empty list is NOT "no
+    // restriction", it means no write path is authorized at all. Codex
+    // generates allowedPaths; a plan that omits it must never silently open
+    // the scope guard to every file in the repository.
+    if (allowed.length === 0 && changedFiles.length > 0) {
+      violations.push('allowedPaths is empty: no write path is authorized');
+    }
+
     for (const file of changedFiles) {
       const normalizedFile = this.normalizeChangedPath(file);
       if (!normalizedFile.ok) {
@@ -48,11 +56,12 @@ export class DiffScopeValidator {
         continue;
       }
 
-      // Check allowed paths
-      const isAllowed = allowed.length === 0 || this.matchesAnyPattern(normalizedFile.path, allowed);
+      // Check allowed paths (an empty allowedPaths was already rejected above,
+      // so no file can be inside it)
+      const isAllowed = allowed.length > 0 && this.matchesAnyPattern(normalizedFile.path, allowed);
       if (isAllowed) {
         allowedFiles.push(file);
-      } else {
+      } else if (allowed.length > 0) {
         violations.push(`File '${file}' is not in any allowed path`);
       }
     }

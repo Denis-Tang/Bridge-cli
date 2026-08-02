@@ -73,6 +73,23 @@ function coalesce<T>(...values: Array<T | undefined | null>): T {
   throw new Error('config-resolver: no value provided');
 }
 
+/**
+ * Reviewers are read-only by design (review independence). When the effective
+ * reviewer is codex-cli, its args MUST contain `--sandbox` immediately
+ * followed by `read-only`; anything else means a misconfigured project.json
+ * could silently hand write access to the reviewer — reject at startup.
+ */
+function assertReviewerReadOnly(reviewer: ReviewerConfig): void {
+  if (reviewer.type !== 'codex-cli') return;
+  const args = reviewer.args ?? [];
+  const hasReadOnlySandbox = args.some((arg, index) => arg === '--sandbox' && args[index + 1] === 'read-only');
+  if (!hasReadOnlySandbox) {
+    throw new Error(
+      `Reviewer type 'codex-cli' requires args containing '--sandbox read-only' (reviewer must stay read-only); got: ${JSON.stringify(args)}`,
+    );
+  }
+}
+
 export function resolveConfig(options: ConfigResolverOptions): SchedulerResolvedConfig {
   const { projectConfig, cliOverrides = {}, snapshot = null, detectedBranch = '' } = options;
 
@@ -149,6 +166,12 @@ export function resolveConfig(options: ConfigResolverOptions): SchedulerResolved
   if (!base.targetBranch && detectedBranch) {
     base.targetBranch = detectedBranch;
   }
+
+  // L6: reviewer read-only sandbox is a code gate, not just a doc promise.
+  // Validate the FINAL assembled reviewer (after snapshot/CLI layers), so a
+  // misconfigured project.json, snapshot or CLI override cannot silently give
+  // the reviewer write access.
+  assertReviewerReadOnly(base.reviewer);
 
   return base;
 }

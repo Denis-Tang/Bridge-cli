@@ -1842,7 +1842,9 @@ export class StageScheduler {
 
   private expectedLockId(runId: string, taskId: string, filePath: string): string {
     const normalized = this.normalizeLockPath(filePath);
-    return runId + '-lk-' + taskId + '-' + normalized.replace(/[^a-zA-Z0-9]/g, '_');
+    // SHA-256 of the normalized path — must stay byte-identical with
+    // SqliteStateStore.createDeterministicLockId and recover.ts lockId.
+    return runId + '-lk-' + taskId + '-' + createHash('sha256').update(normalized).digest('hex');
   }
 
   private normalizeLockPath(filePath: string): string {

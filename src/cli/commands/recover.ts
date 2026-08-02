@@ -278,7 +278,12 @@ function pathContains(parent: string, child: string): boolean {
 }
 
 function lockId(runId: string, taskId: string, filePath: string): string {
-  return runId + '-lk-' + taskId + '-' + filePath.replace(/\\/g, '/').split('/').filter((part) => part && part !== '.').join('/').toLowerCase().replace(/[^a-zA-Z0-9]/g, '_');
+  // SHA-256 of the normalized path — must stay byte-identical with
+  // SqliteStateStore.createDeterministicLockId and
+  // StageScheduler.expectedLockId, or resume verification fails after a
+  // recovery adoption.
+  const normalized = filePath.replace(/\\/g, '/').split('/').filter((part) => part && part !== '.').join('/').toLowerCase();
+  return runId + '-lk-' + taskId + '-' + createHash('sha256').update(normalized).digest('hex');
 }
 
 export function adoptRecoveryAtomically(store: SqliteStateStore, input: {

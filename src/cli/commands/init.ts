@@ -142,6 +142,31 @@ function atomicWriteJson(configPath: string, data: unknown): void {
   renameSync(tmpPath, configPath);
 }
 
+// ── allowedPaths notice ─────────────────────────────────────────────────
+
+/**
+ * `defaults()` intentionally produces an empty `allowedPaths`: an empty write
+ * scope authorizes nothing (the scope guard fails closed) and the schema now
+ * rejects it outright. That is the safe default — but the user must be told
+ * plainly, otherwise the next command fails with a bare schema error.
+ *
+ * Deliberately NOT auto-filled with a placeholder like `["src/"]`: a value the
+ * user forgets to narrow is far more dangerous than one they are forced to
+ * write themselves.
+ */
+export function needsAllowedPathsNotice(config: Record<string, unknown>): boolean {
+  const value = config.allowedPaths;
+  return !Array.isArray(value) || value.length === 0;
+}
+
+function printAllowedPathsNotice(config: Record<string, unknown>): void {
+  if (!needsAllowedPathsNotice(config)) return;
+  console.log('  ⚠ allowedPaths 为空 —— 这是安全默认值，但配置尚不可运行。');
+  console.log('    空的 allowedPaths 表示"未授权任何写入路径"，不是"不限制"。');
+  console.log('    你必须先手工填写实际允许改动的路径，例如: "allowedPaths": ["src/"]');
+  console.log('    在填写之前，加载此配置会被 schema 拒绝（这是刻意的 fail-closed 行为）。');
+}
+
 // ── Command ─────────────────────────────────────────────────────────────
 
 export const initCommand = new Command('init')
@@ -176,6 +201,7 @@ export const initCommand = new Command('init')
     console.log(`  质量门建议: ${proposed.qualityGates.task?.length ?? 0} 个 task / ${proposed.qualityGates.stage?.length ?? 0} 个 stage`);
     console.log('  .gitignore 建议: 将 .brainctl-dev/ 加入目标项目 .gitignore（本命令不自动修改）');
     console.log('  配置便携性: projectRoot 保存为 "."，加载时相对于配置文件目录解析');
+    printAllowedPathsNotice(configForFile);
 
     if (!options.apply) {
       console.log('\n  预览配置（敏感值已脱敏）:');
@@ -208,11 +234,13 @@ export const initCommand = new Command('init')
       atomicWriteJson(configPath, merged);
       console.log(`  ✓ 已字段级合并更新: ${configPath}`);
       console.log('  ℹ 用户自定义 worker/reviewer/gates/retention 已保留，仅缺失键采用新默认值。');
+      printAllowedPathsNotice(merged);
     } else {
       console.log('  + 将创建新的 .brainctl/project.json');
       mkdirSync(configDir, { recursive: true });
       atomicWriteJson(configPath, configForFile);
       console.log(`  ✓ 已写入: ${configPath}`);
+      printAllowedPathsNotice(configForFile);
     }
     console.log('═'.repeat(50));
   });

@@ -542,6 +542,9 @@ async function handleStructuredPlan(request: string, projectPath: string, option
     });
     if (!costGate.allowed) {
       console.log('  x Cost budget blocked planning: ' + costGate.reason);
+      console.log('  This is the AMOUNT (costBudget) gate, not the token budget.');
+      console.log('  "--increase-budget" only raises TOKEN limits and will NOT unblock this.');
+      console.log('  Edit .brainctl/project.json -> costBudget.limit (or run brainctl budget write-off for stale reservations), then retry.');
       await store.createEvent({ id: runId + '-ev-plan-cost-exceeded', runId, eventType: 'cost_budget_exceeded', eventData: { remaining: costGate.remaining, currency: cost.currency } });
       await store.close();
       return;
@@ -555,7 +558,8 @@ async function handleStructuredPlan(request: string, projectPath: string, option
       console.log('  x Token budget exceeded for planning: ' + check.reason);
       await store.createEvent({ id: runId + '-ev-plan-budget-exceeded', runId, eventType: 'token_budget_exceeded', eventData: { policyType: 'codex_plan', remaining: check.remaining, limit: check.limit } });
       console.log('  Plan is NOT approvable.');
-      console.log('  Use "brainctl resume ' + runId + ' --increase-budget <tokens>" to raise the codex_plan limit.');
+      console.log('  Use "brainctl resume ' + runId + ' --increase-budget <tokens>" to raise the codex_plan TOKEN limit.');
+      console.log('  (This only affects the token budget; a costBudget block is handled separately and is not raised by --increase-budget.)');
       await store.close();
       return;
     }

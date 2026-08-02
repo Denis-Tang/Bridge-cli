@@ -605,6 +605,36 @@ export class StageIntegrationCoordinator {
 
       let targetBranch = this.config.targetBranch;
       try {
+        // P0-2: fail closed when the real project worktree is dirty before any
+        // checkout/merge. `brainctl init` only *suggests* gitignoring
+        // .brainctl-dev/, so raw `git status` entries under those prefixes are
+        // Bridge's own artifacts and are filtered; ANY other entry (tracked
+        // M/A/D/R edits or user untracked files) pauses the stage. Privacy:
+        // only counts are recorded, never file names or contents.
+        const porcelain = git(this.config.projectRoot, ['status', '--porcelain']).split('\n');
+        const statusCounts: Record<string, number> = {};
+        let dirtyEntryCount = 0;
+        for (const line of porcelain) {
+          if (!line.trim()) continue;
+          const entry = line.slice(3).trim().replace(/^"/, '');
+          if (entry === '.brainctl-dev' || entry.startsWith('.brainctl-dev/')
+            || entry === '.brainctl' || entry.startsWith('.brainctl/')) continue;
+          dirtyEntryCount += 1;
+          const code = (line.slice(0, 2).trim() || '?').toUpperCase();
+          statusCounts[code] = (statusCounts[code] || 0) + 1;
+        }
+        if (dirtyEntryCount > 0) {
+          const pausedAt = new Date().toISOString();
+          await this.store.updateIntegrationBatch(batch.id, { status: 'conflict', conflictsJson: JSON.stringify({ reason: 'target_worktree_dirty', dirtyEntryCount }), finishedAt: pausedAt });
+          await this.recordStagePause({
+            runId, stageId: stage.id, reasonCode: 'target_worktree_dirty',
+            category: 'integration', eventData: { dirtyEntryCount, statusCounts }, createdAt: pausedAt,
+          });
+          await this.mergeBlockApprovedTasks(stageTasks, pausedAt);
+          await this.store.createEvent({ id: this.nextEventId(runId, 'ev-target-dirty'), runId, stageId: stage.id, eventType: 'integration_conflict', eventData: { reason: 'target_worktree_dirty', dirtyEntryCount, statusCounts } });
+          return false;
+        }
+
         const currentBranch = git(this.config.projectRoot, ['rev-parse', '--abbrev-ref', 'HEAD']);
         try { git(this.config.projectRoot, ['rev-parse', '--verify', '--end-of-options', targetBranch]); }
         catch { console.log('[Scheduler] Target branch ' + targetBranch + ' not found. Using current branch: ' + currentBranch); targetBranch = currentBranch; }

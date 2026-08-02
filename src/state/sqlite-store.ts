@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
@@ -1035,7 +1035,14 @@ export class SqliteStateStore implements StateStore {
   }
 
   private createDeterministicLockId(runId: string, taskId: string, filePath: string): string {
-    return runId + '-lk-' + taskId + '-' + filePath.replace(/[^a-zA-Z0-9]/g, '_');
+    // SHA-256 of the normalized path. The old lossy replacement of every
+    // non-alphanumeric char (`/`, `.`, `-` → `_`) let distinct paths such as
+    // `src/api-v2/x` and `src/api_v2/x` collide onto the same lock row id,
+    // silently dropping the first-layer lock for one of them. filePath is
+    // already normalized (lowercase, slash-joined) by normalizeLockPaths.
+    // MUST stay byte-identical with StageScheduler.expectedLockId and
+    // recover.ts lockId, or verifyResumeLocks misjudges every lock.
+    return runId + '-lk-' + taskId + '-' + sha256Hex(filePath);
   }
 
   // ══════════════════════════════════════════════════════════════
@@ -2492,7 +2499,7 @@ function mapRowToTaskRecord(row: Record<string, unknown>): TaskRecord {
     runId: String(row.run_id),
     title: String(row.title),
     status: String(row.status) as TaskStatus,
-    specJson: row.spec_json ? parseJsonField(String(row.spec_json)) : null,
+    specJson: row.spec_json ? parseSpecJsonStrict(String(row.spec_json)) : null,
     branchName: row.branch_name ? String(row.branch_name) : null,
     worktreePath: row.worktree_path ? String(row.worktree_path) : null,
     workerId: row.worker_id ? String(row.worker_id) : null,
@@ -2511,6 +2518,23 @@ function parseJsonField(value: string): Record<string, unknown> | null {
     return JSON.parse(value) as Record<string, unknown>;
   } catch {
     return null;
+  }
+}
+
+function sha256Hex(content: string): string {
+  return createHash('sha256').update(content).digest('hex');
+}
+
+/**
+ * Strict parse for task spec_json. A corrupt spec must fail closed (loudly)
+ * instead of silently degrading to null — downstream `?? []` fallbacks would
+ * otherwise disable the allowedPaths scope guard for the task.
+ */
+function parseSpecJsonStrict(value: string): Record<string, unknown> {
+  try {
+    return JSON.parse(value) as Record<string, unknown>;
+  } catch {
+    throw new Error('Corrupt task spec_json in state store: not valid JSON; refusing to continue (scope guard would silently fail open)');
   }
 }
 

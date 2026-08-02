@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync, execSync } from 'node:child_process';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { SqliteStateStore } from '../../src/state/sqlite-store.js';
@@ -19,7 +19,11 @@ function initGitRepo(dir: string): void {
   execSync('git config user.email test@test.com', { cwd: dir, stdio: 'pipe' });
   execSync('git config user.name Test', { cwd: dir, stdio: 'pipe' });
   writeFileSync(path.join(dir, 'README.md'), '# Test Repo\n');
-  execSync('git add README.md', { cwd: dir, stdio: 'pipe' });
+  // The fixture's state DB lives inside the repo root; ignore it so the
+  // P0-2 dirty-worktree gate sees a genuinely clean repo (and it is committed
+  // so .gitignore itself is not an untracked entry).
+  writeFileSync(path.join(dir, '.gitignore'), '*.db\n*.db-wal\n*.db-shm\n');
+  execSync('git add README.md .gitignore', { cwd: dir, stdio: 'pipe' });
   execSync('git commit -m "initial"', { cwd: dir, stdio: 'pipe' });
 }
 
@@ -326,5 +330,92 @@ describe('StageScheduler Integration', () => {
     const b = await store.getLatestAttempt(runId + '-tB');
     expect(a!.status).toBe('approved');
     expect(b!.status).toBe('approved');
+  });
+
+  it('pauses with target_worktree_dirty before checkout when the real project has user untracked files', async () => {
+    const now = new Date().toISOString();
+    const runId = 'e2e-dirty-gate-' + Date.now();
+    const targetBranch = 'release/dirty-' + Date.now();
+    const currentBranch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: tmpDir, encoding: 'utf-8' }).trim();
+    execFileSync('git', ['branch', targetBranch], { cwd: tmpDir, stdio: 'pipe' });
+    // User's own untracked work in the real project — the gate must protect it.
+    writeFileSync(path.join(tmpDir, 'user-notes.txt'), 'my untracked work\n');
+
+    await store.createRun({ id: runId, projectId: 'p-dirty', projectRoot: tmpDir, requestText: 'dirty gate', status: 'running', createdAt: now, updatedAt: now });
+    await store.createStage({ id: runId + '-s1', runId, stageNumber: 1, title: 'S1', status: 'ready' });
+    await store.createTask({
+      id: runId + '-t1', runId, title: 'T1', status: 'pending',
+      specJson: { stageNumber: 1, dependencies: [], estimatedWritePaths: ['src/x'], allowedPaths: ['src/'], forbiddenPaths: [] },
+      createdAt: now, updatedAt: now,
+    });
+
+    const scheduler = new StageScheduler(store, {
+      projectRoot: tmpDir, sessionDir: tmpDir, logDir: tmpDir, worktreeBaseDir: '.brainctl-dev/wt',
+      allowRealWorker: false, allowRealReviewer: false, workerTimeoutMs: 30000, maxParallelTasks: 1,
+      targetBranch, qualityGates: PASS_THROUGH_GATE,
+      fakeWorkerResult: fakeCompleted, fakeReviewResult: fakeApproved,
+    });
+    try {
+      await scheduler.startRun(runId);
+      const stage = await store.getStage(runId + '-s1');
+      expect(stage!.status).toBe('paused');
+      const pause = await store.getActivePauseForStage(runId + '-s1');
+      expect(pause?.reasonCode).toBe('target_worktree_dirty');
+      // No checkout happened — still on the original branch, user file untouched.
+      expect(execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: tmpDir, encoding: 'utf-8' }).trim()).toBe(currentBranch);
+      expect(readFileSync(path.join(tmpDir, 'user-notes.txt'), 'utf-8')).toBe('my untracked work\n');
+      // Privacy: the conflict event records counts only, never file names.
+      const events = await store.listEvents(runId, 'integration_conflict');
+      const dirtyEvent = events.find((e) => (e.eventDataJson || '').includes('target_worktree_dirty'));
+      expect(dirtyEvent).toBeDefined();
+      expect(dirtyEvent!.eventDataJson || '').not.toContain('user-notes.txt');
+      expect(dirtyEvent!.eventDataJson || '').toContain('"dirtyEntryCount":1');
+    } finally {
+      execFileSync('git', ['checkout', currentBranch], { cwd: tmpDir, stdio: 'pipe' });
+      try { rmSync(path.join(tmpDir, 'user-notes.txt'), { force: true }); } catch {}
+    }
+  });
+
+  it('allows .brainctl-dev artifacts (ignored by the dirty-worktree gate)', async () => {
+    const now = new Date().toISOString();
+    const runId = 'e2e-dirty-ok-' + Date.now();
+    mkdirSync(path.join(tmpDir, '.brainctl-dev', 'logs'), { recursive: true });
+    writeFileSync(path.join(tmpDir, '.brainctl-dev', 'logs', 'stale.log'), 'bridge artifact\n');
+
+    await store.createRun({ id: runId, projectId: 'p-clean', projectRoot: tmpDir, requestText: 'clean gate', status: 'running', createdAt: now, updatedAt: now });
+    await store.createStage({ id: runId + '-s1', runId, stageNumber: 1, title: 'S1', status: 'ready' });
+    await store.createTask({
+      id: runId + '-t1', runId, title: 'T1', status: 'pending',
+      specJson: { stageNumber: 1, dependencies: [], estimatedWritePaths: ['src/x'], allowedPaths: ['src/'], forbiddenPaths: [] },
+      createdAt: now, updatedAt: now,
+    });
+
+    const scheduler = new StageScheduler(store, {
+      projectRoot: tmpDir, sessionDir: tmpDir, logDir: tmpDir, worktreeBaseDir: '.brainctl-dev/wt',
+      allowRealWorker: false, allowRealReviewer: false, workerTimeoutMs: 30000, maxParallelTasks: 1,
+      targetBranch: 'main', qualityGates: PASS_THROUGH_GATE,
+      fakeWorkerResult: fakeCompleted, fakeReviewResult: fakeApproved,
+    });
+    await scheduler.startRun(runId);
+    expect((await store.getRun(runId))!.status).toBe('completed');
+    expect((await store.getStage(runId + '-s1'))!.status).toBe('completed');
+  });
+
+  it('lock ids generated by the store and expectedLockId are identical (SHA-256 scheme)', async () => {
+    const now = new Date().toISOString();
+    const runId = 'e2e-lockid-' + Date.now();
+    const taskId = runId + '-t1';
+    await store.createRun({ id: runId, projectId: 'p1', projectRoot: tmpDir, requestText: 'lockid', status: 'running', createdAt: now, updatedAt: now });
+    await store.createStage({ id: runId + '-s1', runId, stageNumber: 1, title: 'S1' });
+    await store.createTask({ id: taskId, runId, title: 'T1', status: 'running', specJson: {}, createdAt: now, updatedAt: now });
+    const acquired = await store.acquirePathLocksAtomic({ runId, taskId, filePaths: ['SRC\\Feature\\Index.TS'] });
+    expect(acquired.acquired).toBe(true);
+    const scheduler = new StageScheduler(store, {
+      projectRoot: tmpDir, sessionDir: tmpDir, logDir: tmpDir, worktreeBaseDir: '.brainctl-dev/wt',
+      allowRealWorker: false, allowRealReviewer: false, workerTimeoutMs: 30000, maxParallelTasks: 1,
+      targetBranch: 'main', qualityGates: PASS_THROUGH_GATE,
+    });
+    const expected = (scheduler as any).expectedLockId(runId, taskId, 'src/feature/index.ts');
+    expect(acquired.locks[0].id).toBe(expected);
   });
 });

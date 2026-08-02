@@ -57,7 +57,9 @@
     },
     "allowedPaths": {
       "type": "array",
-      "items": { "type": "string" }
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "可写入路径白名单；空数组会被拒绝（fail-closed），不允许为空"
     },
     "costBudget": {
       "type": ["object", "null"],

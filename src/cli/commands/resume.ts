@@ -38,6 +38,15 @@ export function requireMatchingPauseConfirmation(
   return activePause;
 }
 
+/**
+ * True when the blocking pause is a COST (amount) budget exhaustion, for which
+ * `--increase-budget` (token-only) is useless. Kept pure for unit tests.
+ */
+export function isCostBudgetPauseReason(reasonCode: string | null | undefined): boolean {
+  return ['cost_budget_exceeded', 'cost_ledger_unavailable', 'cost_budget_missing']
+    .some((code) => (reasonCode || '').includes(code));
+}
+
 export const resumeCommand = new Command('resume')
   .description('恢复暂停的 run。M4: --increase-budget 提高 Token 限额')
   .argument('<run-id>', 'run ID')
@@ -118,6 +127,16 @@ export const resumeCommand = new Command('resume')
 
       // ── M4: Handle token budget resume ──
       if (options.increaseBudget !== undefined || options.approve || options.policyType) {
+        // H3b: `--increase-budget` only raises TOKEN limits. When the blocking
+        // pause is a cost (amount) budget exhaustion, the command would
+        // succeed silently without unblocking anything; reject it explicitly
+        // with the correct remedy instead.
+        if (options.increaseBudget !== undefined && isCostBudgetPauseReason(activePause?.reasonCode ?? null)) {
+          console.log('  ✗ 当前暂停是金额预算（costBudget）耗尽；--increase-budget 只提高 Token 限额，对金额预算无效。');
+          console.log('  请编辑 .brainctl/project.json 的 costBudget.limit，然后重新 resume。');
+          await store.close();
+          process.exit(1);
+        }
         resetGovernanceConfigCache();
         const govCfg = getGovernanceConfig(run.projectRoot);
         if (!govCfg.enabled) {

@@ -98,7 +98,7 @@ budgetCommand
 
 budgetCommand
   .command('write-off')
-  .description('人工核销一条 unavailable 预留（必须 --decision-note；可审计；reserved/spawned 拒绝）')
+  .description('人工核销一条 unavailable 预留（必须 --decision-note；可审计；reserved/spawned 拒绝）。卡在 reserved 阶段的预留需先跑 brainctl reconcile --apply 翻成 unavailable/released 后才能核销')
   .requiredOption('--reservation <id>', 'Reservation id (status must be unavailable)')
   .requiredOption('--decision-note <text>', 'Explicit auditable reason; mandatory')
   .option('--project <path>', 'Project root used to resolve the default database path')
@@ -121,6 +121,7 @@ budgetCommand
       if (!changed) {
         if (isJson) console.log(JSON.stringify({ error: 'write_off_rejected', reservation: options!.reservation, message: 'reservation 不存在或状态不是 unavailable（reserved/spawned 一律拒绝，防止误核销在跑调用）' }));
         else console.error(`  ✗ 拒绝核销 ${options!.reservation}: 不存在或状态不是 unavailable。`);
+        console.error('  提示: 若该预留仍卡在 reserved 阶段，先运行 brainctl reconcile --apply（把它翻成 unavailable 或 released），再重新执行 write-off。');
         process.exitCode = 1;
       } else {
         if (isJson) console.log(JSON.stringify({ ok: true, reservation: options!.reservation, status: 'written_off', decisionNote: note }));
