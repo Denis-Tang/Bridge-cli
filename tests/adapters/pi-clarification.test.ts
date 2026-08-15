@@ -13,6 +13,7 @@ import { CodexTechnicalClarifier } from '../../src/adapters/codex-technical-clar
 import { FakeCodexProcessRunner } from '../../src/adapters/codex-process-runner.js';
 import {
   clarificationPauseResult,
+  buildPiClarificationPrompt,
   isReadyToImplement,
   parseCodexClarificationAnswer,
   parsePiClarification,
@@ -154,6 +155,14 @@ function config(root: string, responder: TechnicalClarificationResponder): PiWor
 }
 
 describe('Pi 95% clarification protocol', () => {
+  it('limits clarification reads to the exact listed context files without directory enumeration', () => {
+    const prompt = buildPiClarificationPrompt(task, []);
+
+    expect(prompt).toContain('你只能 direct read 上面明列的精确上下文文件（contextFiles）。');
+    expect(prompt).toContain('上下文文件：docs/guide.md');
+    expect(prompt).toContain('禁止使用 ls、find、grep 或任何目录枚举；禁止访问 “.”、仓库根目录或任何父目录。');
+  });
+
   it('retries no-question uncertainty but keeps real questions behind a user decision', () => {
     const uncertain = clarificationPauseResult(task.taskId, [], 'Pi 理解度为 93%，但没有提出可回答的问题');
     expect(uncertain.status).toBe('failed');

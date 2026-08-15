@@ -231,6 +231,15 @@ describe('classifyFailure (unit)', () => {
     expect(r.category).toBe(FailureCategory.TRANSIENT);
   });
 
+  it('Pi clarification tool policy violation → security and non-retriable', () => {
+    const r = classifyFailure('failed', 'clarification_required: Pi 澄清工具策略违规：尝试 ls .');
+    expect(r).toEqual({
+      retriable: false,
+      reason: 'clarification_policy_violation',
+      category: FailureCategory.SECURITY,
+    });
+  });
+
   it('worktree failure → retriable (transient)', () => {
     const r = classifyFailure('failed', 'wt_fail: git error');
     expect(r.retriable).toBe(true);
@@ -331,6 +340,14 @@ describe('checkRetryBudget (unit)', () => {
     expect(r.allowed).toBe(false);
     expect(r.exhausted).toBe(false);
     expect(r.failureCategory).toBe(FailureCategory.SCOPE);
+  });
+
+  it('clarification policy violation at attempt 1 → cannot start a second attempt', () => {
+    const attempts = [{ status: 'failed', exitReason: 'clarification_required: Pi 澄清工具策略违规：尝试 ls .' }];
+    const r = checkRetryBudget(attempts, 2, 'failed', attempts[0].exitReason);
+    expect(r.allowed).toBe(false);
+    expect(r.exhausted).toBe(false);
+    expect(r.failureCategory).toBe(FailureCategory.SECURITY);
   });
 
   it('canceled attempts excluded from count', () => {

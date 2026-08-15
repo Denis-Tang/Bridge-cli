@@ -140,14 +140,19 @@ export function classifyFailure(
     return { retriable: false, reason: 'resume_failed', category: FailureCategory.DATA_CORRUPTION };
   }
 
-  // ── 8. Retriable: clarification protocol/uncertainty without a user question ──
+  // ── 8. Non-retriable: Pi clarification tool policy violation ───────
+  if (reason.startsWith('clarification_required') && reason.includes('Pi 澄清工具策略违规')) {
+    return { retriable: false, reason: 'clarification_policy_violation', category: FailureCategory.SECURITY };
+  }
+
+  // ── 9. Retriable: clarification protocol/uncertainty without a user question ──
   // The 95% gate still fails closed, but a fresh bounded attempt may read again.
   // Actual user questions remain product_decision and are handled above.
   if (reason.startsWith('clarification_required:')) {
     return { retriable: true, reason: 'clarification_retry_required', category: FailureCategory.TRANSIENT };
   }
 
-  // ── 9. Non-retriable: blocked / needs_decision ────────────────────
+  // ── 10. Non-retriable: blocked / needs_decision ───────────────────
   if (reason.startsWith('blocked:')) {
     return { retriable: false, reason: 'worker_blocked', category: FailureCategory.PRODUCT_DECISION };
   }
