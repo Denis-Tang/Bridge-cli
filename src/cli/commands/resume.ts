@@ -47,6 +47,34 @@ export function isCostBudgetPauseReason(reasonCode: string | null | undefined): 
     .some((code) => (reasonCode || '').includes(code));
 }
 
+/**
+ * Locked resume-pause semantics for product_decision pauses. The caller has
+ * already validated --confirm-pause via requireMatchingPauseConfirmation.
+ * Before approveDecision / resolveStagePause / scheduler side effects, the
+ * exact active decision must be approved and a nonblank trimmed decision note
+ * must be supplied. Returns the trimmed note that must be persisted.
+ */
+export function validateProductDecisionResume(
+  activePause: PauseRecord | null,
+  options: { approve?: string; decisionNote?: string },
+): string {
+  if (!activePause || activePause.requiredApprovalType !== 'product_decision') {
+    return typeof options.decisionNote === 'string' ? options.decisionNote.trim() : '';
+  }
+  const decisionId = activePause.decisionId;
+  if (!decisionId) {
+    throw new Error('Active product_decision PauseRecord is missing decisionId; refusing to resume (fail closed).');
+  }
+  if (options.approve !== decisionId) {
+    throw new Error(`--approve 必须精确匹配 active decision ${decisionId}`);
+  }
+  const decisionNote = typeof options.decisionNote === 'string' ? options.decisionNote.trim() : '';
+  if (!decisionNote) {
+    throw new Error(`必须显式传入非空 --decision-note <text> 才能恢复 product_decision 暂停 ${activePause.id}。`);
+  }
+  return decisionNote;
+}
+
 export const resumeCommand = new Command('resume')
   .description('恢复暂停的 run。M4: --increase-budget 提高 Token 限额')
   .argument('<run-id>', 'run ID')
@@ -59,12 +87,14 @@ export const resumeCommand = new Command('resume')
   .option('--increase-budget <n>', 'M4: 提高 Token 预算上限（token 数）', parseInt)
   .option('--policy-type <type>', 'M4: 预算类型 (codex_plan|codex_review_stage|pi_run|pi_task|pi_attempt)')
   .option('--approve <decision-id>', 'M4: 批准指定决策 ID 后恢复')
+  .option('--decision-note <text>', 'M4: product_decision 暂停的显式决策说明（仅写入 pause_records.resolution_note）')
   .option('--confirm-pause <pause-id>', '确认当前结构化暂停记录 ID 后恢复')
   .action(async (runId: string, options: {
     adaptiveConcurrency?: boolean; maxParallelTasks?: number;
     allowRealProject?: boolean; targetBranch?: string;
     executionMode?: string;
     increaseBudget?: number; policyType?: string; approve?: string;
+    decisionNote?: string;
     confirmPause?: string;
     db?: string;
   }) => {
@@ -124,6 +154,10 @@ export const resumeCommand = new Command('resume')
             options.confirmPause,
           )
         : null;
+      const decisionNote = validateProductDecisionResume(activePause, {
+        approve: options.approve,
+        decisionNote: options.decisionNote,
+      });
 
       // ── M4: Handle token budget resume ──
       if (options.increaseBudget !== undefined || options.approve || options.policyType) {
@@ -238,7 +272,9 @@ export const resumeCommand = new Command('resume')
         const resolved = await resolveStagePause(store, {
           pauseId: activePause.id,
           stageId: pausedStage.id,
-          resolutionNote: `Confirmed by brainctl resume --confirm-pause ${activePause.id}`,
+          resolutionNote: activePause.requiredApprovalType === 'product_decision'
+            ? decisionNote
+            : `Confirmed by brainctl resume --confirm-pause ${activePause.id}`,
           approvalDecisionId: activePause.decisionId,
         });
         if (!resolved) {
@@ -271,8 +307,25 @@ export const resumeCommand = new Command('resume')
       console.log('  ▶ Scheduler completed.');
 
       const finalRun = await store.getRun(runId);
-      console.log('  Final run status: ' + (finalRun?.status || 'unknown'));
-      console.log('  ✅ Run ' + runId + ' finished.');
+      const finalStatus = finalRun?.status || 'unknown';
+      console.log('  Final run status: ' + finalStatus);
+      // The scheduler returning normally does NOT mean the run finished: it also
+      // returns after pausing for a decision. Reporting success here (and exiting
+      // 0) would let a caller treat a paused run as a completed one.
+      if (finalStatus === 'completed') {
+        console.log('  ✅ Run ' + runId + ' completed.');
+      } else {
+        console.log('  ⏸ Run ' + runId + ' did NOT complete (status: ' + finalStatus + ').');
+        for (const stage of await store.listStages(runId)) {
+          const pause = await store.getActivePauseForStage(stage.id);
+          if (pause) {
+            console.log('     待处理暂停 (stage ' + stage.stageNumber + '): ' + pause.id
+              + ' — ' + pause.reasonCode + ' (' + pause.category + ')');
+          }
+        }
+        console.log('  运行 `brainctl status ' + runId + '` 查看详情；解决后再次 resume。');
+        process.exitCode = 2;
+      }
       await store.close();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

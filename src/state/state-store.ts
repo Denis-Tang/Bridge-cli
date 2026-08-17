@@ -117,6 +117,12 @@ export interface StateStore {
   createStagePause(input: CreateStagePauseInput): Promise<PauseRecord>;
   getPauseRecord(pauseId: string): Promise<PauseRecord | null>;
   getActivePauseForStage(stageId: string): Promise<PauseRecord | null>;
+  /**
+   * Look up the latest resolved product_decision pause bound to an attempt via
+   * its stage_paused events. Implementations that do not model attempt-bound
+   * pauses may omit this method; StageScheduler treats its absence as no match.
+   */
+  getLatestResolvedPauseForAttempt?(attemptId: string): Promise<PauseRecord | null>;
   resolveStagePause(input: ResolveStagePauseInput): Promise<boolean>;
 
   // Attempt operations

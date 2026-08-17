@@ -39,6 +39,8 @@ import { buildPiWorkerMinimalPrompt, buildPiWorkerRetryPrompt, buildPiWorkerProm
 import { pauseStage } from './pause-service.js';
 import type { PauseCategory, PauseRecord } from '../types/pause-types.js';
 import { runAutomaticReconciliation } from '../cli/commands/reconcile.js';
+import { autoAdoptVerifiableCommitEvidence } from '../cli/commands/recover.js';
+import type { SqliteStateStore } from '../state/sqlite-store.js';
 import { tasksHaveSerialOwnership } from './path-ownership.js';
 
 function canonicalJson(value: unknown): string {
@@ -60,6 +62,46 @@ function git(cwd: string, args: string[]): string {
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
+}
+
+export interface ProductDecisionRetryBudget {
+  allowed: boolean;
+  exhausted: boolean;
+  failureCategory?: string | null;
+}
+
+/**
+ * Locked resume-pause semantics: a non-retriable product_decision attempt may
+ * bypass that classification exactly once, and only when the SAME attempt has
+ * an approved, resolved product_decision pause with a nonblank note. Retry
+ * budget exhaustion still wins, so this never exceeds the ordinary attempt cap.
+ */
+export function shouldAllowApprovedProductDecisionRetry(
+  budget: ProductDecisionRetryBudget,
+  exitReason: string | null | undefined,
+  resolvedPause: PauseRecord | null,
+): boolean {
+  if (budget.allowed || budget.exhausted) return false;
+  const isProductDecision = budget.failureCategory === 'product_decision'
+    || (exitReason ?? '').includes('product_decision');
+  if (!isProductDecision) return false;
+  return resolvedPause != null
+    && resolvedPause.category === 'product_decision'
+    && resolvedPause.resolvedAt != null
+    && (resolvedPause.resolutionNote?.trim() ?? '') !== '';
+}
+
+/**
+ * When a WorkerResult already requires a product decision, the token post-check
+ * must persist only its audit event. The product_decision PauseRecord stays the
+ * unique active pause; a token-budget pause can be raised separately after the
+ * product decision is resolved.
+ */
+export function shouldCreateTokenBudgetPause(
+  postBudgetExceeded: boolean,
+  productDecisionRequired: boolean,
+): boolean {
+  return postBudgetExceeded && !productDecisionRequired;
 }
 
 function classifyPauseReason(
@@ -154,6 +196,8 @@ export interface SchedulerConfig {
   stageReviewInputLimits?: Partial<StageReviewInputLimits>;
   /** R2: cost reservation heartbeat interval (ms). Default: lease window / 3. Test-injectable. */
   costReservationHeartbeatMs?: number;
+  /** Prepare node_modules in a fresh integration worktree before stage gates run. */
+  prepareIntDeps?: (worktreePath: string, runId: string) => void | Promise<void>;
 }
 
 const DEFAULT_CONFIG: SchedulerConfig = {
@@ -719,12 +763,19 @@ export class StageScheduler {
       }
       if (diffDelta.length > 12_000) diffDelta = diffDelta.slice(0, 12_000) + '\n... [diff truncated by brainctl]';
       const requiredRework = this.parseStringArray(latestReview?.requiredReworkJson);
+      const approvedDecisionNote = await this.getApprovedProductDecisionNote(previousAttempt.id);
+      const baseRepairGoal = requiredRework.length > 0
+        ? requiredRework.join('; ')
+        : `修复上次失败并完成目标: ${spec.goal}`;
+      const repairGoal = approvedDecisionNote
+        ? `${baseRepairGoal}\n\n【已批准的产品决策说明】${approvedDecisionNote}`
+        : baseRepairGoal;
       const packet = buildRetryPacket(
         previousAttempt,
         (previousAttempt.exitReason || '上次 attempt 未通过').slice(0, 1_200),
         findings,
         diffDelta,
-        requiredRework.length > 0 ? requiredRework.join('; ') : `修复上次失败并完成目标: ${spec.goal}`,
+        repairGoal,
         spec,
       );
       const prompt = buildPiWorkerRetryPrompt(packet);
@@ -752,6 +803,13 @@ export class StageScheduler {
       eventData: { contextFiles: packet.contextFilesSummary.length, overflowCount: overflow.length, promptChars: prompt.length },
     });
     return { prompt, taskPacketHash: sha256(canonicalJson(packet)) };
+  }
+
+  private async getApprovedProductDecisionNote(attemptId: string): Promise<string | null> {
+    const resolvedPause = await this.store.getLatestResolvedPauseForAttempt?.(attemptId) ?? null;
+    const note = resolvedPause?.resolutionNote?.trim();
+    if (!note) return null;
+    return note.slice(0, 800);
   }
 
   private dependsOn(
@@ -920,7 +978,15 @@ export class StageScheduler {
             lat.exitReason || undefined,
           );
 
+          let approvedProductDecisionRetry = false;
           if (!budget.allowed) {
+            const resolvedPause = await this.store.getLatestResolvedPauseForAttempt?.(lat.id) ?? null;
+            approvedProductDecisionRetry = shouldAllowApprovedProductDecisionRetry(
+              budget, lat.exitReason, resolvedPause,
+            );
+          }
+
+          if (!budget.allowed && !approvedProductDecisionRetry) {
             console.log('[Scheduler] Task ' + t.id + ' retry not allowed: ' + budget.reason);
             const now = new Date().toISOString();
             await this.store.updateTaskStatus(t.id, 'waiting_decision', now);
@@ -1170,7 +1236,25 @@ export class StageScheduler {
         if (ct?.status === 'merge_blocked') { hasMergeBlocked = true; }
       }
       if (hasMergeBlocked) {
-        console.log('[Scheduler] Stage has merge_blocked task(s); integration permanently blocked.');
+        // merge_blocked is deliberately NOT auto-retriable: a blocked merge means a
+        // human must look. But it must not become an inescapable state either —
+        // when the target already contains the reviewed tree, the obstruction is
+        // gone and the only thing left is state convergence. That case is proven
+        // from Git + the existing batch (never re-reviewed, never re-merged);
+        // anything else records a PauseRecord so the stage never sits in a
+        // running half-state with nothing to act on.
+        const converged = await this.integrationCoordinator.tryConvergePreMergedBlockedStage(stage, runId, wtm, base);
+        if (converged.outcome === 'converged') return true;
+        console.log('[Scheduler] Stage has merge_blocked task(s); integration blocked: ' + converged.reason);
+        await this.recordStagePause({
+          runId, stageId: stage.id, reasonCode: 'merge_blocked_tasks_block_integration',
+          category: 'integration',
+          eventData: {
+            blockedTaskIds: tasks.filter((t) => t.id).map((t) => t.id),
+            preMergedConvergenceRejectedBecause: converged.reason,
+          },
+          createdAt: new Date().toISOString(),
+        });
         return false;
       }
       if (allOk) {
@@ -1201,7 +1285,8 @@ export class StageScheduler {
     // ── M4: Resume from token-budget-paused worker_completed attempt ──
     const latestBeforeExec = await this.store.getLatestAttempt(tid);
     if (latestBeforeExec && latestBeforeExec.status === 'worker_completed') {
-      await this.resumeFromWorkerCompleted(latestBeforeExec, spec, stage, runId, base, wtm, dv);
+      const preserve = await this.resumeFromWorkerCompleted(latestBeforeExec, spec, stage, runId, base, wtm, dv);
+      if (preserve) preserveLocks = true;
       return;
     }
 
@@ -1507,8 +1592,27 @@ export class StageScheduler {
       stoppedAt = new Date().toISOString();
       wrResult = r.workerResult; pid = r.pid ?? null; exitReason = r.errorMessage; rawLog = r.rawLogPath;
       if (!wrResult) {
+        // ── Auto evidence adoption: Pi may have committed but the WorkerResult /
+        // commitHash was lost. Before failing closed, verify the worktree HEAD is a
+        // real commit and adopt it automatically (equivalent to `recover attempt
+        // --commit <HEAD>` without the human typing it). Never fakes completion:
+        // without a verifiable commit this returns false and we fail closed.
+        const auto = await autoAdoptVerifiableCommitEvidence({
+          store: this.store as SqliteStateStore,
+          attemptId: aid,
+          projectRoot: this.config.projectRoot,
+        });
+        if (auto.adopted) {
+          console.log('[Scheduler] ' + (auto.reason ?? ''));
+          console.log('[Scheduler] Auto-adopted verifiable worktree commit for attempt ' + aid + ': ' + auto.commit + ' — resume to continue review → integration → merge.');
+          // Keep the adopted path locks for the resume flow (same as the
+          // token-budget hard pause); the finally block must not release them.
+          preserveLocks = true;
+          return;
+        }
         const detail = exitReason || 'Pi did not return a valid WorkerResult';
         const reason = `worker_result_missing: ${detail}`;
+        console.log('[Scheduler] Auto evidence adoption unavailable for attempt ' + aid + ': ' + (auto.reason ?? 'unknown'));
         await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
         await this.store.updateTaskStatus(tid, 'waiting_decision', stoppedAt);
         await this.store.updateAttemptResult(aid, { piPid: pid, stoppedAt, exitReason: reason, rawLogPath: rawLog || null, promptHash: null as any, workerResultJson: null });
@@ -1517,7 +1621,7 @@ export class StageScheduler {
           runId, stageId: stage.id, taskId: tid, attemptId: aid,
           reasonCode: 'worker_result_missing_recovery_available', category: 'recovery', createdAt: stoppedAt,
         });
-        console.log('[Scheduler] WorkerResult MISSING for attempt ' + aid + ' — marked failed (no manual completion).');
+        console.log('[Scheduler] WorkerResult MISSING for attempt ' + aid + ' (no verifiable worktree commit) — marked failed (no manual completion).');
         await this.releaseLocks(tid, runId);
         return;
       }
@@ -1569,12 +1673,14 @@ export class StageScheduler {
           eventType: 'token_budget_exceeded',
           eventData: { policyType: 'pi_attempt', remaining: pc.remaining, limit: pc.limit },
         });
-        await this.recordStagePause({
-          runId, stageId: stage.id, taskId: tid, attemptId: aid,
-          reasonCode: 'token_budget_exceeded', category: 'budget',
-          requiredApprovalType: 'run_budget', eventData: { policyType: 'pi_attempt' },
-        });
-        tokenPaused = true;
+        if (shouldCreateTokenBudgetPause(true, wrResult?.productDecisionRequired === true)) {
+          await this.recordStagePause({
+            runId, stageId: stage.id, taskId: tid, attemptId: aid,
+            reasonCode: 'token_budget_exceeded', category: 'budget',
+            requiredApprovalType: 'run_budget', eventData: { policyType: 'pi_attempt' },
+          });
+          tokenPaused = true;
+        }
       }
     }
 
@@ -1683,7 +1789,7 @@ export class StageScheduler {
     spec: StructuredTaskSpec,
     stage: StageRecord, runId: string, base: string,
     wtm: WorktreeManager, dv: DiffScopeValidator,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const tid = attempt.taskId;
     const aid = attempt.id;
     const wp = attempt.worktreePath!;
@@ -1699,11 +1805,28 @@ export class StageScheduler {
     } catch { /* */ }
 
     if (!wrResult) {
+      // ── Auto evidence adoption: the attempt is worker_completed but its
+      // WorkerResult was lost. Before failing, check whether the worktree HEAD
+      // is a verifiable commit and adopt it automatically. Never fakes
+      // completion: without verifiable evidence we fail closed below.
+      const auto = await autoAdoptVerifiableCommitEvidence({
+        store: this.store as SqliteStateStore,
+        attemptId: aid,
+        projectRoot: this.config.projectRoot,
+        worktree: wp,
+        branch: bn,
+      });
+      if (auto.adopted) {
+        console.log('[Scheduler] ' + (auto.reason ?? ''));
+        console.log('[Scheduler] Resume auto-adopted verifiable worktree commit for attempt ' + aid + ': ' + auto.commit + ' — resume again to continue review → integration → merge.');
+        // Locks are re-established by adoption; keep them for the next resume.
+        return true;
+      }
       await this.store.updateAttemptStatus(aid, 'failed', stoppedAt);
       await this.store.updateTaskStatus(tid, 'waiting_decision', stoppedAt);
       await this.store.updateAttemptResult(aid, { exitReason: 'resume: workerResult missing' });
       await this.releaseLocks(tid, runId);
-      return;
+      return false;
     }
 
     // Verify worktree still exists
@@ -1713,30 +1836,30 @@ export class StageScheduler {
       await this.store.updateTaskStatus(tid, 'waiting_decision', stoppedAt);
       await this.store.updateAttemptResult(aid, { exitReason: 'resume: worktree missing: ' + wp });
       await this.releaseLocks(tid, runId);
-      return;
+      return false;
     }
 
     const recoveryProof = this.readRecoveryAdoptionProof(attempt, wrResult);
     if (recoveryProof.kind === 'invalid') {
       await this.pauseForInvalidRecovery(runId, stage.id, tid, aid, recoveryProof.reason);
-      return;
+      return false;
     }
     if (recoveryProof.kind === 'valid') {
       const currentCommit = wtm.getCurrentCommit(wp);
       if (currentCommit !== attempt.adoptedCommit) {
         await this.pauseForInvalidRecovery(runId, stage.id, tid, aid, 'adopted_commit_drift');
-        return;
+        return false;
       }
       let currentBranch: string;
       try {
         currentBranch = git(wp, ['branch', '--show-current']);
       } catch {
         await this.pauseForInvalidRecovery(runId, stage.id, tid, aid, 'adopted_worktree_invalid');
-        return;
+        return false;
       }
       if (currentBranch !== bn) {
         await this.pauseForInvalidRecovery(runId, stage.id, tid, aid, 'adopted_branch_drift');
-        return;
+        return false;
       }
     }
 
@@ -1746,7 +1869,7 @@ export class StageScheduler {
     const observedRecoveryPaths = recoveryProof.kind === 'valid' ? recoveryProof.changedFiles : [];
     const lps = this.lockPathsFor(spec, observedRecoveryPaths);
     const lockCheck = await this.verifyResumeLocks(runId, stage.id, tid, aid, lps);
-    if (!lockCheck.ok) return;
+    if (!lockCheck.ok) return false;
 
     // Scope check
     const taskDiffBase = await this.getAttemptDiffBase(runId, aid, base);
@@ -1757,7 +1880,7 @@ export class StageScheduler {
       if (actualChangedFiles.length !== recoveryProof.changedFileCount
         || this.hashRecoveryPaths(actualChangedFiles) !== recoveryProof.changedFilesHash) {
         await this.pauseForInvalidRecovery(runId, stage.id, tid, aid, 'adopted_changed_files_drift');
-        return;
+        return false;
       }
       const scope = checkScopeExpansion(
         ch, spec.estimatedWritePaths ?? [], spec.allowedPaths ?? [], 0,
@@ -1768,7 +1891,7 @@ export class StageScheduler {
       if (approvedRecoveryExpansion.length !== recoveryProof.scopeExpansionFileCount
         || expansionHash !== recoveryProof.scopeExpansionFilesHash) {
         await this.pauseForInvalidRecovery(runId, stage.id, tid, aid, 'adopted_scope_expansion_drift');
-        return;
+        return false;
       }
     }
     const taskAllowedPaths = spec.allowedPaths || [];
@@ -1781,7 +1904,7 @@ export class StageScheduler {
       changedFiles: ch, scopeValidator: dv, worktreeManager: wtm, timestamp: stoppedAt,
       effectiveAllowedPaths, recoveryExpansionApproved: recoveryProof.kind === 'valid',
     });
-    return;
+    return false;
 
   }
 
@@ -1804,7 +1927,7 @@ export class StageScheduler {
       scopeExpansionFileCount: number; scopeExpansionFilesHash: string | null;
     } {
     if (attempt.resultSource === 'pi') return { kind: 'none' };
-    if (!['manual', 'codex_recovery'].includes(attempt.resultSource)
+    if (!['manual', 'codex_recovery', 'worker_auto_recovery'].includes(attempt.resultSource)
       || !attempt.adoptedCommit
       || workerResult.commitHash !== attempt.adoptedCommit) {
       return { kind: 'invalid', reason: 'adoption_provenance_invalid' };

@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { requireMatchingPauseConfirmation, isCostBudgetPauseReason } from '../../src/cli/commands/resume.js';
+import {
+  requireMatchingPauseConfirmation,
+  isCostBudgetPauseReason,
+  validateProductDecisionResume,
+} from '../../src/cli/commands/resume.js';
 import type { PauseRecord } from '../../src/types/pause-types.js';
 
 const activePause: PauseRecord = {
@@ -7,6 +11,14 @@ const activePause: PauseRecord = {
   reasonCode: 'temporary_failure', category: 'transient', recoverable: true,
   requiredApprovalType: null, decisionId: null, evidenceSummary: 'sha256:evidence',
   createdAt: '2026-08-02T00:00:00.000Z', resolvedAt: null, resolutionNote: null,
+};
+
+const productDecisionPause: PauseRecord = {
+  id: 'pause-pd', runId: 'run-1', stageId: 'stage-1',
+  reasonCode: 'product_decision_required', category: 'product_decision', recoverable: true,
+  requiredApprovalType: 'product_decision', decisionId: 'decision-pd',
+  evidenceSummary: 'sha256:pd', createdAt: '2026-08-02T00:00:00.000Z',
+  resolvedAt: null, resolutionNote: null,
 };
 
 describe('resume pause confirmation', () => {
@@ -27,6 +39,44 @@ describe('resume pause confirmation', () => {
   it('fails closed for a legacy paused Stage without a PauseRecord', () => {
     expect(() => requireMatchingPauseConfirmation(null, 'pause-123'))
       .toThrow(/PauseRecord|结构化暂停记录/);
+  });
+});
+
+describe('product_decision resume validation', () => {
+  it('requires exact --approve before accepting a decision note', () => {
+    expect(() => validateProductDecisionResume(productDecisionPause, {
+      approve: 'decision-other',
+      decisionNote: '  valid note  ',
+    })).toThrow(/--approve.*decision-pd/);
+  });
+
+  it('rejects a missing or blank --decision-note even with exact --approve', () => {
+    expect(() => validateProductDecisionResume(productDecisionPause, {
+      approve: 'decision-pd',
+      decisionNote: '   ',
+    })).toThrow(/--decision-note/);
+  });
+
+  it('returns the trimmed note only for exact approve + nonblank note', () => {
+    expect(validateProductDecisionResume(productDecisionPause, {
+      approve: 'decision-pd',
+      decisionNote: '  approved answer  ',
+    })).toBe('approved answer');
+  });
+
+  it('fails closed when the product_decision pause has no decisionId', () => {
+    const missingDecision = { ...productDecisionPause, decisionId: null };
+    expect(() => validateProductDecisionResume(missingDecision, {
+      approve: undefined,
+      decisionNote: 'note',
+    })).toThrow(/decisionId/);
+  });
+
+  it('does not gate non-product pauses on --approve/--decision-note', () => {
+    expect(validateProductDecisionResume(activePause, {
+      approve: undefined,
+      decisionNote: '  ignored  ',
+    })).toBe('ignored');
   });
 });
 

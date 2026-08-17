@@ -592,7 +592,36 @@ export class SqliteStateStore implements StateStore {
     return row ? mapRowToPauseRecord(row) : null;
   }
 
+  async getLatestResolvedPauseForAttempt(attemptId: string): Promise<PauseRecord | null> {
+    const rows = this.db.prepare(
+      `SELECT * FROM events
+       WHERE attempt_id = ? AND event_type = 'stage_paused'
+       ORDER BY created_at DESC, id DESC`
+    ).all(attemptId) as Record<string, unknown>[];
+
+    for (const row of rows) {
+      let eventData: Record<string, unknown> | null = null;
+      try {
+        if (row.event_data_json) {
+          eventData = JSON.parse(String(row.event_data_json)) as Record<string, unknown>;
+        }
+      } catch {
+        continue;
+      }
+      const pauseId = eventData?.pauseId;
+      if (typeof pauseId !== 'string' || pauseId.trim() === '') continue;
+      const pause = await this.getPauseRecord(pauseId);
+      if (!pause || pause.category !== 'product_decision' || !pause.resolvedAt) continue;
+      if (!(pause.resolutionNote?.trim() ?? '')) continue;
+      return pause;
+    }
+    return null;
+  }
+
   async resolveStagePause(input: ResolveStagePauseInput): Promise<boolean> {
+    const resolutionNote = typeof input.resolutionNote === 'string'
+      ? input.resolutionNote.trim()
+      : input.resolutionNote;
     const resolvedAt = input.resolvedAt ?? new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -638,7 +667,7 @@ export class SqliteStateStore implements StateStore {
       const pauseUpdate = this.db.prepare(
         `UPDATE pause_records SET resolved_at = ?, resolution_note = ?
          WHERE id = ? AND stage_id = ? AND resolved_at IS NULL`
-      ).run(resolvedAt, input.resolutionNote, input.pauseId, input.stageId);
+      ).run(resolvedAt, resolutionNote, input.pauseId, input.stageId);
       if (Number(pauseUpdate.changes) !== 1) {
         throw new Error(`PauseRecord ${input.pauseId} changed during resolution`);
       }

@@ -219,7 +219,13 @@ export async function runStageReview(
     };
   }
 
-  const passed = reviewResult.status === 'approved' && reviewResult.mergeAllowed;
+  // A real verdict requires a real reviewer: an unavailable reviewer or a
+  // failed subprocess (errorCategory present) is never a pass, even if the
+  // shape would otherwise look approved.
+  const passed = reviewResult.status === 'approved'
+    && reviewResult.mergeAllowed
+    && reviewResult.reviewerUnavailable !== true
+    && (reviewResult.executionMetadata?.errorCategory === undefined);
 
   // Cache the result if passed
   if (passed) {
