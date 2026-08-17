@@ -445,6 +445,45 @@ describe('PiRpcWorker', () => {
       expect(result.workerResult!.taskId).toBe('test-task-001');
     });
 
+    it('does NOT let an early completed fragment without commitHash starve a later complete result (A.3)', async () => {
+      const fragmentWithoutHash = { ...validWorkerResultJson };
+      delete (fragmentWithoutHash as any).commitHash;
+      const fullResult = { ...validWorkerResultJson, commitHash: 'def0123' };
+
+      class TwoBlockStreamRunner implements ProcessRunner {
+        async run(input: ProcessRunInput): Promise<ProcessRunResult> {
+          const first = 'BEGIN_WORKER_RESULT_JSON\n' + JSON.stringify(fragmentWithoutHash) + '\nEND_WORKER_RESULT_JSON';
+          const second = 'BEGIN_WORKER_RESULT_JSON\n' + JSON.stringify(fullResult) + '\nEND_WORKER_RESULT_JSON';
+          let stdout = '';
+          for (const chunk of [first.slice(0, 12), first.slice(12), '\n', second]) {
+            stdout += chunk;
+            const signal = input.onStdoutChunk?.(chunk, stdout);
+            if (signal?.terminateProcess) break;
+          }
+          return {
+            pid: 99991,
+            exitCode: 0,
+            stdout,
+            stderr: '',
+            timedOut: false,
+            aborted: false,
+            terminatedAfterWorkerResult: false,
+            durationMs: 10,
+          };
+        }
+      }
+
+      const config = createWorkerConfig({ allowRealPiExecution: true });
+      const worker = new PiRpcWorker(config, new TwoBlockStreamRunner());
+      const result = await worker.executeTask(createTaskInput());
+
+      // The early fragment (completed without commitHash) is not schema-valid, so
+      // the worker must keep streaming and accept the LATER complete result.
+      expect(result.workerResult).not.toBeNull();
+      expect(result.workerResult!.status).toBe('completed');
+      expect(result.workerResult!.commitHash).toBe('def0123');
+    });
+
     it('returns WorkerResult even when timedOut but result was parsed', async () => {
       const fakeRunner = new FakeProcessRunner();
       const agentEndEvent = JSON.stringify({

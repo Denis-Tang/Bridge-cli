@@ -94,7 +94,7 @@ Hope this helps!`;
   describe('fallback JSON extraction', () => {
     it('falls back to last JSON object when no markers', () => {
       const output = `Some text
-{ "taskId": "task-001", "status": "completed", "summary": "ok",
+{ "taskId": "task-001", "status": "completed", "summary": "ok", "commitHash": "abc1234",
   "filesChanged": [], "checks": [], "scopeViolations": [],
   "risks": [], "unresolvedQuestions": [], "productDecisionRequired": false,
   "tokenUsage": { "inputTokens": 0, "outputTokens": 0, "cacheHitTokens": 0 } }`;
@@ -102,6 +102,32 @@ Hope this helps!`;
       const result = parseWorkerResult(output);
       expect(result.success).toBe(true);
       expect(result.workerResult).not.toBeNull();
+      expect(result.workerResult!.commitHash).toBe('abc1234');
+    });
+
+    it('rejects completed WorkerResult without commitHash (strict contract)', () => {
+      const output = `BEGIN_WORKER_RESULT_JSON
+{ "taskId": "task-001", "status": "completed", "summary": "ok",
+  "filesChanged": ["docs/README.md"], "checks": [], "scopeViolations": [],
+  "risks": [], "unresolvedQuestions": [], "productDecisionRequired": false,
+  "tokenUsage": { "inputTokens": 0, "outputTokens": 0, "cacheHitTokens": 0 } }
+END_WORKER_RESULT_JSON`;
+
+      const result = parseWorkerResult(output);
+      expect(result.success).toBe(false);
+      expect(result.errors.some((e) => e.includes('commitHash'))).toBe(true);
+    });
+
+    it('parses code-fenced completed result with commitHash', () => {
+      const output = '```json\n' + [
+        'BEGIN_WORKER_RESULT_JSON',
+        JSON.stringify(validWorkerResult),
+        'END_WORKER_RESULT_JSON',
+      ].join('\n') + '\n```';
+
+      const result = parseWorkerResult(output);
+      expect(result.success).toBe(true);
+      expect(result.workerResult!.commitHash).toBe('abc1234');
     });
   });
 

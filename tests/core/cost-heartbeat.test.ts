@@ -73,32 +73,33 @@ describe('R2 cost reservation heartbeat', () => {
     }
   });
 
-  it('T3: no leftover heartbeat timers after completion and after failure', async () => {
+  it('T3: no leftover heartbeat timers after successful completion', async () => {
     const ctx = await setupBenchmark([CORRECT_DAG[0]], 1, 'hb3', { piDelayMs: 250 });
     try {
       setCostBudget(ctx, 40);
       const before = intervalHandleCount();
       await ctx.scheduler.startRun(ctx.runId);
       expect(intervalHandleCount()).toBe(before);
+    } finally {
       await teardownBenchmark(ctx);
-    } catch (e) { /* handled below */ }
+    }
+  });
 
-    // Failure path: fake runner throws after spawn → attempt interrupted, timers cleared.
-    const ctx2 = await setupBenchmark([CORRECT_DAG[0]], 1, 'hb3b', { piDelayMs: 200 });
+  it('T4: no leftover heartbeat timers after a runner crash and the attempt is failed', async () => {
+    const ctx = await setupBenchmark([CORRECT_DAG[0]], 1, 'hb3b', { piDelayMs: 200 });
     try {
-      setCostBudget(ctx2, 40);
-      const origRun = ctx2.piRunner.run.bind(ctx2.piRunner);
-      ctx2.piRunner.run = async (input: never) => {
+      setCostBudget(ctx, 40);
+      ctx.piRunner.run = async (input: never) => {
         await new Promise((r) => setTimeout(r, 120));
         throw new Error('simulated runner crash after spawn');
       };
       const before = intervalHandleCount();
-      await ctx2.scheduler.startRun(ctx2.runId);
+      await ctx.scheduler.startRun(ctx.runId);
       expect(intervalHandleCount()).toBe(before);
-      const attempt = (await ctx2.store.listAttempts(CORRECT_DAG[0].taskId))[0];
+      const attempt = (await ctx.store.listAttempts(CORRECT_DAG[0].taskId))[0];
       expect(attempt.status).toBe('failed');
     } finally {
-      await teardownBenchmark(ctx2);
+      await teardownBenchmark(ctx);
     }
-  });
+  }, 15000);
 });

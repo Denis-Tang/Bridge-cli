@@ -6,9 +6,10 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "vitest run",
+    "postbuild": "node scripts/copy-sql-migrations.mjs",
+    "test": "vitest run --pool=threads",
     "check": "npm run build && npm test",
-    "brainctl": "tsx src/cli/brainctl.ts"
+    "brainctl": "node dist/cli/brainctl.js"
   },
   "bin": {
     "brainctl": "dist/cli/brainctl.js"

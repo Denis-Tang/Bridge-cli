@@ -168,12 +168,62 @@ describe('JSON Schema Validation', () => {
         status: 'completed',
         summary: '完成',
         filesChanged: ['<PROJECT_ROOT>/项目/docs/README.md'],
+        commitHash: 'abc1234',
         checks: [{ name: 'scope', status: 'passed', summary: 'ok' }],
         scopeViolations: [],
         risks: [],
         unresolvedQuestions: [],
         productDecisionRequired: false,
         tokenUsage: { inputTokens: 50, outputTokens: 100, cacheHitTokens: 0 },
+      };
+      expect(validate(valid)).toBe(true);
+    });
+
+    it('rejects completed without commitHash (commitHash contract)', () => {
+      const invalid = {
+        taskId: 'task-no-hash',
+        status: 'completed',
+        summary: '完成但没有提交',
+        filesChanged: ['docs/README.md'],
+        checks: [{ name: 'scope', status: 'passed', summary: 'ok' }],
+        scopeViolations: [],
+        risks: [],
+        unresolvedQuestions: [],
+        productDecisionRequired: false,
+        tokenUsage: { inputTokens: 50, outputTokens: 100, cacheHitTokens: 0 },
+      };
+      expect(validate(invalid)).toBe(false);
+    });
+
+    it('rejects completed with empty commitHash', () => {
+      const invalid = {
+        taskId: 'task-empty-hash',
+        status: 'completed',
+        summary: '完成但 commitHash 为空',
+        filesChanged: ['docs/README.md'],
+        commitHash: '',
+        checks: [{ name: 'scope', status: 'passed', summary: 'ok' }],
+        scopeViolations: [],
+        risks: [],
+        unresolvedQuestions: [],
+        productDecisionRequired: false,
+        tokenUsage: { inputTokens: 50, outputTokens: 100, cacheHitTokens: 0 },
+      };
+      expect(validate(invalid)).toBe(false);
+    });
+
+    it('allows non-completed statuses without commitHash', () => {
+      const valid = {
+        taskId: 'task-failed',
+        status: 'failed',
+        summary: '失败',
+        filesChanged: [],
+        checks: [],
+        scopeViolations: [],
+        risks: ['外部依赖阻塞'],
+        unresolvedQuestions: [],
+        productDecisionRequired: false,
+        tokenUsage: { inputTokens: 10, outputTokens: 20, cacheHitTokens: 0 },
       };
       expect(validate(valid)).toBe(true);
     });

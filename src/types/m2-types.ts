@@ -225,7 +225,7 @@ export interface AttemptRecord {
   exitReason: string | null;
   logPath: string | null;
   rawLogPath: string | null;
-  resultSource: 'pi' | 'manual' | 'codex_recovery';
+  resultSource: 'pi' | 'manual' | 'codex_recovery' | 'worker_auto_recovery';
   adoptedCommit: string | null;
   adoptionMetadataJson: string | null;
   createdAt: string;

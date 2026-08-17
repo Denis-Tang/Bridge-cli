@@ -171,6 +171,46 @@ export class PostWorkerHandler {
   private async verifyCompletionEvidence(input: PostWorkerInput): Promise<boolean> {
     if (!this.config.allowRealWorker && !this.config.allowRealReviewer) return true;
 
+    // A completed result must carry a verifiable diff first; without changed
+    // files there is nothing to review, so fail closed before commitHash checks.
+    if (input.workerResult.status === 'completed' && input.changedFiles.length === 0) {
+      await this.blockUnverifiableCompletion(input, 'worker_completed_without_verifiable_diff', {
+        branchName: Boolean(input.branchName),
+        changedFileCount: 0,
+      });
+      return false;
+    }
+
+    // WorkerResult contract (pi-worker-prompt rule 6): for status=completed,
+    // commitHash must equal the actual worktree HEAD. Fail closed on any
+    // placeholder/random hash, matching what the prompt promises.
+    if (input.workerResult.status === 'completed') {
+      const expected = input.workerResult.commitHash?.trim();
+      if (!expected) {
+        await this.blockUnverifiableCompletion(input, 'worker_completed_without_commit_hash', {
+          branchName: Boolean(input.branchName),
+          changedFileCount: input.changedFiles.length,
+        });
+        return false;
+      }
+      try {
+        const actualHead = git(input.worktreePath, ['rev-parse', 'HEAD']).trim();
+        if (expected !== actualHead) {
+          await this.blockUnverifiableCompletion(input, 'worker_commit_hash_mismatch', {
+            expectedCommitHash: expected,
+            worktreeHead: actualHead,
+            branchName: Boolean(input.branchName),
+          });
+          return false;
+        }
+      } catch {
+        await this.blockUnverifiableCompletion(input, 'worker_commit_hash_unverifiable', {
+          branchName: Boolean(input.branchName),
+        });
+        return false;
+      }
+    }
+
     const expected = input.spec.estimatedWritePaths || [];
     const touchesExpectedPath = expected.some((expectedPath) => input.changedFiles.some((changedPath) =>
       changedPath === expectedPath || changedPath.startsWith(expectedPath.endsWith('/') ? expectedPath : expectedPath + '/'),

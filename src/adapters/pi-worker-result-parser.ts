@@ -64,6 +64,17 @@ export function parseWorkerResult(rawOutput: string): ParseResult {
 }
 
 /**
+ * Lenient extraction: return the raw WorkerResult-shaped object WITHOUT schema
+ * validation. Used by callers that need to inspect status/commitHash before
+ * deciding whether evidence (e.g. worktree HEAD) can complete the result.
+ */
+export function extractWorkerResultObject(rawOutput: string): unknown | null {
+  const marked = extractFromMarkedBlock(rawOutput);
+  if (marked) return marked;
+  return extractLastJsonObject(rawOutput);
+}
+
+/**
  * Extract JSON from between BEGIN_WORKER_RESULT_JSON and END_WORKER_RESULT_JSON markers.
  */
 function extractFromMarkedBlock(output: string): unknown | null {

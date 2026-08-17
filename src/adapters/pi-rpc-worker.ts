@@ -288,7 +288,14 @@ class MarkedTextAccumulator {
 
     const finish = this.captured.indexOf(this.end, this.begin.length);
     if (finish < 0) return null;
-    return this.captured.slice(0, finish + this.end.length);
+    const block = this.captured.slice(0, finish + this.end.length);
+    // Consume the returned block so a LATER marked block in the same stream can
+    // still be captured (an early fragment must not starve the complete one).
+    const tail = this.captured.slice(finish + this.end.length);
+    this.captured = '';
+    this.capturing = false;
+    if (tail) this.push(tail);
+    return block;
   }
 }
 

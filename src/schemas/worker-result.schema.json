@@ -36,5 +36,15 @@
         "cacheHitTokens": { "type": "integer", "minimum": 0 }
       }
     }
+  },
+  "if": {
+    "properties": { "status": { "const": "completed" } },
+    "required": ["status"]
+  },
+  "then": {
+    "required": ["commitHash"],
+    "properties": {
+      "commitHash": { "type": "string", "minLength": 1 }
+    }
   }
 }
