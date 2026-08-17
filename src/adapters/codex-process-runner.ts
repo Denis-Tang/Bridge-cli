@@ -152,17 +152,84 @@ async function terminateProcessTree(pid: number): Promise<void> {
 }
 
 /**
+ * Extract the expected taskId from a Codex review prompt.
+ *
+ * The review prompt's first line is:
+ *   Review the following git diff for task ${taskId}.
+ * Fall back to the example JSON field `"taskId": "${taskId}"` if needed.
+ */
+export function extractCodexReviewTaskId(input?: string): string | null {
+  if (!input) return null;
+  const firstLine = REVIEW_TASK_ID_FIRST_LINE_RE.exec(input);
+  if (firstLine) return firstLine[1].trim();
+  const jsonField = REVIEW_TASK_ID_JSON_RE.exec(input);
+  if (jsonField) return jsonField[1];
+  return null;
+}
+
+export interface CodexReviewMarkerPayload {
+  taskId: string;
+  status: 'approved' | 'rework_required';
+  reviewSummary: string;
+  findings: string[];
+  requiredRework: string[];
+  qualityGateStatus: 'passed' | 'failed';
+  mergeAllowed: boolean;
+}
+
+/**
+ * Serialize a strict Codex review marker block.
+ */
+export function formatCodexReviewResultMarker(result: CodexReviewMarkerPayload): string {
+  return ['BEGIN_REVIEW_RESULT_JSON', JSON.stringify(result), 'END_REVIEW_RESULT_JSON'].join('\n');
+}
+
+/**
+ * Build an approved Codex review marker for a task.
+ */
+export function formatApprovedCodexReviewMarker(taskId: string): string {
+  return formatCodexReviewResultMarker({
+    taskId,
+    status: 'approved',
+    reviewSummary: 'No issues found.',
+    findings: [],
+    requiredRework: [],
+    qualityGateStatus: 'passed',
+    mergeAllowed: true,
+  });
+}
+
+/**
+ * Build a rework-required Codex review marker for a task.
+ */
+export function formatReworkCodexReviewMarker(taskId: string, issue: string): string {
+  return formatCodexReviewResultMarker({
+    taskId,
+    status: 'rework_required',
+    reviewSummary: 'Review found required rework.',
+    findings: [issue],
+    requiredRework: [issue],
+    qualityGateStatus: 'failed',
+    mergeAllowed: false,
+  });
+}
+
+const REVIEW_TASK_ID_FIRST_LINE_RE = /^Review the following git diff for task (.+)\.\r?$/m;
+const REVIEW_TASK_ID_JSON_RE = /"taskId"\s*:\s*"([^"]+)"/;
+
+/**
  * FakeCodexProcessRunner — for testing. Returns pre-configured results,
  * optionally including tokenUsage metadata for confirmed-actual ledger testing.
  */
 export class FakeCodexProcessRunner implements CodexProcessRunner {
   private results: Map<string, CodexProcessRunResult> = new Map();
   private defaultResult: CodexProcessRunResult = {
-    stdout: 'fake codex output',
+    stdout: '',
     stderr: '',
     exitCode: 0,
     durationMs: 100,
   };
+  private defaultResultSet = false;
 
   setResultFor(command: string, args: string[], result: CodexProcessRunResult): void {
     this.results.set(`${command} ${args.join(' ')}`, result);
@@ -170,6 +237,7 @@ export class FakeCodexProcessRunner implements CodexProcessRunner {
 
   setDefaultResult(result: CodexProcessRunResult): void {
     this.defaultResult = result;
+    this.defaultResultSet = true;
   }
 
   getDefaultResult(): CodexProcessRunResult {
@@ -179,9 +247,21 @@ export class FakeCodexProcessRunner implements CodexProcessRunner {
   async run(
     command: string,
     args: string[],
-    _opts: { cwd: string; timeoutMs: number; input?: string; maxBuffer?: number; env?: Record<string, string>; signal?: AbortSignal },
+    opts: { cwd: string; timeoutMs: number; input?: string; maxBuffer?: number; env?: Record<string, string>; signal?: AbortSignal },
   ): Promise<CodexProcessRunResult> {
     const key = `${command} ${args.join(' ')}`;
-    return this.results.get(key) ?? { ...this.defaultResult };
+    const configured = this.results.get(key);
+    if (configured) return { ...configured };
+    if (this.defaultResultSet) return { ...this.defaultResult };
+
+    // Fail closed instead of silently auto-approving a review prompt: an
+    // unconfigured fake must not make missing test setup look like a successful
+    // Codex review (which would hide regressions in failure/unavailable paths).
+    return {
+      stdout: '',
+      stderr: 'fake codex runner: no result configured for this invocation',
+      exitCode: 1,
+      durationMs: 100,
+    };
   }
 }

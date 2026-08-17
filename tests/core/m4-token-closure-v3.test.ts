@@ -15,7 +15,11 @@ import { ensureDefaultPolicies, setPerRunBudget } from '../../src/core/budget-po
 import { StageScheduler } from '../../src/core/stage-scheduler.js';
 import type { WorkerResult } from '../../src/types/protocol.js';
 import { FakeProcessRunner } from '../../src/adapters/pi-rpc-worker.js';
-import { FakeCodexProcessRunner, type CodexProcessRunResult } from '../../src/adapters/codex-process-runner.js';
+import {
+  FakeCodexProcessRunner,
+  type CodexProcessRunResult,
+  formatApprovedCodexReviewMarker,
+} from '../../src/adapters/codex-process-runner.js';
 import { CodexCliBrain } from '../../src/adapters/codex-cli-brain.js';
 import { CodexCliReviewer } from '../../src/adapters/codex-cli-reviewer.js';
 
@@ -332,7 +336,7 @@ describe('M4 Token Ledger v3 — Business Path Closure', () => {
       // Simulate review that burns tokens
       const fakeRunner = new FakeCodexProcessRunner();
       fakeRunner.setDefaultResult({
-        stdout: 'No issues found.', stderr: '', exitCode: 0, durationMs: 120,
+        stdout: formatApprovedCodexReviewMarker('task-g3'), stderr: '', exitCode: 0, durationMs: 120,
         tokenUsage: { inputTokens: 300, outputTokens: 150, cacheHitTokens: 50 }, // 500 > 200
       });
 
@@ -380,7 +384,7 @@ describe('M4 Token Ledger v3 — Business Path Closure', () => {
 
       const fakeRunner = new FakeCodexProcessRunner();
       fakeRunner.setDefaultResult({
-        stdout: 'No issues.', stderr: '', exitCode: 0, durationMs: 100,
+        stdout: formatApprovedCodexReviewMarker('task-g3-ok'), stderr: '', exitCode: 0, durationMs: 100,
         tokenUsage: { inputTokens: 100, outputTokens: 50 },
       });
 

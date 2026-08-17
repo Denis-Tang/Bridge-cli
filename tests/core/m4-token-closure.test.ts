@@ -27,6 +27,7 @@ import {
   FakeCodexProcessRunner,
   type CodexProcessRunner,
   type CodexProcessRunResult,
+  formatApprovedCodexReviewMarker,
 } from '../../src/adapters/codex-process-runner.js';
 import { CodexCliBrain } from '../../src/adapters/codex-cli-brain.js';
 import { CodexCliReviewer } from '../../src/adapters/codex-cli-reviewer.js';
@@ -458,7 +459,7 @@ describe('M4 Token Ledger Closure v2', () => {
     it('D1: writes estimate BEFORE external call, confirmed when tokenUsage present', async () => {
       const fakeRunner = new FakeCodexProcessRunner();
       fakeRunner.setDefaultResult({
-        stdout: 'No issues found. The diff looks correct.',
+        stdout: formatApprovedCodexReviewMarker('task-d1'),
         stderr: '', exitCode: 0, durationMs: 120,
         tokenUsage: { inputTokens: 800, outputTokens: 400, cacheHitTokens: 100 },
       });
@@ -481,7 +482,7 @@ describe('M4 Token Ledger Closure v2', () => {
     it('D2: marks unavailable when no tokenUsage', async () => {
       const fakeRunner = new FakeCodexProcessRunner();
       fakeRunner.setDefaultResult({
-        stdout: 'No issues found.', stderr: '', exitCode: 0, durationMs: 100,
+        stdout: formatApprovedCodexReviewMarker('task-d2'), stderr: '', exitCode: 0, durationMs: 100,
       });
 
       const reviewer = new CodexCliReviewer(
@@ -523,7 +524,7 @@ describe('M4 Token Ledger Closure v2', () => {
     it('D4: no sink → no ledger', async () => {
       const fakeRunner = new FakeCodexProcessRunner();
       fakeRunner.setDefaultResult({
-        stdout: 'ok', stderr: '', exitCode: 0, durationMs: 10,
+        stdout: formatApprovedCodexReviewMarker('task-d4'), stderr: '', exitCode: 0, durationMs: 10,
       });
 
       const reviewer = new CodexCliReviewer(
@@ -564,6 +565,7 @@ describe('M4 Token Ledger Closure v2', () => {
       status: 'completed',
       summary: 'done',
       filesChanged: [],
+      commitHash: 'abc1234',
       checks: [],
       scopeViolations: [],
       risks: [],
@@ -577,6 +579,7 @@ describe('M4 Token Ledger Closure v2', () => {
       status: 'completed',
       summary: 'done',
       filesChanged: [],
+      commitHash: 'abc1234',
       checks: [],
       scopeViolations: [],
       risks: [],

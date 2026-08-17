@@ -6,6 +6,7 @@ import type { LedgerSink, InvocationContext } from '../core/token-telemetry.js';
 import { estimateForCallType } from '../core/token-telemetry.js';
 import type { CodexProcessRunner } from './codex-process-runner.js';
 import { RealCodexProcessRunner } from './codex-process-runner.js';
+import { parseReviewResult } from './codex-review-result-parser.js';
 
 /**
  * Configuration for the Codex CLI Reviewer.
@@ -27,61 +28,48 @@ export interface CodexCliReviewerConfig {
   signal?: AbortSignal;
 }
 
-export function parseCodexCliReviewOutput(output: string, taskId: string): ReviewResult {
-  const lines = output.split('\n');
-  const lowerOutput = output.toLowerCase();
+const UNAVAILABLE_REVIEW_SUMMARY =
+  '[reviewer: codex-cli] Review output could not be parsed into a valid ReviewResult.';
+const UNAVAILABLE_FINDING =
+  'Review output could not be parsed into a valid ReviewResult.';
 
-  const hasNoIssueStatement =
-    /\bno\s+(?:discrete\s+)?(?:correctness\s+)?issues?\b/.test(lowerOutput) ||
-    /\bno\s+(?:actionable\s+)?(?:problems?|findings?|warnings?|errors?)\b/.test(lowerOutput) ||
-    /\bno\s+.*\bissues?\s+(?:is|are)\s+evident\b/.test(lowerOutput) ||
-    /\bno\s+.*\bissues?\s+(?:found|detected)\b/.test(lowerOutput);
-
-  const hasIssueKeyword =
-    /\b(issue|warning|error|problem|bug|regression|security|leak|conflict)\b/.test(lowerOutput);
-
-  const hasActionableLanguage =
-    /\b(must|should|needs?|requires?|required|fix|change|blocker|failing|failed|incorrect|unsafe)\b/.test(lowerOutput);
-
-  const findings: string[] = [];
-  const requiredRework: string[] = [];
-
-  // Try to extract bullet-point findings
-  const findingRegex = /(?:^|\n)\s*[-*]\s*(.+)/g;
-  let match: RegExpExecArray | null;
-  while ((match = findingRegex.exec(output)) !== null) {
-    const text = match[1].trim();
-    if (text.length > 0 && text.length < 200) {
-      findings.push(text);
-      const lowerText = text.toLowerCase();
-      const bulletLooksActionable =
-        /\b(issue|warning|error|problem|bug|regression|security|leak|conflict)\b/.test(lowerText) &&
-        !/\bno\s+(?:actionable\s+)?(?:issues?|problems?|findings?|warnings?|errors?)\b/.test(lowerText);
-      if (bulletLooksActionable) {
-        requiredRework.push(text);
-      }
-    }
+function tryParseCodexCliReviewOutput(
+  output: string,
+  taskId: string,
+): { success: boolean; result: ReviewResult } {
+  const parsed = parseReviewResult(output, taskId);
+  if (parsed.success && parsed.result) {
+    return {
+      success: true,
+      result: { ...parsed.result, reviewer: 'codex-cli' },
+    };
   }
-
-  // If no structured findings found, use the output as-is
-  if (findings.length === 0) {
-    findings.push(`Codex CLI output (${lines.length} lines)`);
-  }
-
-  const approved = hasNoIssueStatement
-    ? requiredRework.length === 0
-    : !hasIssueKeyword || (requiredRework.length === 0 && !hasActionableLanguage);
 
   return {
-    taskId,
-    status: approved ? 'approved' : 'rework_required',
-    reviewSummary: `[reviewer: codex-cli] ${approved ? '审查通过' : '审查发现问题'} — ${findings.length} 项, ${requiredRework.length} 项需修改`,
-    findings,
-    requiredRework,
-    qualityGateStatus: approved ? 'passed' : 'failed',
-    mergeAllowed: approved,
-    reviewer: 'codex-cli',
+    success: false,
+    result: {
+      taskId,
+      status: 'rejected',
+      reviewSummary: UNAVAILABLE_REVIEW_SUMMARY,
+      findings: [UNAVAILABLE_FINDING],
+      requiredRework: [],
+      qualityGateStatus: 'failed',
+      mergeAllowed: false,
+      reviewer: 'codex-cli',
+      reviewerUnavailable: true,
+    },
   };
+}
+
+/**
+ * Parse Codex CLI review output into a ReviewResult.
+ *
+ * Delegates to the strict marker parser. A successful parse always reports
+ * `reviewer: 'codex-cli'`. Any parse, schema, or semantic failure is converted
+ * to a sanitized unavailable ReviewResult that never leaks raw output.
+ */
+export function parseCodexCliReviewOutput(output: string, taskId: string): ReviewResult {
+  return tryParseCodexCliReviewOutput(output, taskId).result;
 }
 
 /**
@@ -174,8 +162,38 @@ export class CodexCliReviewer {
     mkdirSync(this.config.sessionDir, { recursive: true });
     const reviewLogPath = resolve(this.config.sessionDir, `${taskId}_codex-review.log`);
 
-    // Build a review prompt with the diff content
-    const reviewPrompt = `Review the following git diff for task ${taskId}:\n\n\`\`\`diff\n${diff}\n\`\`\`\n\nProvide a structured review result.`;
+    // Build a strict, structured review prompt. The parser accepts exactly one
+    // BEGIN_REVIEW_RESULT_JSON / END_REVIEW_RESULT_JSON block and ignores all
+    // text outside it, so the instructions make that contract explicit.
+    const reviewPrompt = `Review the following git diff for task ${taskId}.
+
+Respond with exactly one review result block. The block must consist of a line containing exactly BEGIN_REVIEW_RESULT_JSON, followed by a single JSON object, followed by a line containing exactly END_REVIEW_RESULT_JSON. Do not add any other BEGIN_REVIEW_RESULT_JSON or END_REVIEW_RESULT_JSON lines, and do not put anything else between the markers.
+
+Example:
+BEGIN_REVIEW_RESULT_JSON
+{
+  "taskId": "${taskId}",
+  "status": "approved",
+  "reviewSummary": "...",
+  "findings": [],
+  "requiredRework": [],
+  "qualityGateStatus": "passed",
+  "mergeAllowed": true
+}
+END_REVIEW_RESULT_JSON
+
+Required fields: taskId, status, reviewSummary, findings, requiredRework, qualityGateStatus, mergeAllowed. taskId must be exactly "${taskId}". status must be one of: approved, rework_required, rejected, needs_user_decision. qualityGateStatus must be one of: passed, failed, skipped. findings and requiredRework must be arrays of non-empty strings (use [] when there is nothing to report). reviewSummary must be a non-empty string. mergeAllowed must be a boolean.
+
+Semantic rules:
+- approved requires "qualityGateStatus": "passed", "mergeAllowed": true, and "requiredRework": [].
+- rework_required requires "qualityGateStatus": "failed", "mergeAllowed": false, and at least one non-empty item in "requiredRework".
+- rejected and needs_user_decision require "mergeAllowed": false.
+
+Diff to review:
+\`\`\`diff
+${diff}
+\`\`\`
+`;
 
     // ── M4: Write estimate BEFORE calling external process ──
     let entryId: string | null = null;
@@ -224,15 +242,17 @@ export class CodexCliReviewer {
         throw new Error(failureReason);
       }
 
-      const parsed = this.parseCodexReviewOutput(result.stdout, taskId);
-      parsed.executionMetadata = {
-        exitCode: result.exitCode,
-        durationMs: result.durationMs,
-        stderrHash: hashDiagnostic(result.stderr),
-      };
+      const parsed = tryParseCodexCliReviewOutput(result.stdout, taskId);
+      if (parsed.success) {
+        parsed.result.executionMetadata = {
+          exitCode: result.exitCode,
+          durationMs: result.durationMs,
+          stderrHash: hashDiagnostic(result.stderr),
+        };
+      }
       writeFileSync(reviewLogPath, JSON.stringify({
-        status: parsed.status,
-        mergeAllowed: parsed.mergeAllowed,
+        status: parsed.result.status,
+        mergeAllowed: parsed.result.mergeAllowed,
         durationMs: result.durationMs,
         stdoutLength: result.stdout.length,
         stderrLength: result.stderr.length,
@@ -259,7 +279,7 @@ export class CodexCliReviewer {
         }
       }
 
-      return parsed;
+      return parsed.result;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       const safeErrMsg = /^Codex CLI (?:timed out|exited with code)/.test(errMsg)
@@ -298,12 +318,6 @@ export class CodexCliReviewer {
     }
   }
 
-  /**
-   * Parse Codex CLI review output into a ReviewResult.
-   */
-  private parseCodexReviewOutput(output: string, taskId: string): ReviewResult {
-    return parseCodexCliReviewOutput(output, taskId);
-  }
 }
 
 function hashDiagnostic(value: string): string | null {

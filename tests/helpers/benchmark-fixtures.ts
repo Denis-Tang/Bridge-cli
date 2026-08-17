@@ -14,7 +14,12 @@ import { resetGovernanceConfigCache, setGovernanceEnabled } from '../../src/core
 import { StageScheduler } from '../../src/core/stage-scheduler.js';
 import { FakeProcessRunner } from '../../src/adapters/pi-rpc-worker.js';
 import type { ProcessRunInput, ProcessRunResult } from '../../src/adapters/pi-worker-types.js';
-import { FakeCodexProcessRunner, type CodexProcessRunResult } from '../../src/adapters/codex-process-runner.js';
+import {
+  FakeCodexProcessRunner,
+  type CodexProcessRunResult,
+  extractCodexReviewTaskId,
+  formatApprovedCodexReviewMarker,
+} from '../../src/adapters/codex-process-runner.js';
 import type { StructuredTaskSpec } from '../../src/types/m2-types.js';
 import type { ExecutionMode } from '../../src/types/m2-types.js';
 import type { WorkerResult } from '../../src/types/protocol.js';
@@ -143,8 +148,12 @@ export class BenchPiRunner extends FakeProcessRunner {
     // Write deterministic content
     mkdirSync(path.join(input.cwd, path.dirname(file)), { recursive: true });
     writeFileSync(path.join(input.cwd, file), taskContent(taskId), 'utf-8');
-    execSync(`git add ${file}`, { cwd: input.cwd, stdio: 'pipe' });
-    execSync(`git commit -qm "bench pi ${taskId}"`, { cwd: input.cwd, stdio: 'pipe' });
+    let commitHash = '';
+    try {
+      execSync(`git add ${file}`, { cwd: input.cwd, stdio: 'pipe' });
+      execSync(`git commit -qm "bench pi ${taskId}"`, { cwd: input.cwd, stdio: 'pipe' });
+      commitHash = execSync('git rev-parse HEAD', { cwd: input.cwd, stdio: 'pipe', encoding: 'utf-8' }).trim();
+    } catch { /* worktree may not have git yet */ }
 
     const endTime = Date.now();
     this.callEndTimes.set(taskId, endTime);
@@ -152,6 +161,7 @@ export class BenchPiRunner extends FakeProcessRunner {
     const result: WorkerResult = {
       taskId, status: 'completed', summary: `fake Pi wrote ${file}`,
       filesChanged: [file],
+      commitHash,
       checks: [{ name: 'fake', status: 'passed', summary: 'ok' }],
       scopeViolations: [], risks: [], unresolvedQuestions: [],
       productDecisionRequired: false,
@@ -185,11 +195,16 @@ export class BenchCodexRunner extends FakeCodexProcessRunner {
     super();
   }
 
-  override async run(): Promise<CodexProcessRunResult> {
+  override async run(
+    _command: string,
+    _args: string[],
+    opts: { cwd: string; timeoutMs: number; input?: string; maxBuffer?: number; env?: Record<string, string>; signal?: AbortSignal },
+  ): Promise<CodexProcessRunResult> {
     this.calls++;
     await new Promise((r) => setTimeout(r, this.delayMs));
+    const taskId = extractCodexReviewTaskId(opts.input) ?? 'unknown-task';
     return {
-      stdout: 'ok',
+      stdout: formatApprovedCodexReviewMarker(taskId),
       stderr: '',
       exitCode: 0,
       durationMs: this.delayMs,

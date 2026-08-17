@@ -54,6 +54,11 @@ export const recoverCommand = new Command('recover')
       if (!branch) throw new Error('recovery branch is missing; pass --branch');
       if (normalizePath(worktree) !== normalizePath(provenance.expectedWorktree)) throw new Error('recovery worktree does not match immutable attempt provenance');
       if (branch !== provenance.expectedBranch) throw new Error('recovery branch does not match immutable attempt provenance');
+      if (provenance.isLegacyBackfill) {
+        console.warn('[recover] 该 attempt 的 provenance 由迁移 015 从库内既有证据回填：'
+          + 'run/stage/task、分支、worktree、base commit 均已校验，'
+          + '但 task packet 与 implementation prompt 摘要无法重建，其完整性本次不作校验。');
+      }
 
       const commit = git(projectRoot, ['rev-parse', '--verify', `${options.commit}^{commit}`]);
       git(projectRoot, ['merge-base', '--is-ancestor', provenance.baseCommit, commit]);
@@ -109,6 +114,7 @@ export const recoverCommand = new Command('recover')
           source: options.source as 'manual' | 'codex_recovery', changedFiles,
           lockPaths: scopeDecision.lockPaths,
           workerResult,
+          legacyProvenanceBackfill: provenance.isLegacyBackfill,
           decisionNote: scopeDecision.requiresDecision ? options.decisionNote!.trim() : null,
           scopeExpansionFiles: scopeDecision.expandedFiles,
           expectedState: {
@@ -137,7 +143,66 @@ interface RecoveryContext {
     attemptId: string; runId: string; stageId: string; taskId: string; baseCommit: string;
     expectedBranch: string; expectedWorktree: string; taskPacketHash: string;
     implementationPromptHash: string; workerId: string; sessionId: string;
+    /** Backfilled by migration 015: identity is verified, packet/prompt digests are not recoverable. */
+    isLegacyBackfill: boolean;
   };
+}
+
+/** Sentinel written by migration 015 where a pre-012 digest cannot be reconstructed. */
+export const LEGACY_PROVENANCE_SENTINEL = 'legacy:unavailable';
+
+interface ReviewGateDb {
+  prepare(sql: string): {
+    get(...params: unknown[]): Record<string, unknown> | undefined;
+  };
+}
+
+/**
+ * Fail-closed gate for restoring an attempt from rework_required.
+ *
+ * The authoritative recovery decision comes from the latest review_json for the
+ * attempt (reviews.attempt_id = attemptId, most recent created_at). Recovery is
+ * permitted when the attempt has no task-level review row. When a review row
+ * exists, recovery is allowed only when that review's status is exactly
+ * 'rework_required' with a requiredRework array (the strict parser guarantees
+ * rework_required reviews always carry a non-empty requiredRework list, so the
+ * gate must accept any array rather than requiring an empty one).
+ */
+function assertReworkRequiredRecoveryAllowed(db: ReviewGateDb, attemptId: string): void {
+  const reviewsTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='reviews'")
+    .get() as { name?: string } | undefined;
+  if (!reviewsTable) {
+    throw new Error('rework_required recovery requires latest review: reviews table is missing');
+  }
+  const latestReview = db.prepare(
+    'SELECT review_json FROM reviews WHERE attempt_id = ? ORDER BY created_at DESC LIMIT 1',
+  ).get(attemptId) as { review_json?: string | null } | undefined;
+  if (!latestReview) {
+    // No task-level review exists for this attempt; an empty review query
+    // permits recovery for a rework_required attempt.
+    return;
+  }
+  if (latestReview.review_json == null) {
+    throw new Error('rework_required recovery requires latest review: latest review_json is missing');
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(latestReview.review_json);
+  } catch {
+    throw new Error('rework_required recovery requires latest review: invalid review_json');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('rework_required recovery requires latest review: invalid review_json');
+  }
+  const review = parsed as { status?: unknown; requiredRework?: unknown };
+  // The strict parser (parseReviewResult) requires a rework_required review to
+  // carry a non-empty requiredRework array, so a real review can never produce
+  // an empty requiredRework here. Requiring length === 0 would make recovery
+  // from any real rework_required attempt dead-locked. Recovery is an explicit
+  // manual operation (user supplies the commit), so only the status must match.
+  if (review.status !== 'rework_required' || !Array.isArray(review.requiredRework)) {
+    throw new Error('rework_required recovery requires latest review with status rework_required and a requiredRework array');
+  }
 }
 
 /** Read the minimum recovery context without WAL changes or pending migrations. */
@@ -161,7 +226,12 @@ export function readRecoveryContextReadOnly(dbPath: string, attemptId: string): 
     const provenanceTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='attempt_provenance'").get() as { name?: string } | undefined;
     if (!provenanceTable) throw new Error('attempt provenance missing; legacy recovery requires a protected manual decision');
     const provenance = db.prepare('SELECT * FROM attempt_provenance WHERE attempt_id = ?').get(attemptId) as Record<string, unknown> | undefined;
-    if (!provenance) throw new Error('attempt provenance missing; recovery fails closed');
+    if (!provenance) {
+      throw new Error('attempt provenance missing; recovery fails closed. '
+        + 'If this attempt predates migration 012, run `brainctl db migrate --apply` to backfill it '
+        + 'from the branch/worktree/diff-base evidence already in this database; '
+        + 'an attempt without that evidence stays unrecoverable by design.');
+    }
     if (String(provenance.run_id) !== String(run.id) || String(provenance.stage_id) !== String(stage.id)
       || String(provenance.task_id) !== String(task.id)) {
       throw new Error('attempt provenance identity does not match run/stage/task');
@@ -170,6 +240,9 @@ export function readRecoveryContextReadOnly(dbPath: string, attemptId: string): 
       .get(String(task.id)) as { id?: string } | undefined;
     if (String(latestAttempt?.id ?? '') !== String(attempt.id)) {
       throw new Error(`attempt ${attemptId} is not the latest attempt for task ${String(task.id)}`);
+    }
+    if (String(attempt.status) === 'rework_required') {
+      assertReworkRequiredRecoveryAllowed(db, attemptId);
     }
 
     let specJson: StructuredTaskSpec;
@@ -198,6 +271,8 @@ export function readRecoveryContextReadOnly(dbPath: string, attemptId: string): 
         expectedBranch: String(provenance.expected_branch), expectedWorktree: String(provenance.expected_worktree),
         taskPacketHash: String(provenance.task_packet_hash), implementationPromptHash: String(provenance.implementation_prompt_hash),
         workerId: String(provenance.worker_id), sessionId: String(provenance.session_id),
+        isLegacyBackfill: String(provenance.task_packet_hash) === LEGACY_PROVENANCE_SENTINEL
+          || String(provenance.implementation_prompt_hash) === LEGACY_PROVENANCE_SENTINEL,
       },
     };
   } finally {
@@ -288,8 +363,9 @@ function lockId(runId: string, taskId: string, filePath: string): string {
 
 export function adoptRecoveryAtomically(store: SqliteStateStore, input: {
   runId: string; stageId: string; taskId: string; attemptId: string; worktree: string; branch: string;
-  commit: string; source: 'manual' | 'codex_recovery'; changedFiles: string[]; lockPaths: string[];
+  commit: string; source: 'manual' | 'codex_recovery' | 'worker_auto_recovery'; changedFiles: string[]; lockPaths: string[];
   workerResult: WorkerResult; decisionNote: string | null; scopeExpansionFiles?: string[];
+  legacyProvenanceBackfill?: boolean;
   expectedState?: { runStatus: string; stageStatus: string; taskStatus: string; attemptStatus: string };
 }): string {
   const db = store.getDatabase();
@@ -320,8 +396,11 @@ export function adoptRecoveryAtomically(store: SqliteStateStore, input: {
     if (['completed', 'failed', 'canceled'].includes(stageStatus)) {
       throw new Error(`recovery cannot pause terminal stage: ${stageStatus}`);
     }
-    if (!['failed', 'interrupted', 'running', 'worker_completed'].includes(attemptStatus)) {
+    if (!['failed', 'interrupted', 'running', 'worker_completed', 'rework_required'].includes(attemptStatus)) {
       throw new Error(`recovery attempt status is not adoptable: ${attemptStatus}`);
+    }
+    if (attemptStatus === 'rework_required') {
+      assertReworkRequiredRecoveryAllowed(db, input.attemptId);
     }
     if (!['failed', 'rework_required', 'waiting_decision', 'running', 'worker_completed'].includes(taskStatus)) {
       throw new Error(`recovery task status is not adoptable: ${taskStatus}`);
@@ -402,6 +481,7 @@ export function adoptRecoveryAtomically(store: SqliteStateStore, input: {
       VALUES (?, ?, ?, ?, ?, 'recovery_adopted', ?, ?)`)
       .run(`${input.runId}-ev-recovery-${Date.now()}-${randomUUID()}`, input.runId, input.stageId, input.taskId, input.attemptId,
         JSON.stringify({ source: input.source, commit: input.commit, changedFileCount: canonicalPathList(input.changedFiles).length,
+          legacyProvenanceBackfill: input.legacyProvenanceBackfill === true,
           decision: input.decisionNote ? {
             type: 'scope_expansion', note: input.decisionNote,
             expandedFileCount: canonicalPathList(input.scopeExpansionFiles ?? []).length,
@@ -423,4 +503,145 @@ function canonicalPathList(paths: string[]): string[] {
 
 function hashPathList(paths: string[]): string {
   return createHash('sha256').update(canonicalPathList(paths).join('\n')).digest('hex');
+}
+
+// ══════════════════════════════════════════════════════════════
+// Auto evidence-based adoption (task 02): Pi committed but
+// WorkerResult/commitHash was lost → automatically verify the
+// worktree HEAD commit and adopt it as a recovery candidate,
+// exactly equivalent to `recover attempt --commit <HEAD>` but
+// without the human typing the command. Never fakes completion:
+// without a verifiable commit the path fails closed.
+// ══════════════════════════════════════════════════════════════
+
+export interface AutoAdoptOutcome {
+  adopted: boolean;
+  reason?: string;
+  commit?: string;
+  pauseId?: string;
+}
+
+/**
+ * Automatically adopt a verifiable worktree-HEAD commit for an attempt whose
+ * WorkerResult is missing. Runs the same provenance/scope/claim/quality-gate
+ * validation as `recover attempt --commit` (source = worker_auto_recovery).
+ * Returns adopted=false (never throws) when the evidence is not verifiable.
+ */
+export async function autoAdoptVerifiableCommitEvidence(input: {
+  store: SqliteStateStore;
+  attemptId: string;
+  projectRoot?: string;
+  /** Override worktree path (defaults to immutable attempt provenance). */
+  worktree?: string;
+  /** Override branch (defaults to immutable attempt provenance). */
+  branch?: string;
+}): Promise<AutoAdoptOutcome> {
+  const { store, attemptId } = input;
+  try {
+    const dbPath = store.getPath();
+    const context = readRecoveryContextReadOnly(dbPath, attemptId);
+    const { attempt, task, stage, run, provenance } = context;
+    if (['completed', 'failed', 'canceled'].includes(run.status)) {
+      return { adopted: false, reason: 'terminal run cannot adopt recovery' };
+    }
+    if (!['failed', 'interrupted', 'running', 'worker_completed', 'rework_required'].includes(attempt.status)) {
+      return { adopted: false, reason: `attempt status not adoptable: ${attempt.status}` };
+    }
+    // Only auto-adopt when the WorkerResult is genuinely missing.
+    const attemptRow = await store.getAttempt(attemptId);
+    if (attemptRow?.workerResultJson && attemptRow.workerResultJson.trim()) {
+      return { adopted: false, reason: 'worker result already present' };
+    }
+
+    const projectRoot = resolve(input.projectRoot ?? run.projectRoot);
+    if (normalizePath(projectRoot) !== normalizePath(run.projectRoot)) {
+      return { adopted: false, reason: '--project does not match the run projectRoot' };
+    }
+    const worktree = resolve(input.worktree ?? provenance.expectedWorktree);
+    if (!existsSync(worktree)) return { adopted: false, reason: 'recovery worktree does not exist' };
+    const branch = input.branch ?? provenance.expectedBranch;
+    if (!branch) return { adopted: false, reason: 'recovery branch is missing' };
+
+    const commit = git(worktree, ['rev-parse', 'HEAD']);
+    if (normalizePath(worktree) !== normalizePath(provenance.expectedWorktree)) {
+      return { adopted: false, reason: 'recovery worktree does not match immutable attempt provenance' };
+    }
+    if (branch !== provenance.expectedBranch) {
+      return { adopted: false, reason: 'recovery branch does not match immutable attempt provenance' };
+    }
+    git(projectRoot, ['merge-base', '--is-ancestor', provenance.baseCommit, commit]);
+    const head = git(worktree, ['rev-parse', 'HEAD']);
+    if (head !== commit) return { adopted: false, reason: `worktree HEAD ${head} does not match candidate commit ${commit}` };
+    const actualBranch = git(worktree, ['branch', '--show-current']);
+    if (actualBranch !== branch) {
+      return { adopted: false, reason: `worktree branch ${actualBranch || '(detached)'} does not match ${branch}` };
+    }
+    if (git(worktree, ['status', '--porcelain'])) return { adopted: false, reason: 'recovery worktree is not clean' };
+    git(projectRoot, ['diff', '--check', `${provenance.baseCommit}..${commit}`, '--']);
+
+    const changedFiles = git(projectRoot, ['diff', '--name-only', `${provenance.baseCommit}..${commit}`, '--'])
+      .split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    if (changedFiles.length === 0) return { adopted: false, reason: 'adopted commit has no diff from the stage base' };
+
+    const spec = task.specJson;
+    const runtime = loadRuntimeProjectConfig(projectRoot, { snapshotText: run.executionConfigSnapshot });
+    let scopeDecision: RecoveryScopeDecision;
+    try {
+      scopeDecision = validateRecoveryScope({
+        changedFiles,
+        estimatedWritePaths: spec.estimatedWritePaths ?? [],
+        taskAllowedPaths: spec.allowedPaths ?? [],
+        taskForbiddenPaths: spec.forbiddenPaths ?? [],
+        projectAllowedPaths: runtime.resolved.allowedPaths,
+        projectForbiddenPaths: runtime.resolved.forbiddenPaths,
+        sharedLocks: runtime.resolved.sharedLocks,
+        repositoryRoot: projectRoot,
+        // Auto adoption never auto-approves scope expansion; the candidate must
+        // already stay inside the frozen TaskSpec scope, otherwise fail closed.
+        allowScopeExpansion: false,
+      });
+    } catch (error) {
+      return {
+        adopted: false,
+        reason: `candidate scope validation failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+
+    const gates = qualityGatesToRunnerConfig(runtime.resolved.qualityGatesTask);
+    if (gates.length === 0) return { adopted: false, reason: 'task quality gates are not configured' };
+    const gateResult = await new QualityGateRunner(worktree).runGates(gates, true);
+    if (!gateResult.passed) return { adopted: false, reason: `task quality gates failed: ${gateResult.summary}` };
+    if (git(worktree, ['status', '--porcelain'])) return { adopted: false, reason: 'quality gates modified the recovery worktree; clean it and retry' };
+    if (git(worktree, ['rev-parse', 'HEAD']) !== commit) return { adopted: false, reason: 'quality gates changed worktree HEAD' };
+
+    const workerResult: WorkerResult = {
+      taskId: task.id, status: 'completed',
+      summary: `Auto-adopted verifiable worktree HEAD commit ${commit.slice(0, 12)}; normal review and integration still required`,
+      filesChanged: changedFiles, commitHash: commit,
+      checks: gateResult.results.map((result) => ({ name: result.name, status: result.status, summary: result.stderrTail || result.stdoutTail || result.status })),
+      scopeViolations: [], risks: [], unresolvedQuestions: [],
+      productDecisionRequired: false,
+      tokenUsage: { inputTokens: 0, outputTokens: 0, cacheHitTokens: 0 },
+    };
+
+    const pauseId = adoptRecoveryAtomically(store, {
+      runId: run.id, stageId: stage.id, taskId: task.id, attemptId, worktree, branch, commit,
+      source: 'worker_auto_recovery', changedFiles,
+      lockPaths: scopeDecision.lockPaths,
+      workerResult,
+      legacyProvenanceBackfill: provenance.isLegacyBackfill,
+      decisionNote: null,
+      expectedState: {
+        runStatus: run.status,
+        stageStatus: stage.status,
+        taskStatus: task.status,
+        attemptStatus: attempt.status,
+      },
+    });
+    console.log(`已自动取证并接纳候选 commit ${commit}，来源=worktree HEAD 可验证证据（attempt ${attemptId}）`);
+    console.log(`Recovery pause confirmation: ${pauseId}`);
+    return { adopted: true, commit, pauseId };
+  } catch (error) {
+    return { adopted: false, reason: error instanceof Error ? error.message : String(error) };
+  }
 }

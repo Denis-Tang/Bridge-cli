@@ -16,7 +16,11 @@ import { resetGovernanceConfigCache, setGovernanceEnabled } from '../../../src/c
 import { StageScheduler } from '../../../src/core/stage-scheduler.js';
 import { FakeProcessRunner } from '../../../src/adapters/pi-rpc-worker.js';
 import type { ProcessRunInput, ProcessRunResult } from '../../../src/adapters/pi-worker-types.js';
-import { FakeCodexProcessRunner } from '../../../src/adapters/codex-process-runner.js';
+import {
+  FakeCodexProcessRunner,
+  extractCodexReviewTaskId,
+  formatApprovedCodexReviewMarker,
+} from '../../../src/adapters/codex-process-runner.js';
 import type { CodexProcessRunResult } from '../../../src/adapters/codex-process-runner.js';
 import type { SqliteConfig } from '../../../src/state/sqlite-config.js';
 import type { StructuredTaskSpec } from '../../../src/types/m2-types.js';
@@ -134,14 +138,17 @@ export class ControllablePiRunner extends FakeProcessRunner {
     const file = `src/recovery_${taskId}.ts`;
     mkdirSync(path.join(input.cwd, path.dirname(file)), { recursive: true });
     writeFileSync(path.join(input.cwd, file), recoveryContent(taskId), 'utf-8');
+    let commitHash = '';
     try {
       execSync(`git add ${file}`, { cwd: input.cwd, stdio: 'pipe' });
       execSync(`git commit -qm "recovery pi ${taskId}"`, { cwd: input.cwd, stdio: 'pipe' });
+      commitHash = execSync('git rev-parse HEAD', { cwd: input.cwd, stdio: 'pipe', encoding: 'utf-8' }).trim();
     } catch { /* worktree may not have git yet */ }
 
     const result: WorkerResult = {
       taskId, status: 'completed', summary: `fake recovery Pi wrote ${file}`,
       filesChanged: [file],
+      commitHash,
       checks: [{ name: 'recovery-fake', status: 'passed', summary: 'ok' }],
       scopeViolations: [], risks: [], unresolvedQuestions: [],
       productDecisionRequired: false,
@@ -181,13 +188,18 @@ export class ControllableCodexRunner extends FakeCodexProcessRunner {
     }
   }
 
-  override async run(): Promise<CodexProcessRunResult> {
+  override async run(
+    _command: string,
+    _args: string[],
+    opts: { cwd: string; timeoutMs: number; input?: string; maxBuffer?: number; env?: Record<string, string>; signal?: AbortSignal },
+  ): Promise<CodexProcessRunResult> {
     this._callCount++;
     if (this._barrier) {
       await this._barrier;
     }
+    const taskId = extractCodexReviewTaskId(opts.input) ?? 'unknown-task';
     return {
-      stdout: 'ok',
+      stdout: formatApprovedCodexReviewMarker(taskId),
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -210,14 +222,17 @@ export class FastRecoveryPiRunner extends FakeProcessRunner {
     const file = `src/recovery_${taskId}.ts`;
     mkdirSync(path.join(input.cwd, path.dirname(file)), { recursive: true });
     writeFileSync(path.join(input.cwd, file), recoveryContent(taskId), 'utf-8');
+    let commitHash = '';
     try {
       execSync(`git add ${file}`, { cwd: input.cwd, stdio: 'pipe' });
       execSync(`git commit -qm "recovery pi ${taskId}"`, { cwd: input.cwd, stdio: 'pipe' });
+      commitHash = execSync('git rev-parse HEAD', { cwd: input.cwd, stdio: 'pipe', encoding: 'utf-8' }).trim();
     } catch { /* ignore */ }
 
     const result: WorkerResult = {
       taskId, status: 'completed', summary: `fake recovery Pi wrote ${file}`,
       filesChanged: [file],
+      commitHash,
       checks: [{ name: 'recovery-fake', status: 'passed', summary: 'ok' }],
       scopeViolations: [], risks: [], unresolvedQuestions: [],
       productDecisionRequired: false,
@@ -238,10 +253,15 @@ export class FastRecoveryPiRunner extends FakeProcessRunner {
 export class FastRecoveryCodexRunner extends FakeCodexProcessRunner {
   calls = 0;
 
-  override async run(): Promise<CodexProcessRunResult> {
+  override async run(
+    _command: string,
+    _args: string[],
+    opts: { cwd: string; timeoutMs: number; input?: string; maxBuffer?: number; env?: Record<string, string>; signal?: AbortSignal },
+  ): Promise<CodexProcessRunResult> {
     this.calls++;
+    const taskId = extractCodexReviewTaskId(opts.input) ?? 'unknown-task';
     return {
-      stdout: 'ok',
+      stdout: formatApprovedCodexReviewMarker(taskId),
       stderr: '',
       exitCode: 0,
       durationMs: 2,

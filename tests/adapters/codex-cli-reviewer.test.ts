@@ -5,6 +5,24 @@ import { join } from 'node:path';
 import { CodexCliReviewer, parseCodexCliReviewOutput } from '../../src/adapters/codex-cli-reviewer.js';
 import { FakeCodexProcessRunner } from '../../src/adapters/codex-process-runner.js';
 
+const UNAVAILABLE_SUMMARY =
+  '[reviewer: codex-cli] Review output could not be parsed into a valid ReviewResult.';
+const UNAVAILABLE_FINDING =
+  'Review output could not be parsed into a valid ReviewResult.';
+
+const block = (body: unknown): string =>
+  `BEGIN_REVIEW_RESULT_JSON\n${JSON.stringify(body)}\nEND_REVIEW_RESULT_JSON`;
+
+const approvedResult = {
+  taskId: 'task-001',
+  status: 'approved',
+  reviewSummary: 'Looks good',
+  findings: [],
+  requiredRework: [],
+  qualityGateStatus: 'passed',
+  mergeAllowed: true,
+};
+
 describe('CodexCliReviewer', () => {
   describe('reviewDiff with allowRealReview=false (default)', () => {
     it('rejects empty diff', async () => {
@@ -72,32 +90,156 @@ describe('CodexCliReviewer', () => {
   });
 
   describe('parseCodexCliReviewOutput', () => {
-    it('approves no-issue wording without false positives', () => {
+    it('returns unavailable/rejected for headings with no JSON block', () => {
       const output = [
-        'codex',
-        'The diff only replaces the contents of a text fixture/message file,',
-        'and no discrete correctness issue is evident from the provided change.',
+        'Findings',
+        'Suggested Fixes',
+        'Test Gap',
+        'The change is correct and no actionable issue is evident.',
       ].join('\n');
 
-      const result = parseCodexCliReviewOutput(output, 'task-no-issue');
+      const result = parseCodexCliReviewOutput(output, 'task-headings');
+
+      expect(result.status).toBe('rejected');
+      expect(result.mergeAllowed).toBe(false);
+      expect(result.qualityGateStatus).toBe('failed');
+      expect(result.reviewerUnavailable).toBe(true);
+      expect(result.requiredRework).toEqual([]);
+      expect(result.reviewSummary).toBe(UNAVAILABLE_SUMMARY);
+      expect(result.findings).toEqual([UNAVAILABLE_FINDING]);
+    });
+
+    it('does not leak raw output in the unavailable fallback', () => {
+      const output = 'Findings\nPRIVATE_SECRET_WORD\nno JSON block here';
+
+      const result = parseCodexCliReviewOutput(output, 'task-no-json');
+
+      expect(result.reviewerUnavailable).toBe(true);
+      expect(JSON.stringify(result)).not.toContain('PRIVATE_SECRET_WORD');
+      expect(result.findings).toEqual([UNAVAILABLE_FINDING]);
+    });
+
+    it('approves a valid approved JSON block even with prose around it', () => {
+      const output = [
+        'Here is some prose before the block.',
+        'It mentions findings and suggested fixes outside the markers.',
+        block(approvedResult),
+        'And some trailing prose after the block.',
+      ].join('\n');
+
+      const result = parseCodexCliReviewOutput(output, 'task-001');
 
       expect(result.status).toBe('approved');
       expect(result.mergeAllowed).toBe(true);
+      expect(result.qualityGateStatus).toBe('passed');
       expect(result.requiredRework).toEqual([]);
       expect(result.reviewer).toBe('codex-cli');
     });
 
-    it('requires rework for explicit actionable issue bullets', () => {
-      const output = [
-        '- Issue: package.json contains invalid JSON and npm test will fail.',
-      ].join('\n');
+    it('forces reviewer to codex-cli on successful parse', () => {
+      const result = parseCodexCliReviewOutput(
+        block({ ...approvedResult, reviewer: 'local-rule' }),
+        'task-001',
+      );
+      expect(result.reviewer).toBe('codex-cli');
+    });
 
-      const result = parseCodexCliReviewOutput(output, 'task-issue');
+    it('parses a valid rework_required block', () => {
+      const reworkResult = {
+        taskId: 'task-rework',
+        status: 'rework_required',
+        reviewSummary: 'Please fix the conflict marker',
+        findings: ['Conflict marker present'],
+        requiredRework: ['Remove conflict marker'],
+        qualityGateStatus: 'failed',
+        mergeAllowed: false,
+      };
+
+      const result = parseCodexCliReviewOutput(block(reworkResult), 'task-rework');
 
       expect(result.status).toBe('rework_required');
       expect(result.mergeAllowed).toBe(false);
-      expect(result.requiredRework).toHaveLength(1);
+      expect(result.qualityGateStatus).toBe('failed');
+      expect(result.requiredRework).toEqual(['Remove conflict marker']);
       expect(result.reviewer).toBe('codex-cli');
+    });
+
+    it('falls back to unavailable for duplicate markers', () => {
+      const output = [
+        'BEGIN_REVIEW_RESULT_JSON',
+        'BEGIN_REVIEW_RESULT_JSON',
+        JSON.stringify(approvedResult),
+        'END_REVIEW_RESULT_JSON',
+      ].join('\n');
+
+      const result = parseCodexCliReviewOutput(output, 'task-001');
+
+      expect(result.status).toBe('rejected');
+      expect(result.reviewerUnavailable).toBe(true);
+      expect(result.reviewSummary).toBe(UNAVAILABLE_SUMMARY);
+      expect(result.executionMetadata).toBeUndefined();
+    });
+
+    it('falls back to unavailable for malformed JSON', () => {
+      const result = parseCodexCliReviewOutput(
+        'BEGIN_REVIEW_RESULT_JSON\n{not valid json}\nEND_REVIEW_RESULT_JSON',
+        'task-001',
+      );
+
+      expect(result.status).toBe('rejected');
+      expect(result.reviewerUnavailable).toBe(true);
+      expect(result.reviewSummary).toBe(UNAVAILABLE_SUMMARY);
+    });
+
+    it('falls back to unavailable for wrong taskId', () => {
+      const result = parseCodexCliReviewOutput(block(approvedResult), 'task-other');
+
+      expect(result.status).toBe('rejected');
+      expect(result.reviewerUnavailable).toBe(true);
+      expect(result.taskId).toBe('task-other');
+      expect(result.reviewSummary).toBe(UNAVAILABLE_SUMMARY);
+    });
+
+    it('falls back to unavailable for a non-string array value', () => {
+      const invalid = { ...approvedResult, findings: [123] };
+      const result = parseCodexCliReviewOutput(block(invalid), 'task-001');
+
+      expect(result.status).toBe('rejected');
+      expect(result.reviewerUnavailable).toBe(true);
+      expect(result.reviewSummary).toBe(UNAVAILABLE_SUMMARY);
+    });
+
+    it('falls back to unavailable for an empty string array value', () => {
+      const invalid = { ...approvedResult, requiredRework: ['   '] };
+      const result = parseCodexCliReviewOutput(block(invalid), 'task-001');
+
+      expect(result.status).toBe('rejected');
+      expect(result.reviewerUnavailable).toBe(true);
+      expect(result.reviewSummary).toBe(UNAVAILABLE_SUMMARY);
+    });
+
+    it('falls back to unavailable for approved with requiredRework', () => {
+      const invalid = { ...approvedResult, requiredRework: ['Fix this'] };
+      const result = parseCodexCliReviewOutput(block(invalid), 'task-001');
+
+      expect(result.status).toBe('rejected');
+      expect(result.reviewerUnavailable).toBe(true);
+      expect(result.reviewSummary).toBe(UNAVAILABLE_SUMMARY);
+    });
+
+    it('falls back to unavailable for rework_required without required rework', () => {
+      const invalid = {
+        ...approvedResult,
+        status: 'rework_required',
+        qualityGateStatus: 'failed',
+        mergeAllowed: false,
+        requiredRework: [],
+      };
+      const result = parseCodexCliReviewOutput(block(invalid), 'task-001');
+
+      expect(result.status).toBe('rejected');
+      expect(result.reviewerUnavailable).toBe(true);
+      expect(result.reviewSummary).toBe(UNAVAILABLE_SUMMARY);
     });
   });
 });

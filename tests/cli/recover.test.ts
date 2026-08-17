@@ -13,12 +13,13 @@ import {
 
 describe('recover attempt atomic adoption', () => {
   let dir: string;
+  let dbPath: string;
   let store: SqliteStateStore;
 
   beforeEach(async () => {
     dir = path.join(tmpdir(), `bridge-recover-${Date.now()}-${Math.random()}`);
     mkdirSync(dir, { recursive: true });
-    const dbPath = path.join(dir, 'state.db');
+    dbPath = path.join(dir, 'state.db');
     store = SqliteStateStore.create(dbPath);
     new SqliteMigrationRunner({ path: dbPath, maskedPath: dbPath }, store.getDatabase()).applyPending();
     const now = new Date().toISOString();
@@ -42,6 +43,35 @@ describe('recover attempt atomic adoption', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  async function seedReworkAttemptWithReview(
+    status: 'rework_required' | 'rejected' | 'needs_user_decision',
+    requiredRework: unknown[],
+  ): Promise<void> {
+    store.getDatabase().prepare("UPDATE task_attempts SET status='rework_required' WHERE id='a'").run();
+    const reviewId = `rev-${status}-${Math.random()}`;
+    await store.createReview({ id: reviewId, attemptId: 'a', taskId: 't', reviewerType: 'codex', status });
+    await store.updateReviewResult(reviewId, {
+      status,
+      reviewJson: JSON.stringify({ taskId: 't', status, requiredRework }),
+    });
+  }
+
+  function workerResult(): import('../../src/types/protocol.js').WorkerResult {
+    return {
+      taskId: 't', status: 'completed', summary: 'adopted', filesChanged: ['src/a.ts'], commitHash: 'abc123',
+      checks: [], scopeViolations: [], risks: [], unresolvedQuestions: [],
+      productDecisionRequired: false, tokenUsage: { inputTokens: 0, outputTokens: 0, cacheHitTokens: 0 },
+    };
+  }
+
+  function adoptBase(overrides: Record<string, unknown> = {}) {
+    return {
+      runId: 'r', stageId: 's', taskId: 't', attemptId: 'a', worktree: dir, branch: 'recovery/a',
+      commit: 'abc123', source: 'codex_recovery', changedFiles: ['src/a.ts'], lockPaths: ['src/'],
+      workerResult: workerResult(), decisionNote: null, ...overrides,
+    };
+  }
+
   it('records provenance, locks and worker_completed without claiming completion', async () => {
     adoptRecoveryAtomically(store, {
       runId: 'r', stageId: 's', taskId: 't', attemptId: 'a', worktree: dir, branch: 'recovery/a',
@@ -61,6 +91,60 @@ describe('recover attempt atomic adoption', () => {
     const event = (await store.listEvents('r', 'recovery_adopted'))[0]?.eventDataJson;
     expect(event).toContain('resume_for_review_and_integration');
     expect(event).toContain('"expandedFileCount":1');
+  });
+
+  it('restores rework_required to worker_completed when latest review is rework_required with empty requiredRework', async () => {
+    await seedReworkAttemptWithReview('rework_required', []);
+
+    adoptRecoveryAtomically(store, adoptBase());
+
+    expect(await store.getAttempt('a')).toMatchObject({ status: 'worker_completed', resultSource: 'codex_recovery' });
+    expect(await store.getTask('t')).toMatchObject({ status: 'worker_completed' });
+    expect(await store.getStage('s')).toMatchObject({ status: 'paused' });
+  });
+
+  it('allows rework_required recovery when latest review requiredRework is non-empty (parser guarantees non-empty)', async () => {
+    await seedReworkAttemptWithReview('rework_required', ['src/a.ts']);
+
+    adoptRecoveryAtomically(store, adoptBase());
+
+    expect(await store.getAttempt('a')).toMatchObject({ status: 'worker_completed', resultSource: 'codex_recovery' });
+    expect(await store.getTask('t')).toMatchObject({ status: 'worker_completed' });
+    expect(await store.getStage('s')).toMatchObject({ status: 'paused' });
+  });
+
+  it('rejects rework_required recovery when latest review status is rejected even with empty requiredRework', async () => {
+    await seedReworkAttemptWithReview('rejected', []);
+
+    expect(() => adoptRecoveryAtomically(store, adoptBase()))
+      .toThrow(/rework_required recovery requires latest review/);
+    expect(await store.getAttempt('a')).toMatchObject({ status: 'rework_required', adoptedCommit: null });
+    expect(await store.getActiveLocksForRun('r')).toHaveLength(0);
+  });
+
+  it('rejects rework_required recovery when latest review status is needs_user_decision even with empty requiredRework', async () => {
+    await seedReworkAttemptWithReview('needs_user_decision', []);
+
+    expect(() => adoptRecoveryAtomically(store, adoptBase()))
+      .toThrow(/rework_required recovery requires latest review/);
+    expect(await store.getAttempt('a')).toMatchObject({ status: 'rework_required', adoptedCommit: null });
+  });
+
+  it('allows rework_required recovery in read-only context when the attempt has no task review', async () => {
+    store.getDatabase().prepare("UPDATE task_attempts SET status='rework_required' WHERE id='a'").run();
+
+    const context = readRecoveryContextReadOnly(dbPath, 'a');
+    expect(context.attempt).toMatchObject({ id: 'a', status: 'rework_required' });
+  });
+
+  it('adopts rework_required recovery when the attempt has no task review', async () => {
+    store.getDatabase().prepare("UPDATE task_attempts SET status='rework_required' WHERE id='a'").run();
+
+    adoptRecoveryAtomically(store, adoptBase());
+
+    expect(await store.getAttempt('a')).toMatchObject({ status: 'worker_completed', resultSource: 'codex_recovery' });
+    expect(await store.getTask('t')).toMatchObject({ status: 'worker_completed' });
+    expect(await store.getStage('s')).toMatchObject({ status: 'paused' });
   });
 
   it('allows an explicitly approved frozen TaskSpec expansion only within the run project scope', () => {

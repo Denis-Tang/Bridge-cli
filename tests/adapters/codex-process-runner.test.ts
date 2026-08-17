@@ -1,8 +1,30 @@
 import { execFileSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
-import { RealCodexProcessRunner } from '../../src/adapters/codex-process-runner.js';
+import { RealCodexProcessRunner, extractCodexReviewTaskId } from '../../src/adapters/codex-process-runner.js';
 
 const runner = new RealCodexProcessRunner();
+
+describe('extractCodexReviewTaskId', () => {
+  it('extracts a plain task id from the first prompt line', () => {
+    const input = 'Review the following git diff for task task-001.\nSome other text';
+    expect(extractCodexReviewTaskId(input)).toBe('task-001');
+  });
+
+  it('extracts a task id containing dots without truncation (regression for review finding)', () => {
+    const input = 'Review the following git diff for task run_1.task-2.a1.\nSome other text';
+    expect(extractCodexReviewTaskId(input)).toBe('run_1.task-2.a1');
+  });
+
+  it('falls back to the JSON taskId field when the first-line form is absent', () => {
+    const input = 'Some prose\n"taskId": "task-42"';
+    expect(extractCodexReviewTaskId(input)).toBe('task-42');
+  });
+
+  it('returns null when no task id is present', () => {
+    expect(extractCodexReviewTaskId('nothing here')).toBeNull();
+    expect(extractCodexReviewTaskId(undefined)).toBeNull();
+  });
+});
 
 describe('RealCodexProcessRunner async process safety', () => {
   it('keeps the event loop responsive and captures stdin/stdout/stderr', async () => {

@@ -8,6 +8,7 @@ import {
   CORRECT_DAG, CONFLICT_DAG, STRESS_DAG,
   type BenchmarkContext,
 } from '../helpers/benchmark-fixtures.js';
+import { extractCodexReviewTaskId, formatReworkCodexReviewMarker } from '../../src/adapters/codex-process-runner.js';
 import { selectExecutionMode, resolveExecutionMode } from '../../src/core/execution-mode.js';
 import { shouldDoTaskLevelReview } from '../../src/core/review-granularity.js';
 import { ReviewResultCache, computeReviewCacheKey, ReviewCacheKey } from '../../src/core/review-cache.js';
@@ -103,10 +104,16 @@ describe('06-MODE — Token-Efficient Core', () => {
       };
       await ctx.store.createTask({ id: 'T9', runId: ctx.runId, title: stage2Spec.title, status: 'pending', specJson: stage2Spec, createdAt: now, updatedAt: now });
 
-      ctx.codexRunner.run = async () => {
+      ctx.codexRunner.run = async (
+        _command: string,
+        _args: string[],
+        opts: { cwd: string; timeoutMs: number; input?: string; maxBuffer?: number; env?: Record<string, string>; signal?: AbortSignal },
+      ) => {
         ctx.codexRunner.calls++;
+        const taskId = extractCodexReviewTaskId(opts.input) ?? 'unknown-task';
+        const issue = 'integrated behavior is incorrect and must be fixed';
         return {
-          stdout: '- issue: integrated behavior is incorrect and must be fixed',
+          stdout: formatReworkCodexReviewMarker(taskId, issue),
           stderr: '', exitCode: 0, durationMs: 1,
           tokenUsage: { inputTokens: 200, outputTokens: 80, cacheHitTokens: 0 },
         };

@@ -12,7 +12,12 @@ import { ensureDefaultPolicies, setPerRunBudget } from '../../src/core/budget-po
 import { resetGovernanceConfigCache, setGovernanceEnabled } from '../../src/core/decision-gate.js';
 import { FakeProcessRunner } from '../../src/adapters/pi-rpc-worker.js';
 import type { ProcessRunInput, ProcessRunResult } from '../../src/adapters/pi-worker-types.js';
-import { FakeCodexProcessRunner, type CodexProcessRunResult } from '../../src/adapters/codex-process-runner.js';
+import {
+  FakeCodexProcessRunner,
+  type CodexProcessRunResult,
+  extractCodexReviewTaskId,
+  formatApprovedCodexReviewMarker,
+} from '../../src/adapters/codex-process-runner.js';
 import type { StructuredTaskSpec } from '../../src/types/m2-types.js';
 import type { WorkerResult } from '../../src/types/protocol.js';
 
@@ -37,12 +42,13 @@ function makeGitRepo(): { tmp: string; projectRoot: string; baseHead: string } {
   return { tmp, projectRoot, baseHead };
 }
 
-function workerResult(taskId: string): WorkerResult {
+function workerResult(taskId: string, commitHash = 'abc1234'): WorkerResult {
   return {
     taskId,
     status: 'completed',
     summary: 'fake Pi wrote allowed file',
     filesChanged: ['src/allowed.ts'],
+    commitHash,
     checks: [{ name: 'fake', status: 'passed', summary: 'ok' }],
     scopeViolations: [],
     risks: [],
@@ -70,7 +76,7 @@ class WritingFakePiRunner extends FakeProcessRunner {
     writeFileSync(path.join(input.cwd, 'src', 'allowed.ts'), `export const v${this.calls} = ${this.calls};\n`, 'utf-8');
     execSync('git add src/allowed.ts', { cwd: input.cwd, stdio: 'pipe' });
     execSync(`git commit -m "fake pi ${this.calls}"`, { cwd: input.cwd, stdio: 'pipe' });
-    const result = workerResult(this.taskId);
+    const result = workerResult(this.taskId, execSync('git rev-parse HEAD', { cwd: input.cwd, stdio: 'pipe', encoding: 'utf-8' }).trim());
     return {
       pid: 4242,
       exitCode: 0,
@@ -107,8 +113,9 @@ class CountingFakeCodexRunner extends FakeCodexProcessRunner {
 
   async run(command: string, args: string[], opts: { cwd: string; timeoutMs: number; input?: string; maxBuffer?: number }): Promise<CodexProcessRunResult> {
     this.calls++;
+    const taskId = extractCodexReviewTaskId(opts.input) ?? 'unknown-task';
     return {
-      stdout: 'No actionable issues found.',
+      stdout: formatApprovedCodexReviewMarker(taskId),
       stderr: '',
       exitCode: 0,
       durationMs: 20,
