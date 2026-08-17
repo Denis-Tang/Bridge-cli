@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
-import { inspectBridgeRepositoryIdentity } from '../../src/cli/commands/doctor.js';
+import { inspectBridgeRepositoryIdentity, parseVersionParts, versionAtLeast } from '../../src/cli/commands/doctor.js';
 
 const tempRoots: string[] = [];
 
@@ -45,5 +45,24 @@ describe('doctor Bridge repository identity', () => {
     expect(result.ok).toBe(false);
     expect(result.packageName).toBeNull();
     expect(result.warning).toContain('当前目录不是 Bridge 正式仓库');
+  });
+});
+
+describe('doctor version helpers (task 03B)', () => {
+  it('parses semver-ish version strings', () => {
+    expect(parseVersionParts('0.140.0')).toEqual([0, 140, 0]);
+    expect(parseVersionParts('0.82.1')).toEqual([0, 82, 1]);
+    expect(parseVersionParts('1.2.3\n')).toEqual([1, 2, 3]);
+    expect(parseVersionParts(null)).toEqual([]);
+    expect(parseVersionParts('not-a-version')).toEqual([]);
+  });
+
+  it('codex >= 0.140.0 threshold (CONFIG.md)', () => {
+    expect(versionAtLeast('0.140.0', 0, 140)).toBe(true);
+    expect(versionAtLeast('0.141.0', 0, 140)).toBe(true);
+    expect(versionAtLeast('0.139.0', 0, 140)).toBe(false);
+    expect(versionAtLeast('1.0.0', 0, 140)).toBe(true);
+    expect(versionAtLeast('0.140.0-alpha', 0, 140)).toBe(true); // prefix match
+    expect(versionAtLeast(null, 0, 140)).toBe(false);
   });
 });
