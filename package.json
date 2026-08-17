@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "Bridge: Codex 规划审查、Pi 隔离施工的本地长任务编排器",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Denis-Tang/Bridge-cli.git"
+  },
+  "homepage": "https://github.com/Denis-Tang/Bridge-cli#readme",
+  "bugs": {
+    "url": "https://github.com/Denis-Tang/Bridge-cli/issues"
+  },
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",

@@ -4,6 +4,13 @@ Bridge 是一个本地长任务编排器：Codex 负责结构化规划和关键�
 
 > Bridge 已能验证“减少逐任务 Codex 审查调用”和“并发任务重叠执行”，但没有完成同任务真实 Provider sequential A/B，因此不宣称固定 Token 节省百分比。Pi Token 用量与调用配额是可观测的代价与护栏。
 
+## 当前状态
+
+- **版本**：`v0.1.0`（已打标签并发布）
+- **fake/disposable 全回归**：✅ 95 文件 / 1190 用例全绿（fresh-clone 一条命令可复现）
+- **真实 Provider 端到端**：⏸ 待授权运行（尚未完成同任务真实 Pi/Codex 端到端验证）
+- **Token 节省声明**：⚠️ 未完成 sequential A/B，不宣称固定节省百分比
+
 ## 工作方式
 
 ```mermaid
