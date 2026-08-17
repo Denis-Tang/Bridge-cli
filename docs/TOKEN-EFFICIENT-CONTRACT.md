@@ -4,7 +4,7 @@
 
 **版本**: v1.1
 
-**正式仓库**: `C:\Users\29672\Documents\bridge`
+**正式仓库**: `C:\path\to\bridge`
 
 **最后更新**: 2026-08-02
 

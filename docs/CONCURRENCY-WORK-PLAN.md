@@ -1,7 +1,7 @@
 # PiAgent 并发施工计划
 
 目标模型：DeepSeek V4 Pro  
-目标项目：`D:\仓库集合\仓库1\codex-brain-pi-orchestrator-backup2\精简可运行版`
+目标项目：`C:\path\to\backup-project`
 
 ## 基本规则
 

@@ -57,7 +57,7 @@
 
 ### 2026-08-02 fake/disposable 全回归
 
-以下命令均在 `C:\Users\29672\Documents\bridge` 执行，runner 全部为 fake/disposable/synthetic；测试文件总数为 82，合计 1016 项通过：
+以下命令均在 `C:\path\to\bridge` 执行，runner 全部为 fake/disposable/synthetic；测试文件总数为 82，合计 1016 项通过：
 
 - `npm run build`：退出码 0。
 - `npm test -- tests/state`：12 文件／151 项，退出码 0。

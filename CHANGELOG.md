@@ -2,7 +2,7 @@
 
 ## v0.1.0（2026-08-17）— 阶段 0 收口 + wave2 全部落地
 
-> 版本说明：这是正式仓库 `C:\Users\29672\Documents\bridge` 自 `b36adca`（fix: block Pi clarification policy violations）之后的首次聚合发布。全部改动经「先审后合」：每批先过真实 Codex review（本地 codex-cli）再落正式仓库；全程未发起真实 Pi 调用。
+> 版本说明：这是正式仓库 `C:\path\to\bridge` 自 `b36adca`（fix: block Pi clarification policy violations）之后的首次聚合发布。全部改动经「先审后合」：每批先过真实 Codex review（本地 codex-cli）再落正式仓库；全程未发起真实 Pi 调用。
 
 ### 阶段 0 修复（来源 disposable-target main，commit `8b49970`）
 

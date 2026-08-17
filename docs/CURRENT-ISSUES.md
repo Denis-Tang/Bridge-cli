@@ -13,7 +13,7 @@
 - **清理状态（Phase 0 freeze）**：已接纳的两笔真实 Provider run 的 task worktree 已回收；3 个旧 fake run worktree 保留在 manual_review；失败的首个集成分支 `brainctl/int/run_1786815966018/stage-1/a1` 仍保留；未发生强制删除（gc `--apply` 未执行）。
 - **bootstrap 证据**：`f4bb660` 记录为「4 文件、80 测试获批」，其与 migration 015 legacy provenance 的关联见 REAL-RUN-READINESS。
 - **不宣称**：生产成熟度、固定 Token 节省、正式发布（tag/bundle 完成）。
-- **正式仓库回写（2026-08-17 补充）**：阶段 0 + wave2（02 Pi 可靠性 / 03 构建预检 / 06 reconcile / 08 product / 07 docs）已按「先审后合」回写进正式仓库 `C:\Users\29672\Documents\bridge`（7 个逻辑 commit，来源 SHA 见各 commit message）。回写中经真实 Codex review 修复 11 项缺陷（parser 白名单与语义矛盾、recover gate 死锁、task-id 正则、trusted stage review 的 `--no-ff`/cleanup 语义、pre-merged 收敛证据标准、commitHash 校验、int-deps 空目录等），全量 **95 文件 / 1190 用例全绿**。`.brainctl/` 运行时配置未回写。详见 `CHANGELOG.md` 与 `_handoff\05-回写结果.md`。
+- **正式仓库回写（2026-08-17 补充）**：阶段 0 + wave2（02 Pi 可靠性 / 03 构建预检 / 06 reconcile / 08 product / 07 docs）已按「先审后合」回写进正式仓库 `C:\path\to\bridge`（7 个逻辑 commit，来源 SHA 见各 commit message）。回写中经真实 Codex review 修复 11 项缺陷（parser 白名单与语义矛盾、recover gate 死锁、task-id 正则、trusted stage review 的 `--no-ff`/cleanup 语义、pre-merged 收敛证据标准、commitHash 校验、int-deps 空目录等），全量 **95 文件 / 1190 用例全绿**。`.brainctl/` 运行时配置未回写。详见 `CHANGELOG.md` 与 `_handoff\05-回写结果.md`。
 
 ## 历史快照（2026-08-02，逐字保留）
 

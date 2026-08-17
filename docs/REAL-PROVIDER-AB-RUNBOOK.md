@@ -22,22 +22,22 @@
 
 ```powershell
 # 从精简可运行版创建 disposable 副本（不在原项目内操作）
-git clone "D:\仓库集合\仓库1\codex-brain-pi-orchestrator-backup2\精简可运行版" "D:\临时\ab-disposable-YYYYMMDD-HHmmss"
+git clone "C:\path\to\backup-project" "C:\path\to\temp\ab-disposable-YYYYMMDD-HHmmss"
 ```
 
 **注意事项：**
-- 副本路径必须在项目目录之外（如 `D:\临时\`）。
+- 副本路径必须在项目目录之外（如 `C:\path\to\temp\`）。
 - 副本不得包含 `.env` 文件。若有，立即删除。
 - 确认副本不含 API key、token、密码等凭据：
   ```powershell
-  rg -l "(sk-|api_key|token|secret|password)" --ignore-case "D:\临时\ab-disposable-*" -g "!.git" 2>&1
+  rg -l "(sk-|api_key|token|secret|password)" --ignore-case "C:\path\to\temp\ab-disposable-*" -g "!.git" 2>&1
   ```
   若有命中，必须清理后再继续。
 
 ### 2.2 固定版本
 
 ```powershell
-cd "D:\临时\ab-disposable-YYYYMMDD-HHmmss"
+cd "C:\path\to\temp\ab-disposable-YYYYMMDD-HHmmss"
 
 # 记录固定版本信息
 node --version > ab-version-info.txt
@@ -242,10 +242,10 @@ token-efficient repeat #3: /efficiency-gate — efficiency_gate_fail
 
 ```powershell
 # 离开 disposable 目录
-cd "D:\仓库集合\仓库1\codex-brain-pi-orchestrator-backup2\精简可运行版"
+cd "C:\path\to\backup-project"
 
 # 删除 disposable 副本（可选，建议保留至验收完成）
-# Remove-Item -Recurse -Force "D:\临时\ab-disposable-*"
+# Remove-Item -Recurse -Force "C:\path\to\temp\ab-disposable-*"
 ```
 
 ## 9. 版本历史
