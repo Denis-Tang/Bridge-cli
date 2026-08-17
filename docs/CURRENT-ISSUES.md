@@ -1,17 +1,29 @@
 # 当前问题清单
 
-更新日期：2026-08-02
+更新日期：2026-08-16（Phase 0 freeze 补充；下方 2026-08-02 内容为历史快照，逐字保留）
 
 本文件只记录当前仍未闭环的事项。历史已关闭问题和旧测试数字见 `HISTORY.md` 与对应 HANDOFF；本轮最终 fake/disposable 数字只在 `REAL-RUN-READINESS.md` 记录。
 
-## 当前阶段结论
+## 2026-08-16 Phase 0 freeze 补充（当前）
+
+- **costBudget 无单位配额口径（已拍板）**：保留 `limit` / `maxPiCallCost` / `maxCodexCallCost` 字段名，仅删除 `currency` 与 `pricingVersion`；数值解释为「无单位最坏单次调用配额」，不再是金额。README / CONFIG 与本文件当前段的「金额/成本」表述已同步改为配额口径；历史快照段落逐字保留。
+- **真实 Provider 运行金额不可得**：`run_1786815966018` 与 `run_1786817596600` 的 provider money cost 均 `unavailable`；Codex plan / clarification / review 用量均 `unavailable`。不宣称零成本，也不标注任何货币金额。
+- **Provider token 归属已确认**：`first Pi call`（input=24744 / output=12142 / cache-read=101760 / total=138646）↔ `run_1786815966018`（Pi commit `0099365`、最终 merge `c979832`）；`follow-up`（input=15134 / output=6103 / cache-read=152192 / total=173429）↔ `run_1786817596600`（Pi commit `a74fe7b`、最终 merge `ea1ad8e`）。
+- **sequential A/B 仍未执行**（见下方 R1）。
+- **清理状态（Phase 0 freeze）**：已接纳的两笔真实 Provider run 的 task worktree 已回收；3 个旧 fake run worktree 保留在 manual_review；失败的首个集成分支 `brainctl/int/run_1786815966018/stage-1/a1` 仍保留；未发生强制删除（gc `--apply` 未执行）。
+- **bootstrap 证据**：`f4bb660` 记录为「4 文件、80 测试获批」，其与 migration 015 legacy provenance 的关联见 REAL-RUN-READINESS。
+- **不宣称**：正式仓库回写、tag/bundle 完成、生产成熟度或固定 Token 节省。
+
+## 历史快照（2026-08-02，逐字保留）
+
+### 当前阶段结论
 
 - **P0/P1 可靠性修复：fake/disposable 已闭环。** PauseRecord 精确恢复、金额预留、SQLite 只读/忙等待、Windows 进程树终止、reconcile、不可变 provenance、actual-path claim、迁移事务、状态 CAS、Pi 澄清只读强制和最终 integrated-tree Review 均有回归覆盖。
 - **历史私人真实运行证据：保留。** 2026-07-28/29 曾在 disposable 与明确授权范围内完成真实 DeepSeek Pi、Codex 技术答疑/审查和 Glue 定向施工；这些证据不自动覆盖 2026-08-02 之后的代码变更。
 - **当前分支最终验收：仅 fake/disposable。** 本轮不调用真实 Pi/Codex，不读取凭据，也不把历史 Provider PASS 冒充当前真实回归。
 - **sequential A/B：未执行。** 没有同任务真实 Codex token 数据，也没有固定节省比例结论。
 
-## 仍需完成
+### 仍需完成
 
 ### R1：补做 sequential baseline（非私人使用阻断）
 
@@ -50,13 +62,13 @@ Bridge 的唯一运行时区间已收敛为 `>=24.0.0 <25.0.0`：package engines
 
 最终 integrated-tree Review 输入不截断。超过 524,288 UTF-8 bytes 或 20,000 lines 时不启动 Reviewer、coverage 保持 `partial` 并暂停 Stage。这两个值只是运维字节/行代理，不是 token 限额；超大变更需要拆 Stage 或在后续版本引入可证明完整覆盖的分片协议。
 
-## 非阻断增强
+### 非阻断增强
 
 - 增加 Python、混合构建和多质量门 disposable fixture。
 - 在真实样本形成后校准金额预算、风险分级和 Review 聚合策略。
 - 继续观察 Windows 上大量 Git worktree 与 SQLite 并发的资源曲线；Vitest 文件级 workers 保持有界，避免把资源争用误判为产品失败。
 
-## 已闭环（2026-08-02 第 1 轮）
+### 已闭环（2026-08-02 第 1 轮）
 
 ### G1：worktree / 分支孤儿泄漏 — 已提供显式回收路径（人工发起）
 
@@ -84,3 +96,44 @@ Bridge 的唯一运行时区间已收敛为 `>=24.0.0 <25.0.0`：package engines
 - 测试：`tests/state/sqlite-cost-writeoff.test.ts`（T4-T7）+ `tests/core/cost-heartbeat.test.ts`（T1-T3），含"回收器证据标准未放宽"回归护栏（T7）。
 
 **当前边界**：核销是**人工、显式、可审计**操作，绝不做成自动；`written_off` 的账目语义是"可能花了钱但用户决定不再占用额度"，不是"证明没花钱"（后者是 `released`）。回收器标准未放宽：`spawned_at != null` 时即使 lease 过期+owner 终态也只标 `unavailable`，不自动 `released`。
+
+## 已闭环（施工 02：Pi 提交与 WorkerResult 回传可靠性）
+
+> 目标：根治「Pi 写对了代码、也提交了，但 WorkerResult/commitHash 没被系统拿到 → 每次靠人补 bootstrap commit」的头号病根。只改 disposable-target；不破坏 `Never faking Pi completion` 红线。
+
+### C1：commitHash 回传契约收紧 + 解析/取证边界
+
+- **Schema 收紧**（`src/schemas/worker-result.schema.json`）：`status=completed` 时 `commitHash` 必填且非空（`if/then` 条件约束）；非 completed 状态仍允许省略。
+- **Prompt 契约**（`src/adapters/pi-worker-prompt.ts` 规则 6）：`commitHash` 必须等于 Pi 在 worktree 中实际提交的 commit 的完整 hash（`git rev-parse HEAD` 输出）；`status=completed` 时禁止占位符/示例值/随机串，系统会用 worktree HEAD 校验。
+- **解析稳健性**（`pi-worker-result-parser.ts` / `pi-rpc-worker.ts`）：
+  - 多种输出形态（纯文本标记块、代码块包裹、JSONL 事件、`agent_end` 早停）下 commitHash 均能解析，且与 worktree HEAD 一致（有测试证明）。
+  - 早期检测不再让「不含 commitHash 的片段」抢占/丢弃后面含 commitHash 的完整结果（MarkedTextAccumulator 消费已返回块 + schema 拒绝不完整结果）。
+  - 新增 `extractWorkerResultObject` 宽松提取，供取证路径在 commitHash 空串/缺失但 status=completed 时从 worktree HEAD 取证。
+
+### C2：Pi 已提交但 WorkerResult 丢失 → 自动取证接纳（完全自动，无需人工确认）
+
+- 新增 `recover.ts::autoAdoptVerifiableCommitEvidence`：当 attempt 是 `worker_completed`/`rework_required`（以及调度器实时路径的 `running`）但 WorkerResult 缺失、而 worktree 存在「可验证」commit（满足：`git merge-base --is-ancestor baseCommit commit`、worktree 干净、HEAD==commit、changed files 触及预计路径、provenance 匹配）时，**自动**走与 `recover attempt --commit <sha>` 完全相同的 provenance/scope/claim/质量门校验后接纳，来源记 `worker_auto_recovery`，打印「已自动取证并接纳候选 commit <sha>，来源=worktree HEAD 可验证证据」。
+- **红线不破**：自动接纳不自动 merge、不跳过 reviewer——接纳后仍走正常 review → integration → merge（merge 仍在审查门后）；scope 扩展需要显式决策，自动路径绝不 auto-approve（fail closed）。
+- 调度器接线：`execTask` 的 `!wrResult` 分支与 `resumeFromWorkerCompleted` 的 WorkerResult 缺失分支先尝试自动取证接纳，失败才走原 fail-closed（`worker_result_missing` / `worker_result_missing_recovery_available`）。
+- 测试：`tests/cli/recover-auto.test.ts`（4 例：可验证提交自动接纳 / 未提交 fail closed / 脏 worktree fail closed / scope 扩展 fail closed）+ `tests/acceptance/auto-evidence-adoption.test.ts`（2 例调度器端到端）+ parser/RPC worker 新增用例。
+
+**当前边界**：自动取证接纳要求 worktree 完整可验证（干净、HEAD 为 base 后代、变更触及预计路径、质量门通过）；任何一环不满足即 fail closed，绝不伪造 Pi 完成。
+
+## 已闭环（施工 03：构建与预检固化）
+
+### B1：`.sql` 复制进构建（tsc 不复制）
+
+- 新增 `scripts/copy-sql-migrations.mjs` 作为 `postbuild`：把 `src/state/migrations/sqlite/*.sql` 复制到 `dist/state/migrations/sqlite/`，**校验数量 == 15**，缺则构建失败。
+- `npm run build` 一条命令产出「可直接 `node dist/cli/brainctl.js` 运行」的完整 dist（含 15 个 `.sql`）。
+
+### B2：doctor 预检强化（保持只读、退出码语义不变）
+
+- 版本阈值：Pi CLI 需匹配已验证版本（默认 `0.82.1`，偏离给显著警告）；Codex CLI 需 `>=0.140.0`（CONFIG.md）。
+- 配对检查：`real-pi` 必须配对 `codex-cli` 审查（`local-rule` 仅 fake/disposable），违反给失败提示。
+- costBudget 检查：真实 Provider（`real-pi` 或 `codex-cli`）需要 `limit/maxPiCallCost/maxCodexCallCost` 完整，缺失/非法时明确提示「真实调用前必须补齐」（不直接拒绝）。
+- dist 完整性：`dist/state/migrations/sqlite/*.sql` 数量与 src 一致（15），不一致提示重新构建。
+
+### B3：integration worktree 依赖竞态正道化
+
+- 新增 `src/core/int-deps.ts`（`prepareIntWorktreeDeps`）+ `StageIntegrationConfig.prepareIntDeps` 钩子：integration worktree 建好后、stage 质量门运行前，把 worktree 的 `node_modules` junction/符号链接到 **run 本地依赖副本**（`.brainctl-dev/int-deps/<runId>/node_modules`，hardlink 优先），绝不指向主仓库 node_modules（避免 merge 后 worktree 清理连带清空主仓库依赖——阶段 0 实测教训）。
+- 运行方式统一：`node dist/cli/brainctl.js`（不用 tsx/esbuild）、vitest `--pool=threads`（避免 fork 命名管道 EPERM）、受限环境 `git archive` 替代 clone。

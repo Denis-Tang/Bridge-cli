@@ -1,8 +1,19 @@
 # 文档权威入口与历史索引
 
-更新日期：2026-08-02
+更新日期：2026-08-16（新增 Phase 0 freeze changelog；下方 2026-08-02 内容为历史快照，逐字保留）
 
 本页解决“当前契约”和“历史施工证据”混读的问题。源码、数据库约束和当前测试结果优先于文档；历史报告中的测试数字、路径、已知问题和结论只描述当时快照，不能覆盖当前事实。
+
+## 2026-08-16 Phase 0 freeze changelog
+
+- **costBudget 无单位化（决策已拍板）**：保留 `limit` / `maxPiCallCost` / `maxCodexCallCost` 字段名，仅删除 `currency` 与 `pricingVersion`；数值解释为「无单位最坏单次调用配额」；README / CURRENT-ISSUES / CONFIG 当前段的「金额/成本」表述同步改为配额口径（历史快照段落逐字保留）。
+- **Provider token 归属（决策已确认）**：`first Pi call`（input=24744 / output=12142 / cache-read=101760 / total=138646）↔ `run_1786815966018`（Pi commit `0099365`、最终 merge `c979832`）；`follow-up`（input=15134 / output=6103 / cache-read=152192 / total=173429）↔ `run_1786817596600`（Pi commit `a74fe7b`、最终 merge `ea1ad8e`）。
+- **历史段落个人绝对路径（决策已确认）**：2026-08-02 历史段落原样保留（历史快照逐字保留）；仅新增 08-16 当前段落且避免出现新的个人绝对路径。
+- **bootstrap 表述（决策已确认）**：`f4bb660` 记录为「4 文件、80 测试获批」，并注明其与 migration 015 legacy provenance 的关联（见 REAL-RUN-READINESS）。
+- **当前 fake/disposable 全回归**：92/92 文件、1082/1082 测试通过；TypeScript build 与 `git diff --check` 通过；heartbeat 精确测试 1 文件 / 4 项连续三次最终 main 全回归通过。
+- **真实 Provider 金额不可得**：两笔窄范围真实运行的 provider money cost 与 Codex 用量均 `unavailable`；不宣称零成本、不标注货币金额。
+- **清理（Phase 0 freeze）**：已接纳的两笔真实 Provider run 的 task worktree 已回收；3 个旧 fake run worktree 保留 manual_review；失败的首个集成分支 `brainctl/int/run_1786815966018/stage-1/a1` 仍保留；未发生强制删除。
+- **sequential A/B 仍未执行**；正式仓库回写 / tag / bundle / 生产成熟度未宣称。
 
 ## 当前权威文档
 

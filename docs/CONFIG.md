@@ -160,11 +160,9 @@ npm run brainctl -- submit "需求" --project "D:/真实项目" --local-run --al
     "model": "", "timeoutMs": 300000
   },
   "costBudget": {
-    "currency": "CNY",
     "limit": 20,
     "maxPiCallCost": 2,
-    "maxCodexCallCost": 1,
-    "pricingVersion": "user-declared-2026-08"
+    "maxCodexCallCost": 1
   },
   "resourceSampling": { "enabled": false, "intervalMs": 5000, "maxParallelTasks": 4 },
   "sharedLocks": [
@@ -183,34 +181,36 @@ npm run brainctl -- submit "需求" --project "D:/真实项目" --local-run --al
 
 未知字段、非法类型、绝对/逃逸路径和空命令均 fail closed，并报告具体字段。无质量门的项目不会被静默视为通过。
 
-真实 Pi 或 Codex Provider 需要 `costBudget`。`limit` 是该 Run 的总金额上限，`maxPiCallCost`/`maxCodexCallCost` 是调用前原子预留的最坏单次金额，`pricingVersion` 必须标识用户采用的计价快照。缺少配置、预留失败或余额不足时不会启动 Provider；无法获得可信实际金额时保留整笔预留并标记用量未知。该账本用于 Bridge 硬门和恢复判断，不替代 Provider 官方账单。
+真实 Pi 或 Codex Provider 需要 `costBudget`。`costBudget` 的数值是**无单位的最坏单次调用配额**，不含 `currency` / `pricingVersion`：`limit` 是该 Run 的调用配额上限，`maxPiCallCost` / `maxCodexCallCost` 是调用前原子预留的最坏单次配额。缺少配置、预留失败或余额不足时不会启动 Provider；无法获得可信实际用量时保留整笔预留并标记用量未知。该账本用于 Bridge 硬门和恢复判断，不替代 Provider 官方账单。
 
-### 成本预留心跳与人工核销
+### 调用配额预留心跳与人工核销（代码/库表沿用 `cost_*` 旧名）
+
+> 说明：配额语义下的「预留」机制在源码与 SQLite 中仍沿用历史标识符（`cost_reservations` 表、`reserveCost` / `settleCost`、`budget` CLI、`costReservationHeartbeatMs` 等）。这些是内部命名，不代表货币金额；数值一律按无单位配额解释。
 
 - **心跳**：Pi worker 与 Codex reviewer 执行期间，预留的 `lease_expires_at` 按 lease 窗口的 1/3 或更短周期自动续期（lease 窗口 = `max(workerTimeoutMs, 120s) + 60s`），避免长调用被陈旧回收器误判。心跳写库失败只记录、不中断 worker（sink failure 不改变业务语义）。心跳间隔是内部实现细节，默认由 lease 窗口推导，不暴露为项目配置项；测试通过 `SchedulerConfig.costReservationHeartbeatMs` 注入覆盖。
-- **人工核销**：进程被 SIGKILL 后无法结算的预留会停在 `unavailable`，永久占用额度。用 `brainctl budget write-off --reservation <id> --decision-note "<原因>"` 显式核销（只允许 `unavailable`；`reserved`/`spawned` 一律拒绝，防止误核销在跑调用）。核销后该预留不再计入 remaining，状态变为 `written_off` 终态。**账目语义**：`released` = 证明没花钱；`written_off` = 可能花了钱但用户决定不再占用额度——两者在查询中可区分，审计事件记录金额、理由与时间。
+- **人工核销**：进程被 SIGKILL 后无法结算的预留会停在 `unavailable`，永久占用配额。用 `brainctl budget write-off --reservation <id> --decision-note "<原因>"` 显式核销（只允许 `unavailable`；`reserved`/`spawned` 一律拒绝，防止误核销在跑调用）。核销后该预留不再计入 remaining，状态变为 `written_off` 终态。**账目语义**：`released` = 证明未消耗配额（未产生调用）；`written_off` = 可能已消耗配额但用户决定不再占用——两者在查询中可区分，审计事件记录预留、理由与时间。
 - 先看后销：`brainctl budget list --status unavailable` 只读盘点后再决定核销。Dashboard 保持只读，无任何写端点。
 
 ### Pi guard 运行时自检（`worker.verifiedPiVersion`）
 
-真实 Pi 澄清会话开始前（每 run/每版本缓存一次）会跑一个**零推理探针**：加载同构探针扩展，验证扩展真的被加载、`pi.on('tool_call')` 真的注册成功、事件系统真的触发（`session_start`）。探针进程用 `--mode rpc --offline --no-session` 加立即 EOF 的 stdin，不发任何 prompt——**不产生任何模型推理与 Provider 费用**。任何信号缺失即 fail closed：拒绝启动该澄清会话（暂停并明确告知可能是 Pi CLI 版本变更）。
+真实 Pi 澄清会话开始前（每 run/每版本缓存一次）会跑一个**零推理探针**：加载同构探针扩展，验证扩展真的被加载、`pi.on('tool_call')` 真的注册成功、事件系统真的触发（`session_start`）。探针进程用 `--mode rpc --offline --no-session` 加立即 EOF 的 stdin，不发任何 prompt——**不产生任何模型推理、不消耗调用配额**。任何信号缺失即 fail closed：拒绝启动该澄清会话（暂停并明确告知可能是 Pi CLI 版本变更）。
 
 - `worker.verifiedPiVersion`（默认 `0.82.1`）是已验证的 Pi CLI 版本。检测到实际版本不匹配时输出**显著警告**，但不会直接拒绝运行——探针必须通过才继续；升级 Pi 后如探针通过，可更新此版本号。
 - 自检结果（通过/失败、Pi 版本、耗时、失败类别、stderr SHA-256）写入 SQLite 事件 `pi_guard_selfcheck` 并出现在 `brainctl status`。**不持久化原始 Provider 输出、完整提示词或 stderr 原文**。
-- **诚实边界**：自检验证的是"扩展被加载 + handler 已注册 + 事件系统存活"，**不验证端到端的真实工具调用阻断**（那需要至少一次推理；方案见三轮汇总，需显式授权与成本预留后执行）。
+- **诚实边界**：自检验证的是"扩展被加载 + handler 已注册 + 事件系统存活"，**不验证端到端的真实工具调用阻断**（那需要至少一次推理；方案见三轮汇总，需显式授权与调用配额预留后执行）。
 
 ### B：阻断语义端到端探针（一次最小推理，已授权待首次执行）
 
 `worker.allowInferenceProbe: true` 时，A 自检通过后会对**未缓存**的 Pi 版本跑一次最小推理探针：在隔离探针目录请求一个**必定越界**的 `read` 调用，验证 guard 真的在 `tool_call` 阶段拦截（violation marker 出现）。
 
-- **成本**：一次最小推理（默认 `deepseek/deepseek-v4-flash`），**必须走成本预留硬门**（`reserveCost` → 探针 → `settleCost`），绝不标免费或绕过 ledger。
-- **缓存**：按 `pi --version` 完整版本持久化到 SQLite（`pi_guard_probe_cache` 表）；同版本已通过即复用，不再花钱。
+- **配额消耗**：一次最小推理（默认 `deepseek/deepseek-v4-flash`），**必须走调用配额预留硬门**（`reserveCost` → 探针 → `settleCost`），绝不标免费或绕过 ledger。
+- **缓存**：按 `pi --version` 完整版本持久化到 SQLite（`pi_guard_probe_cache` 表）；同版本已通过即复用，不再消耗配额。
 - **失败分类（处置不同）**：
   - `guard_ineffective`（收到响应但 `tool_execution_start` 越界事件出现，第一层未拦截）→ **guard 失效**，fail closed 拒绝启动澄清会话；
   - `provider_unavailable`（限流/网络/余额/认证）→ 报**"无法验证"**并暂停（不是 guard 失效），结算为 `released`；
   - `probe_timeout` / `inconclusive`（模型未发起工具调用）→ 报"无法验证"并暂停，结算为 `unavailable`。
-- **首次执行**：即使已配置，第一次真实发起前必须由用户显式同意（agent 会停下说明"即将发起一次 ¥X 的推理探针"）。
-- 零成本 A 自检始终执行；B 是 A 之上的加强，不是替代。
+- **首次执行**：即使已配置，第一次真实发起前必须由用户显式同意（agent 会停下说明"即将发起一次消耗调用配额 X 的推理探针"）。
+- 零推理、不消耗调用配额的 A 自检始终执行；B 是 A 之上的加强，不是替代。
 
 非注入的真实 `worker.type=real-pi` 必须搭配 `reviewer.type=codex-cli`。`local-rule` 仅供 fake/disposable 验证，不能批准真实 Pi 成果。
 
