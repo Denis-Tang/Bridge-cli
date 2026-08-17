@@ -69,6 +69,8 @@ export interface AttemptFacts {
   locksOrphaned: boolean;
   reviewCompleted: boolean;      // review exists and finished
   reviewStatus: string | null;
+  /** True when the attempt's approved state is covered by a valid trusted stage review. */
+  reviewCoveredByTrustedStageReview: boolean;
 }
 
 /** Integration batch facts */

@@ -23,6 +23,8 @@ import { preCheckBudget } from './token-budget.js';
 import { SqliteLedgerSink } from './token-telemetry.js';
 import { startCostReservationHeartbeat, stopCostReservationHeartbeat } from './cost-heartbeat.js';
 import { isBranchMerged } from './reconciliation/git-fact-checker.js';
+import { parseReviewMetadataReviewer } from '../cli/commands/reconcile.js';
+import { prepareIntWorktreeDeps } from './int-deps.js';
 
 function git(cwd: string, args: string[]): string {
   return execFileSync('git', args, {
@@ -51,6 +53,13 @@ export interface StageIntegrationConfig {
   workerTimeoutMs?: number;
   /** R2: cost reservation heartbeat interval (ms); default lease window / 3. */
   costReservationHeartbeatMs?: number;
+  /**
+   * Prepare dependencies inside a freshly created integration worktree BEFORE
+   * the stage quality gate runs. The default provisions a run-local deps copy
+   * and junctions the worktree's node_modules to it (never the main repo's
+   * node_modules). Provide a custom function to override.
+   */
+  prepareIntDeps?: (worktreePath: string, runId: string) => void | Promise<void>;
 }
 
 export interface StagePauseRequest {
@@ -250,6 +259,27 @@ export class StageIntegrationCoordinator {
       const ip = resolve(this.config.projectRoot, ir);
       mkdirSync(dirname(ip), { recursive: true });
       wtm.createWorktree(ib, ir);
+
+      // ── Dependency readiness BEFORE the stage gate (task 03C) ──
+      // git worktree add does not carry node_modules; on slow machines the gate
+      // can start before any deps exist. Provision a run-local deps copy and
+      // junction it into the worktree now, so gates are never racing a copy.
+      try {
+        if (this.config.prepareIntDeps) {
+          await this.config.prepareIntDeps(ip, runId);
+        } else {
+          prepareIntWorktreeDeps({
+            projectRoot: this.config.projectRoot,
+            runId,
+            worktreePath: ip,
+            extraFiles: ['postcss.config.mjs'],
+          });
+        }
+      } catch (error) {
+        // Deps are an optimization, not a gate: a missing node_modules must not
+        // silently break gates that do not need it, but a failure here is loud.
+        console.warn('[Scheduler] int worktree deps prepare failed (continuing): ' + (error instanceof Error ? error.message : String(error)));
+      }
 
       const atts = await this.store.listAttemptsByStage(stage.id);
       const integrationSpecs = new Map<string, StructuredTaskSpec>();
@@ -604,6 +634,10 @@ export class StageIntegrationCoordinator {
       }
 
       let targetBranch = this.config.targetBranch;
+      // Hoisted so the stage_completed event below records the target tip rather
+      // than HEAD: the pre-merged path intentionally skips checkout, so HEAD may
+      // not be on the target branch.
+      let targetMergeCommit = '';
       try {
         // P0-2: fail closed when the real project worktree is dirty before any
         // checkout/merge. `brainctl init` only *suggests* gitignoring
@@ -639,33 +673,61 @@ export class StageIntegrationCoordinator {
         try { git(this.config.projectRoot, ['rev-parse', '--verify', '--end-of-options', targetBranch]); }
         catch { console.log('[Scheduler] Target branch ' + targetBranch + ' not found. Using current branch: ' + currentBranch); targetBranch = currentBranch; }
         const targetHeadBeforeMerge = git(this.config.projectRoot, ['rev-parse', targetBranch]);
-        if (targetHeadBeforeMerge !== base) {
+        // `targetHeadBeforeMerge === base` is only a PROXY for the real invariant
+        // asserted below: after this step the target tree must equal the reviewed
+        // tree. A target that already absorbed the reviewed integration commit
+        // exactly satisfies that same invariant, so it is accepted without a
+        // second merge. Anything else still pauses.
+        const preMerged = this.detectAlreadyMergedReviewedTree(targetBranch, targetHeadBeforeMerge, mh, base);
+        if (targetHeadBeforeMerge !== base && !preMerged.accepted) {
           const pausedAt = new Date().toISOString();
-          await this.store.updateIntegrationBatch(batch.id, { status: 'conflict', conflictsJson: JSON.stringify({ reason: 'target_advanced_after_final_review', expectedBase: base, actualTargetHead: targetHeadBeforeMerge }), finishedAt: pausedAt });
+          const conflictDetail = { reason: 'target_advanced_after_final_review', expectedBase: base, actualTargetHead: targetHeadBeforeMerge, preMergedRejectedBecause: preMerged.reason };
+          await this.store.updateIntegrationBatch(batch.id, { status: 'conflict', conflictsJson: JSON.stringify(conflictDetail), finishedAt: pausedAt });
           await this.recordStagePause({
             runId, stageId: stage.id, reasonCode: 'target_advanced_after_final_review',
-            category: 'integration', eventData: { expectedBase: base, actualTargetHead: targetHeadBeforeMerge }, createdAt: pausedAt,
+            category: 'integration', eventData: conflictDetail, createdAt: pausedAt,
           });
           await this.mergeBlockApprovedTasks(stageTasks, pausedAt);
-          await this.store.createEvent({ id: this.nextEventId(runId, 'ev-target-advanced'), runId, stageId: stage.id, eventType: 'integration_conflict', eventData: { reason: 'target_advanced_after_final_review', expectedBase: base, actualTargetHead: targetHeadBeforeMerge } });
+          await this.store.createEvent({ id: this.nextEventId(runId, 'ev-target-advanced'), runId, stageId: stage.id, eventType: 'integration_conflict', eventData: conflictDetail });
           return false;
         }
-        const worktreeList = git(this.config.projectRoot, ['worktree', 'list', '--porcelain']);
-        const checkedOutBranches = worktreeList.split('\n').filter((line) => line.startsWith('branch ')).map((line) => line.replace(/^branch refs\/heads\//, '').trim());
-        if (currentBranch !== targetBranch) {
-          if (checkedOutBranches.some((b) => b === targetBranch || b === 'refs/heads/' + targetBranch)) {
-            console.log('[Scheduler] WARNING: target branch ' + targetBranch + ' checked out in another worktree. Attempting checkout in main worktree.');
+
+        if (targetHeadBeforeMerge !== base) {
+          // Already merged by a prior (possibly manual) merge, proven by ancestry
+          // + exact tree equality. Reuse the existing Review; never re-review and
+          // never create a second merge commit.
+          targetMergeCommit = targetHeadBeforeMerge;
+          await this.store.createEvent({
+            id: this.nextEventId(runId, 'ev-target-pre-merged'), runId, stageId: stage.id,
+            eventType: 'integration_completed',
+            eventData: {
+              targetBranch, targetMergeCommit, integrationBranch: ib,
+              reason: 'target_already_contains_reviewed_tree',
+              reviewedIntegrationCommit: mh, reviewedTree: preMerged.reviewedTree, stageBase: base,
+            },
+          });
+          console.log('[Scheduler] Target branch ' + targetBranch + ' already contains the reviewed tree ('
+            + 'reviewed ' + mh.slice(0, 12) + ' is an ancestor and trees match ' + preMerged.reviewedTree.slice(0, 12)
+            + '); skipping a second merge and reusing the passed review.');
+        } else {
+          const worktreeList = git(this.config.projectRoot, ['worktree', 'list', '--porcelain']);
+          const checkedOutBranches = worktreeList.split('\n').filter((line) => line.startsWith('branch ')).map((line) => line.replace(/^branch refs\/heads\//, '').trim());
+          if (currentBranch !== targetBranch) {
+            if (checkedOutBranches.some((b) => b === targetBranch || b === 'refs/heads/' + targetBranch)) {
+              console.log('[Scheduler] WARNING: target branch ' + targetBranch + ' checked out in another worktree. Attempting checkout in main worktree.');
+            }
+            git(this.config.projectRoot, ['checkout', targetBranch]);
           }
-          git(this.config.projectRoot, ['checkout', targetBranch]);
+          git(this.config.projectRoot, ['merge', '--no-ff', '--no-edit', '--', ib]);
+          targetMergeCommit = git(this.config.projectRoot, ['rev-parse', 'HEAD']);
+          await this.store.createEvent({ id: runId + '-ev-target-merge-' + Date.now(), runId, stageId: stage.id, eventType: 'integration_completed', eventData: { targetBranch, targetMergeCommit, integrationBranch: ib } });
+          console.log('[Scheduler] Target branch merge complete: ' + ib + ' -> ' + targetBranch + ' (' + targetMergeCommit + ')');
         }
-        git(this.config.projectRoot, ['merge', '--no-ff', '--no-edit', '--', ib]);
-        const targetMergeCommit = git(this.config.projectRoot, ['rev-parse', 'HEAD']);
+        // The invariant both paths must satisfy, asserted identically.
         const reviewedTree = git(this.config.projectRoot, ['rev-parse', `${mh}^{tree}`]);
         const finalTree = git(this.config.projectRoot, ['rev-parse', `${targetMergeCommit}^{tree}`]);
         if (reviewedTree !== finalTree) throw new Error('final merge tree differs from the reviewed integration tree');
         await this.store.updateIntegrationBatch(batch.id, { status: 'completed', mergeCommitHash: targetMergeCommit, targetMergeCommit: targetMergeCommit, finalCommit: targetMergeCommit, reviewCoverageStatus: 'complete', finishedAt: new Date().toISOString() });
-        await this.store.createEvent({ id: runId + '-ev-target-merge-' + Date.now(), runId, stageId: stage.id, eventType: 'integration_completed', eventData: { targetBranch, targetMergeCommit, integrationBranch: ib } });
-        console.log('[Scheduler] Target branch merge complete: ' + ib + ' -> ' + targetBranch + ' (' + targetMergeCommit + ')');
       } catch (mergeErr: any) {
         const errMsg = mergeErr.message || String(mergeErr);
         const pausedAt = new Date().toISOString();
@@ -686,7 +748,7 @@ export class StageIntegrationCoordinator {
       }
       await this.store.updateStageStatus(stage.id, 'completed', mergedAt);
       await this.store.releaseActualPathClaimsForStage(stage.id, mergedAt);
-      await this.store.createEvent({ id: runId + '-ev-int-ok-' + Date.now(), runId, stageId: stage.id, eventType: 'stage_completed', eventData: { stageNumber: stage.stageNumber, targetBranch, targetMergeCommit: git(this.config.projectRoot, ['rev-parse', 'HEAD']) } });
+      await this.store.createEvent({ id: runId + '-ev-int-ok-' + Date.now(), runId, stageId: stage.id, eventType: 'stage_completed', eventData: { stageNumber: stage.stageNumber, targetBranch, targetMergeCommit } });
       console.log('[Scheduler] Stage ' + stage.stageNumber + ' integrated + merged to ' + targetBranch + '.');
       if (this.config.cleanupMergedWorktrees || this.config.allowRealWorker || this.config.allowRealReviewer) {
         await this.cleanupMergedStageWorktrees(runId, stage.id, wtm, atts, ib, ip);
@@ -701,6 +763,171 @@ export class StageIntegrationCoordinator {
       });
       await this.mergeBlockApprovedTasks(stageTasks, pausedAt);
       return false;
+    }
+  }
+
+  /**
+   * Protected re-entry for a stage whose tasks are `merge_blocked` but whose
+   * target branch already contains EXACTLY the reviewed integration tree.
+   *
+   * This is the only way out of `merge_blocked` other than human rework, and it
+   * exists because the block can become obsolete: once the target holds the
+   * reviewed tree, the merge that was blocked has effectively already happened.
+   *
+   * Converges only when every one of these holds, and never calls a Reviewer,
+   * never creates a merge commit, and never touches Git state:
+   *  - a batch exists carrying the reviewed integration commit;
+   *  - its review coverage is `complete` and the reviewer was available;
+   *  - every task's latest attempt is approved / review_skipped;
+   *  - the Git proof in detectAlreadyMergedReviewedTree() passes.
+   * Otherwise it returns a reason and the caller records a PauseRecord.
+   */
+  async tryConvergePreMergedBlockedStage(
+    stage: StageRecord,
+    runId: string,
+    wtm: WorktreeManager,
+    base: string,
+  ): Promise<{ outcome: 'converged' } | { outcome: 'rejected'; reason: string }> {
+    const batches = await this.store.listIntegrationBatches(stage.id);
+    const candidate = [...batches]
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : 1))
+      .at(-1);
+    if (!candidate) return { outcome: 'rejected', reason: 'no_integration_batch_for_stage' };
+    const reviewedCommit = candidate.reviewedThroughCommit || candidate.mergeCommitHash;
+    if (!reviewedCommit) return { outcome: 'rejected', reason: 'batch_has_no_reviewed_integration_commit' };
+    if (candidate.reviewCoverageStatus !== 'complete') {
+      return { outcome: 'rejected', reason: 'review_coverage_not_complete: ' + candidate.reviewCoverageStatus };
+    }
+    if (candidate.reviewerUnavailable) {
+      return { outcome: 'rejected', reason: 'reviewer_was_unavailable_for_this_batch' };
+    }
+    // Align with reconcile's trusted-stage-review standard: a completed batch
+    // is only trustworthy when the final integrated-tree review came from the
+    // real codex-cli reviewer. A null/foreign/metadata-less reviewer must not
+    // let a merge_blocked stage converge on weaker evidence.
+    if (parseReviewMetadataReviewer(candidate.reviewMetadataJson) !== 'codex-cli') {
+      return { outcome: 'rejected', reason: 'reviewer_not_codex_cli_for_this_batch' };
+    }
+
+    const stageTasks = await this.tasksForStage(stage, runId);
+    if (stageTasks.length === 0) return { outcome: 'rejected', reason: 'stage_has_no_tasks' };
+    for (const task of stageTasks) {
+      const latest = await this.store.getLatestAttempt(task.id);
+      if (!latest || (latest.status !== 'approved' && latest.status !== 'review_skipped')) {
+        return { outcome: 'rejected', reason: 'task_latest_attempt_not_approved: ' + task.id };
+      }
+    }
+
+    let targetBranch = this.config.targetBranch;
+    let targetHead: string;
+    try {
+      const currentBranch = git(this.config.projectRoot, ['rev-parse', '--abbrev-ref', 'HEAD']);
+      try { git(this.config.projectRoot, ['rev-parse', '--verify', '--end-of-options', targetBranch]); }
+      catch { targetBranch = currentBranch; }
+      targetHead = git(this.config.projectRoot, ['rev-parse', targetBranch]);
+    } catch (error) {
+      return { outcome: 'rejected', reason: 'cannot_resolve_target_branch: ' + (error instanceof Error ? error.message : String(error)) };
+    }
+
+    const stageBase = candidate.baseCommit || base;
+    const proof = this.detectAlreadyMergedReviewedTree(targetBranch, targetHead, reviewedCommit, stageBase);
+    if (!proof.accepted) return { outcome: 'rejected', reason: proof.reason };
+
+    // Proven: converge state only, always along legal transitions — the state
+    // machine is never relaxed. Tasks: merge_blocked → approved → merged.
+    // Stage: running → integration → completed (a blocked stage was left in
+    // `running`, and `running → completed` is not a legal edge).
+    const now = new Date().toISOString();
+    if (stage.status === 'running') {
+      if (!await this.store.updateStageStatus(stage.id, 'integration', now)) {
+        return { outcome: 'rejected', reason: 'cannot_move_stage_to_integration_for_convergence' };
+      }
+    }
+    for (const task of stageTasks) {
+      const current = await this.store.getTask(task.id);
+      if (current?.status === 'merge_blocked') {
+        const restored = await this.store.updateTaskStatus(task.id, 'approved', now);
+        if (!restored) {
+          return { outcome: 'rejected', reason: 'cannot_restore_merge_blocked_task_to_approved: ' + task.id };
+        }
+      }
+    }
+    await this.store.updateIntegrationBatch(candidate.id, {
+      status: 'completed', targetMergeCommit: targetHead, finalCommit: targetHead,
+      // Mirror the normal merge path (mergeCommitHash = actual target tip):
+      // reconciliation resolves mergeCommitTree from this field, and the tree
+      // must equal the reviewed tree — storing the reviewed integration commit
+      // here would let reconcile validate the reviewed tree against itself.
+      mergeCommitHash: targetHead,
+      reviewCoverageStatus: 'complete', finishedAt: now,
+      conflictsJson: null,
+    });
+    await this.store.createEvent({
+      id: this.nextEventId(runId, 'ev-premerged-converge'), runId, stageId: stage.id,
+      eventType: 'integration_completed',
+      eventData: {
+        targetBranch, targetMergeCommit: targetHead, integrationBranch: candidate.integrationBranch,
+        reason: 'merge_blocked_converged_target_already_contains_reviewed_tree',
+        reviewedIntegrationCommit: reviewedCommit, reviewedTree: proof.reviewedTree, stageBase,
+        reviewerReused: true,
+      },
+    });
+    console.log('[Scheduler] Stage ' + stage.stageNumber + ' was merge_blocked but the target already contains the '
+      + 'reviewed tree (' + proof.reviewedTree.slice(0, 12) + '); converging state and reusing the passed review.');
+    const reloaded = await this.store.getIntegrationBatch?.(candidate.id) ?? { ...candidate, targetMergeCommit: targetHead };
+    if (!await this.completeIdempotentIntegration(stage, runId, wtm, reloaded)) {
+      return { outcome: 'rejected', reason: 'state_tail_convergence_failed' };
+    }
+    return { outcome: 'converged' };
+  }
+
+  /**
+   * Decide whether the target branch already contains EXACTLY the reviewed
+   * integration tree, so a second merge would be a no-op.
+   *
+   * Accepts only when all three hold, and rejects on any git failure:
+   *  1. the reviewed integration commit is an ancestor of the target — the
+   *     reviewed work is genuinely present, not merely coincidentally similar;
+   *  2. the stage base is an ancestor of the target — same history line, not a
+   *     rewritten or unrelated one;
+   *  3. the target tree equals the reviewed tree byte-for-byte — nothing extra
+   *     landed on top of what was reviewed.
+   *
+   * Any one alone is insufficient: (3) without (1) can match by coincidence, and
+   * (1) without (3) means something was merged afterwards and is unreviewed.
+   * Together they imply the same invariant the normal merge path asserts, which
+   * is why this path may reuse the existing Review instead of calling a Reviewer.
+   */
+  private detectAlreadyMergedReviewedTree(
+    targetBranch: string,
+    targetHead: string,
+    reviewedIntegrationCommit: string,
+    stageBase: string,
+  ): { accepted: boolean; reason: string; reviewedTree: string } {
+    try {
+      const isAncestor = (candidate: string): boolean => {
+        try {
+          git(this.config.projectRoot, ['merge-base', '--is-ancestor', '--end-of-options', candidate, targetBranch]);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      const reviewedTree = git(this.config.projectRoot, ['rev-parse', `${reviewedIntegrationCommit}^{tree}`]);
+      if (!isAncestor(reviewedIntegrationCommit)) {
+        return { accepted: false, reason: 'reviewed_integration_commit_not_ancestor_of_target', reviewedTree };
+      }
+      if (!isAncestor(stageBase)) {
+        return { accepted: false, reason: 'stage_base_not_ancestor_of_target', reviewedTree };
+      }
+      const targetTree = git(this.config.projectRoot, ['rev-parse', `${targetHead}^{tree}`]);
+      if (targetTree !== reviewedTree) {
+        return { accepted: false, reason: 'target_tree_differs_from_reviewed_tree', reviewedTree };
+      }
+      return { accepted: true, reason: 'target_already_contains_reviewed_tree', reviewedTree };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return { accepted: false, reason: 'pre_merge_probe_failed: ' + detail, reviewedTree: '' };
     }
   }
 

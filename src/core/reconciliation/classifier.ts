@@ -259,14 +259,22 @@ function classifyAttempt(
         ['expected_write_missing', attempt.attemptId, String(expectedWritePaths.length), String(changedFiles.length)],
       ));
     }
-    if (!attempt.reviewCompleted || !attempt.reviewEvidenceTrusted) {
+    // A completed per-task review that is fake/untrusted always blocks, even if
+    // a trusted stage review also covers the attempt. Only a genuinely missing
+    // per-task review may be substituted by a valid trusted stage review.
+    if (attempt.reviewCompleted && !attempt.reviewEvidenceTrusted) {
       findings.push(makeFinding(
         runId, 'attempt', attempt.attemptId,
-        attempt.reviewCompleted ? 'fake_review_in_real_path' : 'review_evidence_missing', 'blocking',
-        attempt.reviewCompleted
-          ? `Attempt ${attempt.attemptNumber} is approved with review evidence marked fake or untrusted.`
-          : `Attempt ${attempt.attemptNumber} is approved without completed review evidence.`,
-        [attempt.reviewCompleted ? 'fake_review_in_real_path' : 'review_evidence_missing', attempt.attemptId, attempt.reviewStatus || 'none'],
+        'fake_review_in_real_path', 'blocking',
+        `Attempt ${attempt.attemptNumber} is approved with review evidence marked fake or untrusted.`,
+        ['fake_review_in_real_path', attempt.attemptId, attempt.reviewStatus || 'none'],
+      ));
+    } else if (!attempt.reviewCompleted && !attempt.reviewCoveredByTrustedStageReview) {
+      findings.push(makeFinding(
+        runId, 'attempt', attempt.attemptId,
+        'review_evidence_missing', 'blocking',
+        `Attempt ${attempt.attemptNumber} is approved without completed review evidence.`,
+        ['review_evidence_missing', attempt.attemptId, attempt.reviewStatus || 'none'],
       ));
     }
     return;

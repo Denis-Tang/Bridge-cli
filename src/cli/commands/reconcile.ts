@@ -7,6 +7,8 @@
 
 import { Command } from 'commander';
 import { resolve } from 'node:path';
+// execFileSync is imported here at the top of the file and used by
+// resolveGitRevParse() / getChangedFiles() below (git rev-parse --verify).
 import { execFileSync } from 'node:child_process';
 import { readSqliteConfigFromEnv } from '../../state/sqlite-config.js';
 import { SqliteStateStore } from '../../state/sqlite-store.js';
@@ -25,6 +27,7 @@ import {
 import { isLockOrphaned } from '../../core/reconciliation/lock-validator.js';
 import { resolveIntegrationTargetBranch } from '../../core/reconciliation/target-branch-resolver.js';
 import { gatherGovernanceFacts } from '../../core/reconciliation/governance-fact-gatherer.js';
+import type { IntegrationBatchRecord, EventRecord } from '../../types/m2-types.js';
 import type {
   ReconciliationFactSnapshot,
   ReconciliationPhase,
@@ -203,7 +206,8 @@ async function gatherRunFacts(
 
   // Stage facts
   const stages = await store.listStages(runId);
-  const events = await store.listEvents(runId);
+  const events = sortByCreatedAtThenId(await store.listEvents(runId));
+  const runTrustedTokenEfficient = isTrustedTokenEfficientExecution(run.executionConfigSnapshot);
   const activeRunLocks = (await store.getActiveLocksForRun(runId))
     .filter((lock) => lock.status === 'locked');
   const governance = runFacts.governanceEnabled
@@ -212,6 +216,44 @@ async function gatherRunFacts(
   const stageFacts: StageFacts[] = [];
 
   for (const stage of stages) {
+    // Only the latest integration batch may supply a trusted stage review
+    // proof. Selection is deterministic (createdAt, then id) and fail-closed:
+    // an invalid latest batch never falls back to an older one.
+    const batches = sortByCreatedAtThenId(await store.listIntegrationBatches(stage.id));
+    const latestBatch = batches.length > 0 ? batches[batches.length - 1] : null;
+
+    let integrationFacts: IntegrationFacts | null = null;
+    let gitProof: GitProofResult | null = null;
+    if (latestBatch) {
+      const batch = latestBatch;
+      const intBranchExists = await gatherer.branchExists(
+        run.projectRoot, batch.integrationBranch);
+      const mergeCommitInGit = batch.mergeCommitHash
+        ? await gatherer.isCommitReachable(run.projectRoot, batch.mergeCommitHash)
+        : false;
+      const targetBranch = resolveIntegrationTargetBranch(
+        events,
+        stage.id,
+        batch.integrationBranch,
+      );
+      const targetAlreadyMerged = targetBranch !== null
+        ? await gatherer.isBranchMerged(run.projectRoot, batch.integrationBranch, targetBranch)
+        : false;
+
+      integrationFacts = {
+        batchId: batch.id,
+        status: batch.status,
+        integrationBranch: batch.integrationBranch,
+        integrationBranchExists: intBranchExists,
+        mergeCommitInGit,
+        targetAlreadyMerged,
+        targetBranch,
+        targetMergeCommit: batch.targetMergeCommit,
+      };
+
+      gitProof = resolveTrustedStageReviewGitProof(run.projectRoot, batch);
+    }
+
     const tasks = await store.listTasksByStage(stage.id);
     const taskFacts: TaskFacts[] = [];
 
@@ -306,14 +348,33 @@ async function gatherRunFacts(
           && taskLocks.length > 0
           && isLockOwnerStatusOrphaned(attempt.status);
 
-        // Review check
-        const reviews = await store.listReviewsByTask(attempt.taskId);
+        // Review check — attempt-scoped: reviews are written per attempt, and
+        // a rework_required review on an OLD attempt must not count as
+        // completion evidence for the CURRENT attempt (token-efficient skips
+        // rely on this to fall back to trusted stage review coverage).
+        const reviews = await store.listReviewsByAttempt(attempt.id);
         const latestReview = reviews[reviews.length - 1];
         const reviewCompleted = latestReview
           ? (latestReview.status === 'approved' || latestReview.status === 'rework_required' || latestReview.status === 'failed')
           : false;
         const reviewStatus = latestReview?.status || null;
         const reviewEvidenceTrusted = isReviewEvidenceTrusted(latestReview?.reviewJson, reviewStatus);
+        const reviewCoveredByTrustedStageReview = runTrustedTokenEfficient
+          && latestBatch !== null
+          && gitProof !== null
+          && computeTrustedStageReviewCoverage({
+            trustedExecutionMode: runTrustedTokenEfficient,
+            attempt: {
+              attemptId: attempt.id,
+              taskId: attempt.taskId,
+              stageId: attempt.stageId,
+              status: attempt.status,
+              reviewCompleted,
+            },
+            latestBatch,
+            events,
+            gitProof,
+          });
 
         attemptFacts.push({
           attemptId: attempt.id,
@@ -346,6 +407,7 @@ async function gatherRunFacts(
           reviewCompleted,
           reviewStatus,
           reviewEvidenceTrusted,
+          reviewCoveredByTrustedStageReview,
         });
       }
 
@@ -357,36 +419,6 @@ async function gatherRunFacts(
       });
     }
 
-    // Integration facts
-    let integrationFacts: IntegrationFacts | null = null;
-    const batches = await store.listIntegrationBatches(stage.id);
-    if (batches.length > 0) {
-      const batch = batches[0]; // usually 1 per stage
-      const intBranchExists = await gatherer.branchExists(
-        run.projectRoot, batch.integrationBranch);
-      const mergeCommitInGit = batch.mergeCommitHash
-        ? await gatherer.isCommitReachable(run.projectRoot, batch.mergeCommitHash)
-        : false;
-      const targetBranch = resolveIntegrationTargetBranch(
-        events,
-        stage.id,
-        batch.integrationBranch,
-      );
-      const targetAlreadyMerged = targetBranch !== null
-        ? await gatherer.isBranchMerged(run.projectRoot, batch.integrationBranch, targetBranch)
-        : false;
-
-      integrationFacts = {
-        batchId: batch.id,
-        status: batch.status,
-        integrationBranch: batch.integrationBranch,
-        integrationBranchExists: intBranchExists,
-        mergeCommitInGit,
-        targetAlreadyMerged,
-        targetBranch,
-        targetMergeCommit: batch.targetMergeCommit,
-      };
-    }
     stageFacts.push({
       stageId: stage.id,
       stageNumber: stage.stageNumber,
@@ -426,6 +458,256 @@ async function gatherRunFacts(
     stages: stageFacts,
     governance,
   };
+}
+
+// ══════════════════════════════════════════════════════════════
+// Trusted stage review proof (pure decision helpers)
+// ══════════════════════════════════════════════════════════════
+
+/** Sort audit rows deterministically by createdAt, then id. */
+export function sortByCreatedAtThenId<T extends { createdAt: string; id: string }>(
+  records: readonly T[],
+): T[] {
+  return [...records].sort((a, b) => {
+    const createdAtOrder = a.createdAt.localeCompare(b.createdAt);
+    if (createdAtOrder !== 0) return createdAtOrder;
+    return a.id.localeCompare(b.id);
+  });
+}
+
+/** Select only the latest integration batch; never fall back to older batches. */
+export function selectLatestIntegrationBatch(
+  batches: readonly IntegrationBatchRecord[],
+): IntegrationBatchRecord | null {
+  const sorted = sortByCreatedAtThenId(batches);
+  return sorted.length > 0 ? sorted[sorted.length - 1] : null;
+}
+
+/**
+ * Parse the persisted execution config snapshot directly as JSON and decide
+ * whether it proves token-efficient execution with the codex-cli reviewer.
+ * NULL, absent, malformed, wrong types, or wrong values are all untrusted.
+ */
+export function isTrustedTokenEfficientExecution(
+  executionConfigSnapshot: string | null | undefined,
+): boolean {
+  if (typeof executionConfigSnapshot !== 'string' || executionConfigSnapshot.trim() === '') {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(executionConfigSnapshot) as {
+      config?: {
+        executionMode?: unknown;
+        reviewer?: { type?: unknown };
+      } | null;
+    } | null;
+    if (!parsed || typeof parsed !== 'object') return false;
+    const config = parsed.config;
+    if (!config || typeof config !== 'object') return false;
+    const reviewer = config.reviewer;
+    if (!reviewer || typeof reviewer !== 'object') return false;
+    return config.executionMode === 'token-efficient' && reviewer.type === 'codex-cli';
+  } catch {
+    return false;
+  }
+}
+
+/** Parse reviewMetadataJson and return the reviewer string, if any. */
+export function parseReviewMetadataReviewer(reviewMetadataJson: string | null): string | null {
+  if (!reviewMetadataJson) return null;
+  try {
+    const parsed = JSON.parse(reviewMetadataJson) as { reviewer?: unknown };
+    return typeof parsed.reviewer === 'string' ? parsed.reviewer : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validate the latest integration batch as a trusted stage review proof.
+ * Fail-closed: complete coverage, reviewer available, codex-cli reviewer,
+ * non-empty commits, and both commit tree resolutions succeed and are equal
+ * (reviewed tree == final merge tree).
+ *
+ * NOTES on why branch/head equality is intentionally lenient:
+ * - We do NOT require reviewedThroughCommit === mergeCommitHash. The normal
+ *   path merges the integration branch with `--no-ff` (stage-integration
+ *   updates mergeCommitHash to the new target merge commit), so the two hashes
+ *   differ by construction while their trees are identical. Requiring hash
+ *   equality would make every legitimately completed token-efficient batch
+ *   fail trusted-stage-review and be mis-classified as review_evidence_missing.
+ * - We do NOT require the integration branch ref to still exist. Successful
+ *   real runs delete the integration branch during worktree cleanup
+ *   (cleanupMergedStageWorktrees), so a post-cleanup preflight must be able to
+ *   trust the proof from persisted commits alone. If the ref still exists it
+ *   must point at the reviewed commit (fail closed on a drifted branch); a
+ *   deleted ref (null) falls back to the tree-equality invariant.
+ */
+export function isLatestBatchTrustedStageReview(
+  batch: IntegrationBatchRecord,
+  gitProof: GitProofResult,
+): boolean {
+  // Fail-closed: only a completed batch is final trusted stage review
+  // evidence. A pending/integrating/conflict/failed batch must never satisfy
+  // coverage, even if the remaining fields happen to be populated.
+  if (batch.status !== 'completed') return false;
+  if (typeof batch.integrationBranch !== 'string' || batch.integrationBranch.trim() === '') return false;
+  if (batch.reviewCoverageStatus !== 'complete') return false;
+  if (batch.reviewerUnavailable !== false) return false;
+  if (parseReviewMetadataReviewer(batch.reviewMetadataJson) !== 'codex-cli') return false;
+  if (typeof batch.reviewedThroughCommit !== 'string' || batch.reviewedThroughCommit.trim() === '') return false;
+  if (typeof batch.mergeCommitHash !== 'string' || batch.mergeCommitHash.trim() === '') return false;
+  if (gitProof.integrationBranchHead !== null && gitProof.integrationBranchHead !== batch.reviewedThroughCommit) {
+    return false;
+  }
+  if (gitProof.reviewedThroughTree === null || gitProof.mergeCommitTree === null) return false;
+  if (gitProof.reviewedThroughTree !== gitProof.mergeCommitTree) return false;
+  return true;
+}
+
+/** Check for the exact task+attempt review_skipped_token_efficient event. */
+export function hasReviewSkippedTokenEfficient(
+  events: readonly EventRecord[],
+  taskId: string,
+  attemptId: string,
+): boolean {
+  return events.some((event) =>
+    event.eventType === 'review_skipped_token_efficient'
+    && event.taskId === taskId
+    && event.attemptId === attemptId,
+  );
+}
+
+/**
+ * Check the stage review evidence chain for the exact stage/commit/task.
+ * Events are sorted by createdAt then id before matching, so a later
+ * stage_review_completed event approving the exact task must follow the
+ * matching stage_review_started event for the exact commit.
+ */
+export function hasStageReviewEvidence(
+  events: readonly EventRecord[],
+  stageId: string,
+  reviewedThroughCommit: string,
+  taskId: string,
+): boolean {
+  const sorted = sortByCreatedAtThenId(events);
+  let matchingStartSeen = false;
+  for (const event of sorted) {
+    if (event.stageId !== stageId) continue;
+    if (event.eventType === 'stage_review_started') {
+      // A start event for a different commit must reset the flag: completion
+      // may only pair with the start for the exact reviewed commit, never be
+      // borrowed from a later review of another commit.
+      matchingStartSeen = parseEventDataString(event.eventDataJson, 'reviewedCommit') === reviewedThroughCommit;
+    } else if (matchingStartSeen && event.eventType === 'stage_review_completed') {
+      // Hardening: if the completed event itself carries a reviewedCommit it
+      // must also equal the exact reviewed commit. Events without the field
+      // (the current writer omits it) stay paired with the armed start.
+      const completedCommit = parseEventDataString(event.eventDataJson, 'reviewedCommit');
+      if (completedCommit !== null && completedCommit !== reviewedThroughCommit) {
+        matchingStartSeen = false;
+        continue;
+      }
+      const approvedTasks = parseEventDataStringArray(event.eventDataJson, 'approvedTasks');
+      if (approvedTasks.includes(taskId)) return true;
+    }
+  }
+  return false;
+}
+
+export interface TrustedStageReviewAttemptContext {
+  attemptId: string;
+  taskId: string;
+  stageId: string;
+  status: string;
+  reviewCompleted: boolean;
+}
+
+export interface GitProofResult {
+  integrationBranchHead: string | null;
+  reviewedThroughTree: string | null;
+  mergeCommitTree: string | null;
+}
+
+/**
+ * Pure decision: can an approved attempt substitute its missing per-task
+ * review with a valid trusted stage review? Every check is strict and no
+ * event/approval may be borrowed from another task, attempt, or stage.
+ */
+export function computeTrustedStageReviewCoverage(input: {
+  trustedExecutionMode: boolean;
+  attempt: TrustedStageReviewAttemptContext;
+  latestBatch: IntegrationBatchRecord;
+  events: readonly EventRecord[];
+  gitProof: GitProofResult;
+}): boolean {
+  if (!input.trustedExecutionMode) return false;
+  if (input.attempt.status !== 'approved') return false;
+  if (input.attempt.reviewCompleted) return false;
+  if (!hasReviewSkippedTokenEfficient(input.events, input.attempt.taskId, input.attempt.attemptId)) return false;
+  if (!isLatestBatchTrustedStageReview(input.latestBatch, input.gitProof)) return false;
+  if (!hasStageReviewEvidence(
+    input.events,
+    input.attempt.stageId,
+    input.latestBatch.reviewedThroughCommit ?? '',
+    input.attempt.taskId,
+  )) return false;
+  return true;
+}
+
+/** Resolve the Git facts required for the fail-closed stage review proof. */
+function resolveTrustedStageReviewGitProof(
+  projectRoot: string,
+  batch: IntegrationBatchRecord,
+): GitProofResult {
+  return {
+    integrationBranchHead: resolveGitRevParse(projectRoot, batch.integrationBranch),
+    reviewedThroughTree: batch.reviewedThroughCommit
+      ? resolveGitRevParse(projectRoot, `${batch.reviewedThroughCommit}^{tree}`)
+      : null,
+    mergeCommitTree: batch.mergeCommitHash
+      ? resolveGitRevParse(projectRoot, `${batch.mergeCommitHash}^{tree}`)
+      : null,
+  };
+}
+
+function resolveGitRevParse(projectRoot: string, spec: string): string | null {
+  if (!spec) return null;
+  try {
+    const output = execFileSync('git', ['rev-parse', '--verify', spec], {
+      cwd: projectRoot,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 5000,
+    }).trim();
+    return output.length > 0 ? output : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseEventDataString(eventDataJson: string | null, field: string): string | null {
+  if (!eventDataJson) return null;
+  try {
+    const parsed = JSON.parse(eventDataJson) as Record<string, unknown>;
+    const value = parsed[field];
+    return typeof value === 'string' ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseEventDataStringArray(eventDataJson: string | null, field: string): string[] {
+  if (!eventDataJson) return [];
+  try {
+    const parsed = JSON.parse(eventDataJson) as Record<string, unknown>;
+    const value = parsed[field];
+    return Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === 'string')
+      : [];
+  } catch {
+    return [];
+  }
 }
 
 function findAttemptLeaseExpiry(events: Awaited<ReturnType<SqliteStateStore['listEvents']>>, attemptId: string): string | null {

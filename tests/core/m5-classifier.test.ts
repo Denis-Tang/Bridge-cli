@@ -5,6 +5,18 @@
 import { describe, it, expect } from 'vitest';
 import { classifyFacts, deriveSafeActions } from '../../src/core/reconciliation/classifier.js';
 import { converge } from '../../src/core/reconciliation/convergence-engine.js';
+import {
+  isTrustedTokenEfficientExecution,
+  parseReviewMetadataReviewer,
+  hasReviewSkippedTokenEfficient,
+  hasStageReviewEvidence,
+  isLatestBatchTrustedStageReview,
+  computeTrustedStageReviewCoverage,
+  selectLatestIntegrationBatch,
+  sortByCreatedAtThenId,
+} from '../../src/cli/commands/reconcile.js';
+import type { GitProofResult } from '../../src/cli/commands/reconcile.js';
+import type { IntegrationBatchRecord, EventRecord } from '../../src/types/m2-types.js';
 import type {
   ReconciliationFactSnapshot,
   RunFacts,
@@ -65,6 +77,7 @@ function makeAttemptFacts(overrides: Partial<AttemptFacts> = {}): AttemptFacts {
     reviewCompleted: false,
     reviewStatus: null,
     reviewEvidenceTrusted: false,
+    reviewCoveredByTrustedStageReview: false,
     ...overrides,
   };
 }
@@ -541,6 +554,428 @@ describe('M5 Classifier', () => {
       const pidMissing = findings.filter((f) => f.kind === 'pid_missing');
       expect(pidMissing.length).toBeGreaterThanOrEqual(1);
     });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════
+// Trusted stage review classification
+// ══════════════════════════════════════════════════════════════
+
+describe('M5 trusted stage review classification', () => {
+  it('covers a missing per-task review only when the minimal boolean fact is true', () => {
+    const approvedWithCoverage = makeAttemptFacts({
+      status: 'approved',
+      workerResultExists: true,
+      workerResultCompleted: true,
+      workerResultJson: JSON.stringify({ status: 'completed' }),
+      branchName: 'task-branch',
+      branchExists: true,
+      changedFiles: ['src/change.txt'],
+      expectedWritePaths: ['src/change.txt'],
+      expectedWriteEvidence: true,
+      reviewCompleted: false,
+      reviewStatus: null,
+      reviewCoveredByTrustedStageReview: true,
+    });
+    const snap = makeSnapshot(
+      { runStatus: 'running' },
+      [{ tasks: [makeTaskFacts({ status: 'merged', attempts: [approvedWithCoverage] })] }],
+    );
+    const findings = classifyFacts(snap, false);
+    expect(findings.some((f) => f.kind === 'review_evidence_missing')).toBe(false);
+    expect(findings.some((f) => f.kind === 'fake_review_in_real_path')).toBe(false);
+  });
+
+  it('still blocks a missing review when trusted coverage is false', () => {
+    const approvedWithoutCoverage = makeAttemptFacts({
+      status: 'approved',
+      workerResultExists: true,
+      workerResultCompleted: true,
+      workerResultJson: JSON.stringify({ status: 'completed' }),
+      branchName: 'task-branch',
+      branchExists: true,
+      changedFiles: ['src/change.txt'],
+      expectedWritePaths: ['src/change.txt'],
+      expectedWriteEvidence: true,
+      reviewCompleted: false,
+      reviewStatus: null,
+      reviewCoveredByTrustedStageReview: false,
+    });
+    const snap = makeSnapshot(
+      { runStatus: 'running' },
+      [{ tasks: [makeTaskFacts({ status: 'merged', attempts: [approvedWithoutCoverage] })] }],
+    );
+    const findings = classifyFacts(snap, false);
+    expect(findings.some((f) => f.kind === 'review_evidence_missing')).toBe(true);
+  });
+
+  it('keeps a fake/untrusted completed per-task review blocking over trusted stage coverage', () => {
+    const approvedWithFakeReview = makeAttemptFacts({
+      status: 'approved',
+      workerResultExists: true,
+      workerResultCompleted: true,
+      workerResultJson: JSON.stringify({ status: 'completed' }),
+      branchName: 'task-branch',
+      branchExists: true,
+      changedFiles: ['src/change.txt'],
+      expectedWritePaths: ['src/change.txt'],
+      expectedWriteEvidence: true,
+      reviewCompleted: true,
+      reviewStatus: 'approved',
+      reviewEvidenceTrusted: false,
+      reviewCoveredByTrustedStageReview: true,
+    });
+    const snap = makeSnapshot(
+      { runStatus: 'running' },
+      [{ tasks: [makeTaskFacts({ status: 'merged', attempts: [approvedWithFakeReview] })] }],
+    );
+    const findings = classifyFacts(snap, false);
+    expect(findings.some((f) => f.kind === 'fake_review_in_real_path')).toBe(true);
+    expect(findings.some((f) => f.kind === 'review_evidence_missing')).toBe(false);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════
+// Trusted stage review proof helpers (pure, zero git/sqlite)
+// ══════════════════════════════════════════════════════════════
+
+describe('M5 trusted stage review proof helpers', () => {
+  function makeBatch(overrides: Partial<IntegrationBatchRecord> = {}): IntegrationBatchRecord {
+    return {
+      id: 'batch-001',
+      stageId: 'stage-001',
+      runId: 'run-001',
+      status: 'completed',
+      integrationBranch: 'int-branch',
+      baseCommit: 'base-commit',
+      mergeCommitHash: 'merge-commit',
+      targetMergeCommit: null,
+      conflictsJson: null,
+      createdAt: '2024-01-01T00:00:00.000Z',
+      finishedAt: null,
+      reviewedThroughCommit: 'merge-commit',
+      finalCommit: null,
+      reviewCoverageStatus: 'complete',
+      reviewerUnavailable: false,
+      reviewMetadataJson: JSON.stringify({ reviewer: 'codex-cli' }),
+      ...overrides,
+    };
+  }
+
+  function makeEvent(overrides: Partial<EventRecord> = {}): EventRecord {
+    return {
+      id: 'ev-001',
+      runId: 'run-001',
+      stageId: 'stage-001',
+      taskId: 'task-001',
+      attemptId: 'att-001',
+      eventType: 'review_skipped_token_efficient',
+      eventDataJson: null,
+      createdAt: '2024-01-01T00:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  function makeValidGitProof(overrides: Partial<GitProofResult> = {}): GitProofResult {
+    return {
+      integrationBranchHead: 'merge-commit',
+      reviewedThroughTree: 'tree-1',
+      mergeCommitTree: 'tree-1',
+      ...overrides,
+    };
+  }
+
+  function makeAttemptContext(overrides: Record<string, unknown> = {}) {
+    return {
+      attemptId: 'att-001',
+      taskId: 'task-001',
+      stageId: 'stage-001',
+      status: 'approved',
+      reviewCompleted: false,
+      ...overrides,
+    };
+  }
+
+  it('accepts only token-efficient + codex-cli execution snapshots', () => {
+    expect(isTrustedTokenEfficientExecution(JSON.stringify({
+      snapshotVersion: 1, createdAt: '2024-01-01T00:00:00.000Z',
+      config: { executionMode: 'token-efficient', reviewer: { type: 'codex-cli' } },
+    }))).toBe(true);
+    expect(isTrustedTokenEfficientExecution(JSON.stringify({
+      snapshotVersion: 1, createdAt: '2024-01-01T00:00:00.000Z',
+      config: { executionMode: 'default', reviewer: { type: 'codex-cli' } },
+    }))).toBe(false);
+    expect(isTrustedTokenEfficientExecution(JSON.stringify({
+      snapshotVersion: 1, createdAt: '2024-01-01T00:00:00.000Z',
+      config: { executionMode: 'simple', reviewer: { type: 'codex-cli' } },
+    }))).toBe(false);
+    expect(isTrustedTokenEfficientExecution(JSON.stringify({
+      snapshotVersion: 1, createdAt: '2024-01-01T00:00:00.000Z',
+      config: { executionMode: 'token-efficient', reviewer: { type: 'local-rule' } },
+    }))).toBe(false);
+    expect(isTrustedTokenEfficientExecution(null)).toBe(false);
+    expect(isTrustedTokenEfficientExecution(undefined)).toBe(false);
+    expect(isTrustedTokenEfficientExecution('{not json')).toBe(false);
+    expect(isTrustedTokenEfficientExecution('{}')).toBe(false);
+    expect(isTrustedTokenEfficientExecution('{"config":{"executionMode":"token-efficient"}}')).toBe(false);
+    expect(isTrustedTokenEfficientExecution('{"config":{"executionMode":"token-efficient","reviewer":{"type":"codex-cli"}}}')).toBe(true);
+    expect(isTrustedTokenEfficientExecution(JSON.stringify({
+      config: { executionMode: 'token-efficient', reviewer: { type: 42 } },
+    }))).toBe(false);
+  });
+
+  it('selects the latest batch by createdAt then id and never falls back', () => {
+    const older = makeBatch({ id: 'batch-old', createdAt: '2024-01-01T00:00:00.000Z' });
+    const newer = makeBatch({ id: 'batch-new', createdAt: '2024-01-02T00:00:00.000Z', reviewCoverageStatus: 'partial' });
+    const selected = selectLatestIntegrationBatch([older, newer]);
+    expect(selected?.id).toBe('batch-new');
+    expect(selected?.reviewCoverageStatus).toBe('partial');
+
+    const sameTimeA = makeBatch({ id: 'batch-a', createdAt: '2024-01-02T00:00:00.000Z' });
+    const sameTimeB = makeBatch({ id: 'batch-b', createdAt: '2024-01-02T00:00:00.000Z' });
+    expect(selectLatestIntegrationBatch([sameTimeB, sameTimeA])?.id).toBe('batch-b');
+  });
+
+  it('requires complete coverage, reviewer available, and codex-cli metadata reviewer', () => {
+    const valid = makeValidGitProof();
+    expect(isLatestBatchTrustedStageReview(makeBatch(), valid)).toBe(true);
+    expect(isLatestBatchTrustedStageReview(makeBatch({ reviewCoverageStatus: 'partial' }), valid)).toBe(false);
+    expect(isLatestBatchTrustedStageReview(makeBatch({ reviewerUnavailable: true }), valid)).toBe(false);
+    expect(isLatestBatchTrustedStageReview(makeBatch({ reviewMetadataJson: JSON.stringify({ reviewer: 'local-rule' }) }), valid)).toBe(false);
+    expect(isLatestBatchTrustedStageReview(makeBatch({ reviewMetadataJson: null }), valid)).toBe(false);
+    expect(isLatestBatchTrustedStageReview(makeBatch({ reviewMetadataJson: '{bad' }), valid)).toBe(false);
+    expect(parseReviewMetadataReviewer(JSON.stringify({ reviewer: 'codex-cli' }))).toBe('codex-cli');
+    expect(parseReviewMetadataReviewer(JSON.stringify({ reviewer: 42 }))).toBe(null);
+  });
+
+  it('fail-closed: only a completed batch is trusted stage review evidence', () => {
+    const valid = makeValidGitProof();
+    // Every non-completed status must fail even when all other fields are populated.
+    for (const status of ['pending', 'integrating', 'conflict', 'failed'] as const) {
+      expect(isLatestBatchTrustedStageReview(makeBatch({ status }), valid)).toBe(false);
+    }
+    // Completed batch with the full proof chain remains trusted.
+    expect(isLatestBatchTrustedStageReview(makeBatch({ status: 'completed' }), valid)).toBe(true);
+  });
+
+  it('fail-closed Git proof: drifted branch or tree mismatch fails; deleted branch falls back to tree equality', () => {
+    const valid = makeValidGitProof();
+    expect(isLatestBatchTrustedStageReview(makeBatch(), valid)).toBe(true);
+    // Branch still exists but drifted away from the reviewed commit → fail closed.
+    expect(isLatestBatchTrustedStageReview(makeBatch(), makeValidGitProof({ integrationBranchHead: 'advanced-head' }))).toBe(false);
+    // Branch was cleaned up (deleted) after a successful real run → null head is
+    // acceptable; the persisted reviewedThroughCommit/mergeCommitHash trees carry
+    // the proof. This is the regression shape for cleanup-after-merge.
+    expect(isLatestBatchTrustedStageReview(makeBatch(), makeValidGitProof({ integrationBranchHead: null }))).toBe(true);
+    expect(isLatestBatchTrustedStageReview(makeBatch(), makeValidGitProof({ reviewedThroughTree: null }))).toBe(false);
+    expect(isLatestBatchTrustedStageReview(makeBatch(), makeValidGitProof({ mergeCommitTree: null }))).toBe(false);
+    expect(isLatestBatchTrustedStageReview(makeBatch(), makeValidGitProof({ reviewedThroughTree: 'tree-a', mergeCommitTree: 'tree-b' }))).toBe(false);
+    expect(isLatestBatchTrustedStageReview(makeBatch({ reviewedThroughCommit: 'review-commit' }), valid)).toBe(false);
+    expect(isLatestBatchTrustedStageReview(makeBatch({ mergeCommitHash: null }), valid)).toBe(false);
+    expect(isLatestBatchTrustedStageReview(makeBatch({ reviewedThroughCommit: null }), valid)).toBe(false);
+  });
+
+  it('trusts a --no-ff merge: reviewedThroughCommit differs from mergeCommitHash but trees match (even after branch cleanup)', () => {
+    // The real scheduler merges the integration branch with --no-ff, so
+    // mergeCommitHash is a NEW target merge commit while reviewedThroughCommit
+    // is the reviewed integration commit; the hashes differ but the trees are
+    // identical. Trusted stage review must accept this shape, both while the
+    // integration branch still exists and after cleanup deleted it.
+    const noFf = makeBatch({ mergeCommitHash: 'target-merge-commit' });
+    expect(isLatestBatchTrustedStageReview(noFf, makeValidGitProof({
+      integrationBranchHead: 'merge-commit', // == reviewedThroughCommit
+      mergeCommitTree: 'tree-1',
+    }))).toBe(true);
+    expect(isLatestBatchTrustedStageReview(noFf, makeValidGitProof({
+      integrationBranchHead: null, // deleted by cleanup after real run
+      mergeCommitTree: 'tree-1',
+    }))).toBe(true);
+    // Branch HEAD drifting away from the reviewed commit still fails closed.
+    expect(isLatestBatchTrustedStageReview(noFf, makeValidGitProof({ integrationBranchHead: 'elsewhere', mergeCommitTree: 'tree-1' }))).toBe(false);
+  });
+
+  it('requires the exact task+attempt skip event', () => {
+    const skip = makeEvent({
+      id: 'skip-1', eventType: 'review_skipped_token_efficient',
+      taskId: 'task-001', attemptId: 'att-001',
+    });
+    expect(hasReviewSkippedTokenEfficient([skip], 'task-001', 'att-001')).toBe(true);
+    expect(hasReviewSkippedTokenEfficient([], 'task-001', 'att-001')).toBe(false);
+    expect(hasReviewSkippedTokenEfficient(
+      [makeEvent({ id: 'wrong-attempt', attemptId: 'att-other' })], 'task-001', 'att-001')).toBe(false);
+    expect(hasReviewSkippedTokenEfficient(
+      [makeEvent({ id: 'wrong-task', taskId: 'task-other' })], 'task-001', 'att-001')).toBe(false);
+  });
+
+  it('matches the stage review chain for the exact commit and exact task', () => {
+    const started = makeEvent({
+      id: 'start', eventType: 'stage_review_started',
+      taskId: null, attemptId: null,
+      eventDataJson: JSON.stringify({ reviewedCommit: 'review-commit' }),
+      createdAt: '2024-01-01T00:00:00.000Z',
+    });
+    const completed = makeEvent({
+      id: 'complete', eventType: 'stage_review_completed',
+      taskId: null, attemptId: null,
+      eventDataJson: JSON.stringify({ approvedTasks: ['task-001'] }),
+      createdAt: '2024-01-01T00:00:01.000Z',
+    });
+    expect(hasStageReviewEvidence([started, completed], 'stage-001', 'review-commit', 'task-001')).toBe(true);
+    expect(hasStageReviewEvidence([completed, started], 'stage-001', 'review-commit', 'task-001')).toBe(true);
+    // Chronologically reversed chain (completed before started) must fail closed.
+    expect(hasStageReviewEvidence([
+      makeEvent({ ...started, id: 'start-late', createdAt: '2024-01-01T00:00:01.000Z' }),
+      makeEvent({ ...completed, id: 'complete-early', createdAt: '2024-01-01T00:00:00.000Z' }),
+    ], 'stage-001', 'review-commit', 'task-001')).toBe(false);
+    expect(hasStageReviewEvidence([started, completed], 'stage-001', 'other-commit', 'task-001')).toBe(false);
+    expect(hasStageReviewEvidence([started], 'stage-001', 'review-commit', 'task-001')).toBe(false);
+    expect(hasStageReviewEvidence(
+      [started, makeEvent({
+        id: 'complete-other-task', eventType: 'stage_review_completed',
+        taskId: null, attemptId: null,
+        eventDataJson: JSON.stringify({ approvedTasks: ['task-other'] }),
+        createdAt: '2024-01-01T00:00:01.000Z',
+      })], 'stage-001', 'review-commit', 'task-001')).toBe(false);
+    expect(hasStageReviewEvidence(
+      [started, makeEvent({
+        id: 'complete-other-stage', stageId: 'stage-other', eventType: 'stage_review_completed',
+        taskId: null, attemptId: null,
+        eventDataJson: JSON.stringify({ approvedTasks: ['task-001'] }),
+        createdAt: '2024-01-01T00:00:01.000Z',
+      })], 'stage-001', 'review-commit', 'task-001')).toBe(false);
+  });
+
+  it('never borrows completion from a later review of a different commit (interleaved)', () => {
+    // Regression (review finding on 25e9d5ea): once a matching start was seen,
+    // matchingStartSeen stayed true, so a stage_review_completed belonging to a
+    // later, different commit could be borrowed to cover the reviewed commit.
+    // commit X start -> X complete (approves another task) -> commit Y start ->
+    // commit Y complete (approves THIS task) must NOT be treated as evidence
+    // for commit X.
+    const startX = makeEvent({
+      id: 'start-x', eventType: 'stage_review_started',
+      taskId: null, attemptId: null,
+      eventDataJson: JSON.stringify({ reviewedCommit: 'commit-x' }),
+      createdAt: '2024-01-01T00:00:00.000Z',
+    });
+    const completeX = makeEvent({
+      id: 'complete-x', eventType: 'stage_review_completed',
+      taskId: null, attemptId: null,
+      eventDataJson: JSON.stringify({ approvedTasks: ['task-other'] }),
+      createdAt: '2024-01-01T00:00:01.000Z',
+    });
+    const startY = makeEvent({
+      id: 'start-y', eventType: 'stage_review_started',
+      taskId: null, attemptId: null,
+      eventDataJson: JSON.stringify({ reviewedCommit: 'commit-y' }),
+      createdAt: '2024-01-01T00:00:02.000Z',
+    });
+    const completeY = makeEvent({
+      id: 'complete-y', eventType: 'stage_review_completed',
+      taskId: null, attemptId: null,
+      eventDataJson: JSON.stringify({ approvedTasks: ['task-001'] }),
+      createdAt: '2024-01-01T00:00:03.000Z',
+    });
+    // Interleaved: completion of commit Y must not cover commit X.
+    expect(hasStageReviewEvidence(
+      [startX, completeX, startY, completeY], 'stage-001', 'commit-x', 'task-001')).toBe(false);
+    // Reverse interleave (same result, order-independent via sort).
+    expect(hasStageReviewEvidence(
+      [completeY, startY, completeX, startX], 'stage-001', 'commit-x', 'task-001')).toBe(false);
+    // The matching pair for commit Y itself still passes (same commit).
+    expect(hasStageReviewEvidence(
+      [startY, completeY], 'stage-001', 'commit-y', 'task-001')).toBe(true);
+    // A start for a different commit in between must also not break a later
+    // valid same-commit chain: X start -> Y start -> X complete must fail,
+    // because the armed flag was reset by Y's start.
+    expect(hasStageReviewEvidence(
+      [startX, startY, makeEvent({
+        id: 'complete-x2', eventType: 'stage_review_completed',
+        taskId: null, attemptId: null,
+        eventDataJson: JSON.stringify({ approvedTasks: ['task-001'] }),
+        createdAt: '2024-01-01T00:00:03.000Z',
+      })], 'stage-001', 'commit-x', 'task-001')).toBe(false);
+    // A completed event that carries its own non-matching reviewedCommit must
+    // be rejected even if a matching start was seen.
+    expect(hasStageReviewEvidence(
+      [startX, makeEvent({
+        id: 'complete-x3', eventType: 'stage_review_completed',
+        taskId: null, attemptId: null,
+        eventDataJson: JSON.stringify({ reviewedCommit: 'commit-y', approvedTasks: ['task-001'] }),
+        createdAt: '2024-01-01T00:00:01.000Z',
+      })], 'stage-001', 'commit-x', 'task-001')).toBe(false);
+    // A completed event carrying the matching reviewedCommit still passes.
+    expect(hasStageReviewEvidence(
+      [startX, makeEvent({
+        id: 'complete-x4', eventType: 'stage_review_completed',
+        taskId: null, attemptId: null,
+        eventDataJson: JSON.stringify({ reviewedCommit: 'commit-x', approvedTasks: ['task-001'] }),
+        createdAt: '2024-01-01T00:00:01.000Z',
+      })], 'stage-001', 'commit-x', 'task-001')).toBe(true);
+  });
+
+  it('computeTrustedStageReviewCoverage only returns true for a complete proof chain', () => {
+    const started = makeEvent({
+      id: 'start', eventType: 'stage_review_started',
+      taskId: null, attemptId: null,
+      eventDataJson: JSON.stringify({ reviewedCommit: 'merge-commit' }),
+      createdAt: '2024-01-01T00:00:00.000Z',
+    });
+    const completed = makeEvent({
+      id: 'complete', eventType: 'stage_review_completed',
+      taskId: null, attemptId: null,
+      eventDataJson: JSON.stringify({ approvedTasks: ['task-001'] }),
+      createdAt: '2024-01-01T00:00:01.000Z',
+    });
+    const skip = makeEvent({
+      id: 'skip', eventType: 'review_skipped_token_efficient',
+      taskId: 'task-001', attemptId: 'att-001',
+      createdAt: '2024-01-01T00:00:00.500Z',
+    });
+    const events = [started, skip, completed];
+    expect(computeTrustedStageReviewCoverage({
+      trustedExecutionMode: true,
+      attempt: makeAttemptContext(),
+      latestBatch: makeBatch(),
+      events,
+      gitProof: makeValidGitProof(),
+    })).toBe(true);
+
+    expect(computeTrustedStageReviewCoverage({
+      trustedExecutionMode: false,
+      attempt: makeAttemptContext(),
+      latestBatch: makeBatch(),
+      events,
+      gitProof: makeValidGitProof(),
+    })).toBe(false);
+    expect(computeTrustedStageReviewCoverage({
+      trustedExecutionMode: true,
+      attempt: makeAttemptContext({ status: 'running' }),
+      latestBatch: makeBatch(),
+      events,
+      gitProof: makeValidGitProof(),
+    })).toBe(false);
+    expect(computeTrustedStageReviewCoverage({
+      trustedExecutionMode: true,
+      attempt: makeAttemptContext({ reviewCompleted: true }),
+      latestBatch: makeBatch(),
+      events,
+      gitProof: makeValidGitProof(),
+    })).toBe(false);
+    expect(computeTrustedStageReviewCoverage({
+      trustedExecutionMode: true,
+      attempt: makeAttemptContext(),
+      latestBatch: makeBatch(),
+      events: [started, completed], // no skip event
+      gitProof: makeValidGitProof(),
+    })).toBe(false);
+  });
+
+  it('sorts audit events by createdAt then id before matching', () => {
+    const a = makeEvent({ id: 'a', createdAt: '2024-01-01T00:00:00.000Z' });
+    const b = makeEvent({ id: 'b', createdAt: '2024-01-01T00:00:00.000Z' });
+    const c = makeEvent({ id: 'c', createdAt: '2024-01-01T00:00:01.000Z' });
+    expect(sortByCreatedAtThenId([c, b, a]).map((e) => e.id)).toEqual(['a', 'b', 'c']);
   });
 });
 

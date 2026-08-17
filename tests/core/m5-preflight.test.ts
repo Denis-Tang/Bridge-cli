@@ -3,7 +3,8 @@
 // non-blocking pass. Zero writes in preflight path.
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdirSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { SqliteStateStore } from '../../src/state/sqlite-store.js';
@@ -11,6 +12,7 @@ import { SqliteMigrationRunner } from '../../src/state/sqlite-migration-runner.j
 import type { SqliteConfig } from '../../src/state/sqlite-config.js';
 import { classifyFacts } from '../../src/core/reconciliation/classifier.js';
 import { converge } from '../../src/core/reconciliation/convergence-engine.js';
+import { runPreflightReconciliation } from '../../src/cli/commands/reconcile.js';
 import type {
   ReconciliationFactSnapshot,
 } from '../../src/types/m5-types.js';
@@ -69,6 +71,7 @@ describe('M5 Preflight', () => {
             branchName: 'task-branch', branchExists: true, branchHeadMatches: true,
             workerResultExists: false, workerResultJson: null,
             locksHeld: 0, locksOrphaned: false,
+            reviewCoveredByTrustedStageReview: false,
             reviewCompleted: false, reviewStatus: null,
           }],
         }],
@@ -154,6 +157,7 @@ describe('M5 Preflight', () => {
             branchName: null, branchExists: false, branchHeadMatches: false,
             workerResultExists: false, workerResultJson: null,
             locksHeld: 1, locksOrphaned: true,
+            reviewCoveredByTrustedStageReview: false,
             reviewCompleted: false, reviewStatus: null,
           }],
         }],
@@ -163,5 +167,124 @@ describe('M5 Preflight', () => {
     const findings = classifyFacts(facts, false);
     // Should still detect PID missing even with governance off
     expect(findings.some((f) => f.kind === 'pid_missing')).toBe(true);
+  });
+
+  it('M5-PF08: preflight reconciliation accepts a trusted stage review proof (no review_evidence_missing)', async () => {
+    const runId = `run-trusted-review-${Date.now()}`;
+    const repoDir = path.join(tmpDir, `git-repo-${Date.now()}`);
+    mkdirSync(repoDir, { recursive: true });
+
+    const runGit = (args: string[]): string => execFileSync('git', args, {
+      cwd: repoDir,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 5000,
+    }).trim();
+
+    runGit(['init', '-b', 'main']);
+    runGit(['config', 'user.email', 'test@example.com']);
+    runGit(['config', 'user.name', 'Test User']);
+
+    writeFileSync(path.join(repoDir, 'base.txt'), 'base\n');
+    runGit(['add', '.']);
+    runGit(['commit', '-m', 'base']);
+    const baseCommit = runGit(['rev-parse', 'HEAD']);
+
+    // Task branch holds the reviewed-through commit with the real change.
+    runGit(['checkout', '-b', 'task-branch']);
+    writeFileSync(path.join(repoDir, 'task.txt'), 'task\n');
+    runGit(['add', '.']);
+    runGit(['commit', '-m', 'task work']);
+    const reviewedThroughCommit = runGit(['rev-parse', 'HEAD']);
+
+    // Integration branch points at the exact commit reviewed for the stage.
+    runGit(['checkout', '-b', 'int-branch']);
+    const mergeCommitHash = runGit(['rev-parse', 'HEAD']);
+
+    const stageId = `${runId}-stage-1`;
+    const taskId = `${runId}-task-1`;
+    const attemptId = `${runId}-att-1`;
+    const batchId = `${runId}-batch-1`;
+
+    const snapshot = JSON.stringify({
+      snapshotVersion: 1,
+      createdAt: new Date().toISOString(),
+      config: { executionMode: 'token-efficient', reviewer: { type: 'codex-cli' } },
+    });
+
+    await store.createRun({
+      id: runId,
+      projectId: `proj-${runId}`,
+      projectRoot: repoDir,
+      requestText: 'Trusted stage review regression',
+      status: 'running',
+      executionConfigSnapshot: snapshot,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    await store.createStage({ id: stageId, runId, stageNumber: 1, title: 'S1', status: 'completed', baseCommit });
+    await store.createTask({
+      id: taskId,
+      runId,
+      title: 'T1',
+      status: 'merged',
+      specJson: { estimatedWritePaths: ['task.txt'] },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    await store.createAttempt({ id: attemptId, taskId, stageId, attemptNumber: 1, status: 'approved' });
+    await store.updateAttemptResult(attemptId, {
+      branchName: 'int-branch',
+      workerResultJson: JSON.stringify({ status: 'completed', commitHash: mergeCommitHash }),
+    });
+
+    await store.createIntegrationBatch({ id: batchId, stageId, runId, integrationBranch: 'int-branch' });
+    await store.updateIntegrationBatch(batchId, {
+      status: 'completed',
+      mergeCommitHash,
+      reviewedThroughCommit,
+      reviewCoverageStatus: 'complete',
+      reviewerUnavailable: false,
+      reviewMetadataJson: JSON.stringify({ reviewer: 'codex-cli' }),
+    });
+
+    const skipEvent = await store.createEvent({
+      id: `${runId}-ev-skip`,
+      runId,
+      stageId,
+      taskId,
+      attemptId,
+      eventType: 'review_skipped_token_efficient',
+      eventData: { reason: 'token_efficient_mode', mode: 'token-efficient', riskLevel: 'medium' },
+    });
+    const startedEvent = await store.createEvent({
+      id: `${runId}-ev-stage-start`,
+      runId,
+      stageId,
+      taskId: null,
+      attemptId: null,
+      eventType: 'stage_review_started',
+      eventData: { taskCount: 1, stageNumber: 1, reviewedCommit: reviewedThroughCommit },
+    });
+    const completedEvent = await store.createEvent({
+      id: `${runId}-ev-stage-complete`,
+      runId,
+      stageId,
+      taskId: null,
+      attemptId: null,
+      eventType: 'stage_review_completed',
+      eventData: { cacheHit: false, approvedTasks: [taskId] },
+    });
+
+    // Force deterministic audit ordering (createdAt, then id).
+    const db = store.getDatabase();
+    db.prepare('UPDATE events SET created_at = ? WHERE id = ?').run('2024-01-01T00:00:00.500Z', skipEvent.id);
+    db.prepare('UPDATE events SET created_at = ? WHERE id = ?').run('2024-01-01T00:00:00.000Z', startedEvent.id);
+    db.prepare('UPDATE events SET created_at = ? WHERE id = ?').run('2024-01-01T00:00:01.000Z', completedEvent.id);
+
+    const findings = await runPreflightReconciliation(store, runId, 'approve_preflight');
+    expect(findings.some((f) => f.kind === 'review_evidence_missing')).toBe(false);
+    expect(findings.some((f) => f.kind === 'fake_review_in_real_path')).toBe(false);
+    expect(findings.some((f) => f.severity === 'blocking')).toBe(false);
   });
 });
