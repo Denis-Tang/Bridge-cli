@@ -1,6 +1,6 @@
 # 真实运行准入状态
 
-更新日期：2026-08-16（Phase 0 freeze 证据；下方 2026-08-02 内容为历史快照，逐字保留）
+更新日期：2026-08-16（Phase 0 freeze 证据；下方 2026-08-02 内容为历史快照，逐字保留）；2026-08-17（正式仓库回写后复核数字）
 
 ## 2026-08-16 Phase 0 freeze 当前证据
 
@@ -8,9 +8,10 @@
 
 ### 当前 fake/disposable 全回归
 
-- **92/92 文件、1082/1082 测试通过**；TypeScript build 与 `git diff --check` 通过。
+- **95/95 文件、1190/1190 测试通过**（正式仓库回写后全量复核：`npx vitest run --pool=threads`）；TypeScript build（`tsc` + postbuild 复制 15/15 `.sql`）与 `git diff --check` 通过。
 - **heartbeat 精确测试**：`tests/core/cost-heartbeat.test.ts` 1 文件 / 4 项，连续三次最终 main 全回归通过。
 - **套件覆盖（当前）提及**：migration 015 legacy provenance（`015_backfill_legacy_attempt_provenance.sql` 回填机制 + `tests/state/sqlite-legacy-provenance-backfill.test.ts`）、精确 recover/resume（`tests/cli/recover.test.ts` / `tests/cli/resume.test.ts`）、pre-merged convergence（`tests/core/integration-pre-merged-target.test.ts` 等）、review coverage、Git/SQLite 与 cleanup（`tests/core/gc-service.test.ts`）。
+- **历史套件数字（快照，勿与当前混写）**：82/1016（2026-08-02 全回归）、92/92 + 1082/1082（07 docs 落地时的 08-16 复核）、95/1181（08 落地后 08-16 复核）、**95/1190（2026-08-17 正式仓库回写后复核，含 4 个 review 语义回归测试）**。
 
 ### 窄范围真实 Provider 运行（2026-08-16，token 归属已确认）
 
