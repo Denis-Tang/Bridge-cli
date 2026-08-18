@@ -4,7 +4,7 @@ import type { StructuredPlan, StructuredTaskSpec } from '../types/m2-types.js';
 import type { LedgerSink, InvocationContext } from '../core/token-telemetry.js';
 import { estimateForCallType } from '../core/token-telemetry.js';
 import type { CodexProcessRunner } from './codex-process-runner.js';
-import { RealCodexProcessRunner } from './codex-process-runner.js';
+import { RealCodexProcessRunner, extractCodexJsonlMessageText } from './codex-process-runner.js';
 
 /**
  * Configuration for Codex CLI Brain provider.
@@ -113,8 +113,12 @@ export class CodexCliBrain {
         '--ephemeral',
         '--sandbox',
         'read-only',
-        '--ignore-user-config',
+        // `--json` so the runner can surface provider usage from the
+        // `turn.completed` event; model text is unwrapped from JSONL below.
+        // No `--ignore-user-config`: it would drop the custom DeepSeek provider
+        // from ~/.codex/config.toml and fall back to OpenAI (401).
         '--ignore-rules',
+        '--json',
         '-',
       ], {
         cwd: this.config.workDir,
@@ -144,7 +148,8 @@ export class CodexCliBrain {
             );
           } catch { /* sink failure must not change semantics */ }
         } else {
-          // No reliable usage metadata → unavailable (preserves estimate)
+          // No structured usage metadata (e.g. plain-text output or a provider
+          // that did not report usage) → unavailable (preserves the estimate).
           try {
             await sink.markUnavailable(entryId, durationMs);
           } catch { /* sink failure must not change semantics */ }
@@ -234,9 +239,13 @@ Rules:
    * Try to parse structured plan from Codex CLI output.
    */
   private tryParsePlan(output: string, request: string, runId: string): BrainPlanResult {
+    // With `--json`, codex wraps the model text in JSONL agent_message events;
+    // unwrap it before looking for the ```json block (plain-text output falls
+    // back unchanged).
+    const text = extractCodexJsonlMessageText(output) || output;
     // Try to extract JSON from code block
-    const jsonMatch = output.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
-    const jsonStr = jsonMatch ? jsonMatch[1] : output;
+    const jsonMatch = text.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+    const jsonStr = jsonMatch ? jsonMatch[1] : text;
 
     try {
       const plan = JSON.parse(jsonStr) as StructuredPlan;

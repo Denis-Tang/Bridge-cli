@@ -22,6 +22,13 @@ export interface CodexProcessRunResult {
   };
 }
 
+/** Structured token usage parsed from Codex CLI `--json` (JSONL) output. */
+export interface CodexJsonlUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheHitTokens?: number;
+}
+
 export interface CodexProcessRunner {
   run(
     command: string,
@@ -39,7 +46,9 @@ export interface CodexProcessRunner {
 
 /**
  * RealCodexProcessRunner — asynchronous, shell-free Codex process execution.
- * Does NOT attempt to parse token usage from Codex CLI output (no structured metadata available).
+ * When invoked with `--json` (JSONL events on stdout), structured token usage
+ * is parsed from the `turn.completed` event and surfaced as `tokenUsage`;
+ * otherwise (or when parsing finds nothing usable) the field stays absent.
  */
 export class RealCodexProcessRunner implements CodexProcessRunner {
   async run(
@@ -84,7 +93,7 @@ export class RealCodexProcessRunner implements CodexProcessRunner {
         let stderr = Buffer.concat(stderrChunks).toString('utf8');
         if (!stderr && fallbackError) stderr = fallbackError;
         const errorCategory = terminalReason ?? (exitCode === 0 ? undefined : 'nonzero_exit');
-        resolve({
+        const runResult: CodexProcessRunResult = {
           stdout,
           stderr,
           exitCode,
@@ -92,7 +101,13 @@ export class RealCodexProcessRunner implements CodexProcessRunner {
           timedOut: terminalReason === 'timeout',
           aborted: terminalReason === 'aborted',
           errorCategory,
-        });
+        };
+        // Structured usage is only present when the caller asked for `--json`
+        // and the provider reported it; missing/parseable-but-unusable output
+        // leaves tokenUsage absent (never guessed).
+        const tokenUsage = parseCodexJsonlUsage(stdout);
+        if (tokenUsage) runResult.tokenUsage = tokenUsage;
+        resolve(runResult);
       };
       const terminate = (reason: 'timeout' | 'aborted' | 'max_buffer') => {
         if (terminalReason || settled) return;
@@ -149,6 +164,115 @@ async function terminateProcessTree(pid: number): Promise<void> {
     killer.once('error', () => resolve());
     killer.once('close', () => resolve());
   });
+}
+
+/**
+ * Parse DeepSeek Responses-style token usage from Codex CLI `--json` (JSONL)
+ * output.
+ *
+ * Verified against a live `codex exec --json` probe (2026-08-18, DeepSeek
+ * custom provider): the `turn.completed` event carries a `usage` object with
+ * `input_tokens`, `output_tokens` and `cached_input_tokens` (cache read).
+ * `cache_write_input_tokens` / `reasoning_output_tokens` are also reported by
+ * the provider but are not part of the ledger contract; the provider already
+ * includes reasoning tokens inside `output_tokens`.
+ *
+ * Returns null — never a guess — when no valid usage is found (plain-text
+ * output, non-JSONL, missing usage, or malformed numbers); callers then keep
+ * the ledger entry `unavailable`.
+ */
+export function parseCodexJsonlUsage(stdout: string): CodexJsonlUsage | null {
+  if (!stdout) return null;
+  for (const rawLine of stdout.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue; // line is not JSON — keep scanning, never guess
+    }
+    if (!event || typeof event !== 'object' || Array.isArray(event)) continue;
+    const obj = event as Record<string, unknown>;
+    if (obj.type !== 'turn.completed') continue;
+    const usage = obj.usage;
+    if (!usage || typeof usage !== 'object' || Array.isArray(usage)) continue;
+    const u = usage as Record<string, unknown>;
+    const inputTokens = toNonNegativeNumber(u.input_tokens);
+    const outputTokens = toNonNegativeNumber(u.output_tokens);
+    if (inputTokens === null || outputTokens === null) continue;
+    // Cache read: `cached_input_tokens` is the verified field; the other two
+    // shapes are accepted defensively for other providers/versions.
+    const details = (u.input_tokens_details as Record<string, unknown> | undefined);
+    const cacheHitTokens = firstNonNegativeNumber(
+      u.cached_input_tokens,
+      u.cache_read_input_tokens,
+      details?.cached_tokens,
+    );
+    return {
+      inputTokens,
+      outputTokens,
+      ...(cacheHitTokens !== null ? { cacheHitTokens } : {}),
+    };
+  }
+  return null;
+}
+
+/**
+ * Extract the assistant's final message text from Codex CLI `--json` (JSONL)
+ * output: the concatenation of every `item.completed` event whose item is an
+ * `agent_message` (content blocks of type `output_text`/`text` preferred, with
+ * the legacy flat `text` field as fallback).
+ *
+ * Returns an empty string when the output is not JSONL (e.g. plain-text
+ * stdout) so callers can fall back to raw output unchanged.
+ */
+export function extractCodexJsonlMessageText(stdout: string): string {
+  if (!stdout) return '';
+  const texts: string[] = [];
+  for (const rawLine of stdout.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!event || typeof event !== 'object' || Array.isArray(event)) continue;
+    const obj = event as Record<string, unknown>;
+    if (obj.type !== 'item.completed') continue;
+    const item = obj.item;
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const it = item as Record<string, unknown>;
+    if (it.type !== 'agent_message') continue;
+    const content = it.content;
+    if (Array.isArray(content) && content.length > 0) {
+      for (const block of content) {
+        if (!block || typeof block !== 'object' || Array.isArray(block)) continue;
+        const b = block as Record<string, unknown>;
+        if ((b.type === 'output_text' || b.type === 'text') && typeof b.text === 'string') {
+          texts.push(b.text);
+        }
+      }
+    } else if (typeof it.text === 'string') {
+      texts.push(it.text);
+    }
+  }
+  return texts.join('\n');
+}
+
+function toNonNegativeNumber(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return null;
+  return value;
+}
+
+function firstNonNegativeNumber(...values: unknown[]): number | null {
+  for (const value of values) {
+    const parsed = toNonNegativeNumber(value);
+    if (parsed !== null) return parsed;
+  }
+  return null;
 }
 
 /**

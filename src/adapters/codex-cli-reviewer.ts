@@ -5,7 +5,7 @@ import type { ReviewResult } from '../types/protocol.js';
 import type { LedgerSink, InvocationContext } from '../core/token-telemetry.js';
 import { estimateForCallType } from '../core/token-telemetry.js';
 import type { CodexProcessRunner } from './codex-process-runner.js';
-import { RealCodexProcessRunner } from './codex-process-runner.js';
+import { RealCodexProcessRunner, extractCodexJsonlMessageText } from './codex-process-runner.js';
 import { parseReviewResult } from './codex-review-result-parser.js';
 
 /**
@@ -101,7 +101,12 @@ export class CodexCliReviewer {
       sessionDir: '.brainctl-dev/review-logs',
       allowRealReview: false,
       command: 'codex',
-      args: ['exec', '--ephemeral', '--sandbox', 'read-only', '--ignore-user-config', '--ignore-rules', '-'],
+      // `--json` gives JSONL events incl. provider usage (DeepSeek returns
+      // usage on `turn.completed`); the model text is unwrapped from the
+      // agent_message events before the marker parser runs. `--ignore-user-config`
+      // is intentionally NOT passed: it would drop the custom DeepSeek provider
+      // configured in ~/.codex/config.toml and fall back to OpenAI (401).
+      args: ['exec', '--ephemeral', '--sandbox', 'read-only', '--ignore-rules', '--json', '-'],
       ...config,
     };
     this.processRunner = options?.processRunner ?? new RealCodexProcessRunner();
@@ -242,7 +247,11 @@ ${diff}
         throw new Error(failureReason);
       }
 
-      const parsed = tryParseCodexCliReviewOutput(result.stdout, taskId);
+      // With `--json`, codex wraps the model text in JSONL agent_message events;
+      // unwrap it for the marker parser (falls back to raw stdout for
+      // plain-text output, e.g. when a config override drops `--json`).
+      const reviewText = extractCodexJsonlMessageText(result.stdout) || result.stdout;
+      const parsed = tryParseCodexCliReviewOutput(reviewText, taskId);
       if (parsed.success) {
         parsed.result.executionMetadata = {
           exitCode: result.exitCode,

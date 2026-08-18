@@ -1,6 +1,6 @@
 import type { TaskSpec } from '../types/protocol.js';
-import type { CodexProcessRunner } from './codex-process-runner.js';
-import { RealCodexProcessRunner } from './codex-process-runner.js';
+import type { CodexProcessRunner, CodexProcessRunResult } from './codex-process-runner.js';
+import { RealCodexProcessRunner, extractCodexJsonlMessageText } from './codex-process-runner.js';
 import { estimateForCallType, type InvocationContext, type LedgerSink } from '../core/token-telemetry.js';
 import {
   parseCodexClarificationAnswer,
@@ -48,7 +48,11 @@ export class CodexTechnicalClarifier implements TechnicalClarificationResponder 
     const prompt = this.buildPrompt(input.taskSpec, input.clarification, input.round);
     const args = this.config.args.length > 0
       ? this.config.args
-      : ['exec', '--ephemeral', '--sandbox', 'read-only', '--ignore-user-config', '--ignore-rules', '-'];
+      // `--json` so the runner can surface provider usage from the
+      // `turn.completed` event; the model text is unwrapped from JSONL below.
+      // No `--ignore-user-config`: it would drop the custom DeepSeek provider
+      // from ~/.codex/config.toml and fall back to OpenAI (401).
+      : ['exec', '--ephemeral', '--sandbox', 'read-only', '--ignore-rules', '--json', '-'];
 
     // Write the estimate BEFORE spawning, so a crashed/killed call still leaves
     // evidence that a paid clarification round was attempted.
@@ -65,6 +69,7 @@ export class CodexTechnicalClarifier implements TechnicalClarificationResponder 
     }
 
     const startTime = Date.now();
+    let tokenUsage: CodexProcessRunResult['tokenUsage'];
     try {
       const result = await this.processRunner.run(this.config.command || 'codex', args, {
         cwd: input.worktreePath,
@@ -74,6 +79,7 @@ export class CodexTechnicalClarifier implements TechnicalClarificationResponder 
         env: this.config.env,
         signal: this.config.signal,
       });
+      tokenUsage = result.tokenUsage;
       if (result.exitCode !== 0 || result.timedOut) {
         return {
           status: 'requires_user',
@@ -82,21 +88,42 @@ export class CodexTechnicalClarifier implements TechnicalClarificationResponder 
           categories: ['technical'],
         };
       }
-      return parseCodexClarificationAnswer(result.stdout) ?? {
+      // With `--json`, codex wraps the model text in JSONL agent_message
+      // events; unwrap it before the marker parser (plain-text output falls
+      // back unchanged).
+      const answerText = extractCodexJsonlMessageText(result.stdout) || result.stdout;
+      return parseCodexClarificationAnswer(answerText) ?? {
         status: 'requires_user',
         answers: [],
         reason: 'Codex 技术答疑输出无法验证，按失败闭锁处理',
         categories: ['technical'],
       };
     } finally {
-      // Codex CLI returns no structured usage, so actuals stay unavailable by
-      // design — never invent confirmed numbers. The record still proves the
-      // call happened and how long it took.
+      // Structured usage from the provider (via `--json`) → confirmed actual;
+      // otherwise the actuals stay unavailable by design — never invent
+      // confirmed numbers. The record still proves the call happened and how
+      // long it took.
       if (sink && entryId) {
-        try {
-          await sink.markUnavailable(entryId, Date.now() - startTime);
-        } catch {
-          // Sink failure must not change business semantics.
+        const durationMs = Date.now() - startTime;
+        if (tokenUsage) {
+          try {
+            await sink.confirmActual(
+              entryId,
+              tokenUsage.inputTokens + tokenUsage.outputTokens + (tokenUsage.cacheHitTokens || 0),
+              tokenUsage.inputTokens,
+              tokenUsage.outputTokens,
+              tokenUsage.cacheHitTokens || 0,
+              durationMs,
+            );
+          } catch {
+            // Sink failure must not change business semantics.
+          }
+        } else {
+          try {
+            await sink.markUnavailable(entryId, durationMs);
+          } catch {
+            // Sink failure must not change business semantics.
+          }
         }
       }
     }

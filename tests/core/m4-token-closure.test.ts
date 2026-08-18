@@ -299,7 +299,7 @@ describe('M4 Token Ledger Closure v2', () => {
       expect(result.success).toBe(true);
       expect(invocation).toEqual({
         command: 'codex',
-        args: ['exec', '--ephemeral', '--sandbox', 'read-only', '--ignore-user-config', '--ignore-rules', '-'],
+        args: ['exec', '--ephemeral', '--sandbox', 'read-only', '--ignore-rules', '--json', '-'],
         input: expect.stringContaining('plan safely'),
       });
       expect(invocation?.input).toContain('dependencies array MUST contain only task IDs from the same stage');

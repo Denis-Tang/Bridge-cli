@@ -1446,7 +1446,10 @@ export class StageScheduler {
         env: this.config.privacyService?.buildProviderEnv('pi', undefined, this.config.workerConfig?.model),
         clarificationResponder: new CodexTechnicalClarifier({
           command: this.config.reviewerConfig?.command || 'codex',
-          args: this.config.reviewerConfig?.args ?? ['exec', '--ephemeral', '--sandbox', 'read-only', '--ignore-user-config', '--ignore-rules', '-'],
+          // `--json` surfaces provider usage (DeepSeek) on turn.completed; no
+          // `--ignore-user-config` so the custom provider in ~/.codex/config.toml
+          // is actually used (otherwise codex falls back to OpenAI → 401).
+          args: this.config.reviewerConfig?.args ?? ['exec', '--ephemeral', '--sandbox', 'read-only', '--ignore-rules', '--json', '-'],
           timeoutMs: this.config.reviewerConfig?.timeoutMs ?? 120_000,
           env: this.config.privacyService?.buildProviderEnv('codex'),
           signal: this.abortController?.signal,

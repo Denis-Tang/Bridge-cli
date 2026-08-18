@@ -173,7 +173,10 @@ export function defaults(projectRoot: string): ProjectConfig {
     reviewer: {
       type: 'local-rule',
       command: 'codex',
-      args: ['exec', '--ephemeral', '--sandbox', 'read-only', '--ignore-user-config', '--ignore-rules', '-'],
+      // `--json` surfaces provider usage (DeepSeek) on turn.completed; no
+      // `--ignore-user-config` so the custom provider in ~/.codex/config.toml
+      // is actually used (otherwise codex falls back to OpenAI → 401).
+      args: ['exec', '--ephemeral', '--sandbox', 'read-only', '--ignore-rules', '--json', '-'],
       model: '',
       timeoutMs: 120000,
     },
