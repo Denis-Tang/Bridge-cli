@@ -108,7 +108,14 @@ export function buildPiClarificationToolPolicy(
   return {
     root: resolve(root),
     allowedPatterns: [...(taskSpec.allowedPaths ?? []), ...(taskSpec.contextFiles ?? [])],
-    forbiddenPatterns: [...(taskSpec.forbiddenPaths ?? []), ...HARD_CLARIFICATION_FORBIDDEN_PATTERNS],
+    // Only the hard sensitive patterns guard clarification READS. The task's
+    // write-forbiddenPaths must NOT be merged here: clarification is a read-only
+    // understanding phase whose whole point is reading the code under
+    // investigation (which the plan may legitimately list as write-forbidden,
+    // e.g. a diagnose-only task). Regression: real Pi clarification was blocked
+    // with 'forbidden path requested: index.js' because the plan forbade
+    // writing index.js for that task.
+    forbiddenPatterns: [...HARD_CLARIFICATION_FORBIDDEN_PATTERNS],
   };
 }
 
