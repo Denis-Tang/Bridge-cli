@@ -73,8 +73,13 @@ export function buildMinimalTaskPacket(
   contextFileContents: Map<string, string>,
   config: TaskPacketConfig = DEFAULT_TASK_PACKET_CONFIG,
 ): { packet: MinimalTaskPacket; overflow: string[] } {
-  const overflowCheck = checkContextOverflow(spec.contextFiles, config.maxContextFiles);
-  const filesToInclude = spec.contextFiles.slice(0, config.maxContextFiles);
+  // Optional spec fields must be defaulted: the brain's plan JSON is not
+  // guaranteed to carry them (observed missing: contextFiles, forbiddenPaths),
+  // and a missing field must never crash the prompt build.
+  const contextFiles = spec.contextFiles ?? [];
+  const dependencies = spec.dependencies ?? [];
+  const overflowCheck = checkContextOverflow(contextFiles, config.maxContextFiles);
+  const filesToInclude = contextFiles.slice(0, config.maxContextFiles);
 
   const contextFilesSummary: TaskContextFileSummary[] = filesToInclude.map((f) => {
     const content = contextFileContents.get(f) || '';
@@ -82,11 +87,11 @@ export function buildMinimalTaskPacket(
   });
 
   // Compute dependency hash from dependency task IDs
-  const depHash = sha256((spec.dependencies || []).sort().join(','));
+  const depHash = sha256(dependencies.sort().join(','));
 
   // Build dependency summary (minimal: just task IDs, not their outputs)
-  const dependencySummary = spec.dependencies.length > 0
-    ? `依赖任务: ${spec.dependencies.join(', ')}（结果摘要和hash见上下文文件）`
+  const dependencySummary = dependencies.length > 0
+    ? `依赖任务: ${dependencies.join(', ')}（结果摘要和hash见上下文文件）`
     : '无依赖';
 
   const packet: MinimalTaskPacket = {
