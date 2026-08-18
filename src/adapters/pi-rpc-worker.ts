@@ -417,13 +417,12 @@ export class RealProcessRunner implements ProcessRunner {
       await Promise.resolve(input.onSpawn(childPid));
     }
 
-    // Write stdin if provided, then close it. Regression (2026-08-18, real Pi
-    // 0.82.1 rpc): keeping stdin open makes Pi stream session/progress output
-    // indefinitely (tens of MB within minutes) instead of finishing the turn,
-    // so the WorkerResult is never parsed and the call times out. Closing stdin
-    // after the one-shot rpc prompt lets Pi complete and exit cleanly.
+    // Write stdin if provided. Do NOT close stdin immediately — Pi RPC mode
+    // needs stdin to stay open for the duration of processing; closing it makes
+    // Pi 0.82.1 exit after echoing the prompt without processing it. The caller
+    // terminates the process via onStdoutChunk early-detection or the timeout.
     if (input.stdin && child.stdin) {
-      child.stdin.end(input.stdin);
+      child.stdin.write(input.stdin);
     }
 
     // Collect stdout
