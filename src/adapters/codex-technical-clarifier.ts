@@ -148,6 +148,7 @@ export class CodexTechnicalClarifier implements TechnicalClarificationResponder 
       '如果任何问题涉及需求选择、隐私、费用扩大或范围变化，必须返回 requires_user；不得替用户决定。',
       '如果仓库事实不足、问题含糊或回答可能改变产品行为，也必须返回 requires_user。',
       'answered 状态下 answers 必须逐项对应 Pi 的 questions，且不能扩大允许路径、命令或预算。',
+      'answers 数组的长度必须与 questions 数组的长度完全一致，第 i 项回答 questions[i]；如果某问无法回答，也要用占位回答保持长度一致。',
       '',
       '只输出以下标记块：',
       'BEGIN_CODEX_CLARIFICATION_JSON',
