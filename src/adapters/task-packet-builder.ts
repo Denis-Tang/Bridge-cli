@@ -93,8 +93,11 @@ export function buildMinimalTaskPacket(
     taskId: spec.taskId,
     title: spec.title,
     goal: spec.goal,
-    allowedPaths: spec.allowedPaths,
-    forbiddenPaths: spec.forbiddenPaths,
+    // Optional spec fields must be defaulted: the brain's plan JSON is not
+    // guaranteed to carry them, and a missing field must never crash the
+    // prompt build (regression: 'Cannot read properties of undefined').
+    allowedPaths: spec.allowedPaths ?? [],
+    forbiddenPaths: spec.forbiddenPaths ?? [],
     contextFilesSummary,
     dependencyHash: depHash,
     dependencySummary,
@@ -130,8 +133,8 @@ export function buildRetryPacket(
     findings,
     diffDelta,
     repairGoal,
-    allowedPaths: spec.allowedPaths,
-    forbiddenPaths: spec.forbiddenPaths,
+    allowedPaths: spec.allowedPaths ?? [],
+    forbiddenPaths: spec.forbiddenPaths ?? [],
     acceptanceCommands: spec.acceptanceChecks || [],
     allowedCommands: spec.allowedCommands || [],
     productDecisionsLocked: spec.productDecisionsLocked,

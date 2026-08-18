@@ -231,6 +231,7 @@ Rules:
 - Within a stage, tasks with same-stage explicit dependencies must wait.
 - estimatedWritePaths must list ALL files the task will likely modify, and the array must NEVER be empty: for read-only analysis/verification tasks, list the file(s) the task will examine (e.g. the file under investigation or the test file being checked).
 - allowedPaths must also NEVER be empty: list the file(s) or directory the task is allowed to touch (for read-only tasks, the file(s) being examined).
+- forbiddenPaths must ALWAYS be present and non-empty, e.g. [".env", ".env.*", "node_modules/"] plus anything the task must not touch.
 - Multiple tasks must NOT write to the same file in the same stage.
 - allowedPaths limits which directories the worker can modify.
 - Output ONLY the JSON block, no other text.`;
