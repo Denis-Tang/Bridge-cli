@@ -59,6 +59,41 @@ describe('CodexCliReviewer', () => {
     });
   });
 
+  it('reviews a no-change diagnosis via diagnosisContext instead of rejecting an empty diff', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'brainctl-review-diagnosis-'));
+    try {
+      const runner = new FakeCodexProcessRunner();
+      runner.setDefaultResult({
+        stdout: block({
+          taskId: 'task-diag',
+          status: 'approved',
+          reviewSummary: '诊断正确',
+          findings: [],
+          requiredRework: [],
+          qualityGateStatus: 'passed',
+          mergeAllowed: true,
+        }),
+        stderr: '',
+        exitCode: 0,
+        durationMs: 20,
+      });
+      const reviewer = new CodexCliReviewer(
+        { allowRealReview: true, sessionDir, workDir: sessionDir, timeoutMs: 10000 },
+        { processRunner: runner },
+      );
+      const result = await reviewer.reviewDiff('', 'task-diag', '任务目标: 确认根因\nWorker 结论摘要: map 解构后 this 为 undefined');
+
+      // Approved only via the diagnosis-review path: an empty diff without
+      // context is rejected without invoking the runner, so an 'approved'
+      // result proves the diagnosis context reached the real review.
+      expect(result.status).toBe('approved');
+      expect(result.mergeAllowed).toBe(true);
+      expect(result.qualityGateStatus).toBe('passed');
+    } finally {
+      rmSync(sessionDir, { recursive: true, force: true });
+    }
+  });
+
   it('does not persist raw diff or CLI output on failure', async () => {
     const sessionDir = mkdtempSync(join(tmpdir(), 'brainctl-review-privacy-'));
     try {

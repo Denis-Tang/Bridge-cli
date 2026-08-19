@@ -38,8 +38,11 @@
     }
   },
   "if": {
-    "properties": { "status": { "const": "completed" } },
-    "required": ["status"]
+    "properties": {
+      "status": { "const": "completed" },
+      "filesChanged": { "type": "array", "minItems": 1 }
+    },
+    "required": ["status", "filesChanged"]
   },
   "then": {
     "required": ["commitHash"],

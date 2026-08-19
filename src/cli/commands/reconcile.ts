@@ -318,6 +318,7 @@ async function gatherRunFacts(
         const workerResultExists = attempt.workerResultJson != null && attempt.workerResultJson.length > 0;
         let workerResultCompleted = false;
         let workerCommitHash: string | null = null;
+        let workerResultNoChange = false;
         if (workerResultExists) {
           try {
             const workerResult = JSON.parse(attempt.workerResultJson!);
@@ -325,11 +326,23 @@ async function gatherRunFacts(
             workerCommitHash = typeof workerResult.commitHash === 'string' && workerResult.commitHash.trim()
               ? workerResult.commitHash.trim()
               : null;
+            workerResultNoChange = Array.isArray(workerResult.filesChanged)
+              && workerResult.filesChanged.length === 0;
           } catch { /* malformed persisted result remains unverifiable */ }
         }
+        // The attempt branch may be gone after a successful merge + cleanup.
+        // The worker's own commit being reachable from HEAD is then the
+        // verifiable change evidence.
+        const workerCommitMerged = workerCommitHash !== null
+          && workerCommitHash.length >= 4
+          && await gatherer.isCommitReachable(run.projectRoot, workerCommitHash);
         const changedFiles = branchName && branchExists && stage.baseCommit
           ? getChangedFiles(run.projectRoot, stage.baseCommit, branchName)
-          : [];
+          // Attempt branch cleaned up after a successful merge: derive the
+          // changed paths from the worker's own commit when it exists.
+          : (workerCommitHash !== null && workerCommitHash.length >= 4
+              ? getCommitChangedFiles(run.projectRoot, workerCommitHash)
+              : []);
         const taskSpec = (task.specJson || {}) as { estimatedWritePaths?: unknown };
         const expectedWritePaths = Array.isArray(taskSpec.estimatedWritePaths)
           ? taskSpec.estimatedWritePaths.filter((path): path is string => typeof path === 'string')
@@ -399,6 +412,8 @@ async function gatherRunFacts(
           workerResultJson: attempt.workerResultJson,
           workerResultCompleted,
           workerCommitHash,
+          workerResultNoChange,
+          workerCommitMerged,
           changedFiles,
           expectedWritePaths,
           expectedWriteEvidence,
@@ -750,6 +765,21 @@ export function selectLatestAttemptForLock(attempts: AttemptFacts[]): AttemptFac
 function getChangedFiles(projectRoot: string, baseCommit: string, branchName: string): string[] {
   try {
     const output = execFileSync('git', ['diff', '--name-only', `${baseCommit}..${branchName}`], {
+      cwd: projectRoot,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 5000,
+    }).trim();
+    return output ? output.split(/\r?\n/).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Files changed by a single commit (used when the attempt branch is gone but the worker commit survives). */
+function getCommitChangedFiles(projectRoot: string, commitHash: string): string[] {
+  try {
+    const output = execFileSync('git', ['show', '--name-only', '--format=', commitHash], {
       cwd: projectRoot,
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],

@@ -238,11 +238,20 @@ function classifyAttempt(
   if (attempt.status === 'approved') {
     const changedFiles = attempt.changedFiles || [];
     const expectedWritePaths = attempt.expectedWritePaths || [];
+    // A no-change completion (diagnose/report-only task) is verifiable without
+    // a diff: the WorkerResult explicitly reports filesChanged=[] and the
+    // runtime proved the worktree was clean at acceptance. Everything else must
+    // carry a real branch diff.
+    const isNoChangeCompletion = attempt.workerResultExists
+      && attempt.workerResultCompleted
+      && attempt.workerResultNoChange;
+    // A cleaned-up attempt branch is still verifiable when the worker's own
+    // commit is reachable from HEAD (merged into the target history).
     const hasVerifiableChange = attempt.workerResultExists
       && attempt.workerResultCompleted
       && attempt.branchName !== null
-      && attempt.branchExists
-      && changedFiles.length > 0;
+      && (attempt.branchExists || attempt.workerCommitMerged)
+      && (changedFiles.length > 0 || isNoChangeCompletion || attempt.workerCommitMerged);
     if (!hasVerifiableChange) {
       findings.push(makeFinding(
         runId, 'attempt', attempt.attemptId,
@@ -251,7 +260,7 @@ function classifyAttempt(
         ['approved_without_verifiable_change', attempt.attemptId, String(attempt.workerResultExists), String(attempt.workerResultCompleted), String(attempt.branchExists), String(changedFiles.length)],
       ));
     }
-    if (expectedWritePaths.length > 0 && !attempt.expectedWriteEvidence) {
+    if (expectedWritePaths.length > 0 && !attempt.expectedWriteEvidence && !isNoChangeCompletion) {
       findings.push(makeFinding(
         runId, 'attempt', attempt.attemptId,
         'expected_write_missing', 'blocking',

@@ -49,7 +49,8 @@ function extractMarkedJson(output: string, begin: string, end: string): string |
   if (start < 0) return null;
   const finish = output.indexOf(end, start + begin.length);
   if (finish < 0) return null;
-  return output.slice(start + begin.length, finish).trim();
+  // Strip markdown backticks the model may have wrapped around the markers.
+  return output.slice(start + begin.length, finish).trim().replace(/^`+/, '').replace(/`+$/, '').trim();
 }
 
 export function parsePiClarification(output: string, expectedTaskId: string): PiClarificationResult | null {

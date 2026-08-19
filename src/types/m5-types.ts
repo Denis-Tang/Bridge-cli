@@ -61,6 +61,10 @@ export interface AttemptFacts {
   workerResultJson: string | null; // in-memory only, not persisted
   workerResultCompleted: boolean;
   workerCommitHash: string | null;
+  /** True when the WorkerResult reports filesChanged as an empty array (a legit no-change diagnose/report completion). */
+  workerResultNoChange: boolean;
+  /** True when the worker's claimed commit is reachable from HEAD (the attempt branch may have been cleaned up after merge). */
+  workerCommitMerged: boolean;
   changedFiles: string[];         // relative paths from base..attempt branch
   expectedWritePaths: string[];
   expectedWriteEvidence: boolean;

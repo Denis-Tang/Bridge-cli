@@ -147,6 +147,9 @@ export class CodexTechnicalClarifier implements TechnicalClarificationResponder 
       '你可以只读检查仓库来回答纯技术问题。不得修改任何文件。',
       '如果任何问题涉及需求选择、隐私、费用扩大或范围变化，必须返回 requires_user；不得替用户决定。',
       '如果仓库事实不足、问题含糊或回答可能改变产品行为，也必须返回 requires_user。',
+      '注意：当任务的标题/目标/验收标准明确是诊断、取证、定位根因（如 "locate/confirm/diagnose/investigate root cause"、' +
+      '"without changing any files"、"仅确认"），其交付物就是诊断结论本身，不涉及产品行为变更——此类「是否要改代码/交付物是什么」' +
+      '的问题属于 technical 范畴，应直接回答（如「该任务仅诊断取证，不做代码修改」），不要返回 requires_user。',
       'answered 状态下 answers 必须逐项对应 Pi 的 questions，且不能扩大允许路径、命令或预算。',
       'answers 数组的长度必须与 questions 数组的长度完全一致，第 i 项回答 questions[i]；如果某问无法回答，也要用占位回答保持长度一致。',
       '',

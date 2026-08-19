@@ -14,6 +14,7 @@ import type { QualityGateConfig } from '../quality/quality-gate-runner.js';
 import { PiRpcWorker } from '../adapters/pi-rpc-worker.js';
 import { CodexTechnicalClarifier } from '../adapters/codex-technical-clarifier.js';
 import { PrivacyService } from '../privacy/privacy-service.js';
+import { prepareIntWorktreeDeps } from './int-deps.js';
 import type { PiWorkerConfig } from '../adapters/pi-worker-types.js';
 import { NoopResourceSampler } from './resource-sampler.js';
 import { BudgetTracker } from './budget-tracker.js';
@@ -305,9 +306,14 @@ export class StageScheduler {
         : classified.requiredApprovalType;
     if (requiredApprovalType && !decisionId) {
       const decisions = await this.store.listApprovalDecisions(input.runId);
+      // Only PENDING decisions are reusable: an already-approved/resolved
+      // decision must not be linked to a NEW pause, otherwise `resume
+      // --approve <id>` cannot approve it again and the pause becomes
+      // unresolvable (observed: repeated product_decision clarification
+      // pauses on the same stage reused the first approved decision).
       const matching = decisions.filter((decision) =>
         decision.decisionType === requiredApprovalType
-        && (decision.status === 'pending' || decision.status === 'approved')
+        && decision.status === 'pending'
         && ((decision.metadata as { stageId?: string }).stageId === input.stageId
           || (input.taskId != null && (decision.metadata as { taskId?: string }).taskId === input.taskId)),
       );
@@ -1337,6 +1343,21 @@ export class StageScheduler {
       await this.store.updateTaskStatus(tid, 'rework_required', new Date().toISOString());
       await this.store.updateAttemptResult(aid, { exitReason: 'wt_fail: ' + (e.message || String(e)), stoppedAt: new Date().toISOString(), worktreePath: wp, branchName: bn });
       await this.releaseLocks(tid, runId); return;
+    }
+    // Provision run-local deps into the task worktree BEFORE the worker runs:
+    // the model needs node_modules to verify its own work (running tests), and
+    // the task quality gate runs in the same worktree afterwards. Never links
+    // the main repo's node_modules directly (junction-wipe risk); the per-run
+    // hardlink farm under .brainctl-dev/int-deps is shared with the
+    // integration path.
+    try {
+      prepareIntWorktreeDeps({
+        projectRoot: this.config.projectRoot,
+        runId,
+        worktreePath: wp,
+      });
+    } catch (depsErr) {
+      console.warn('[Scheduler] Task worktree deps provisioning failed (worker may lack node_modules): ' + (depsErr instanceof Error ? depsErr.message : String(depsErr)));
     }
     const attemptStartedAt = new Date().toISOString();
     await this.store.updateAttemptResult(aid, { worktreePath: wp, branchName: bn, startedAt: attemptStartedAt });

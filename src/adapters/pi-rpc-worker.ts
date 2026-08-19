@@ -1177,6 +1177,10 @@ export class PiRpcWorker {
       const workerResultText = new MarkedTextAccumulator('BEGIN_WORKER_RESULT_JSON', 'END_WORKER_RESULT_JSON');
       const providerUsageAccumulator = new PiProviderUsageAccumulator();
       let sawStreamChunk = false;
+      // A complete BEGIN…END block was streamed but failed validation. The model
+      // has already answered; waiting only lets its agent loop churn until the
+      // worker timeout. Fail fast at the next message boundary instead.
+      let invalidBlockError: string | null = null;
       const self = this;
       const consumeLine = (line: string): ProcessEarlyCompletion | void => {
         const event = parseJsonlEvent(line);
@@ -1185,15 +1189,26 @@ export class PiRpcWorker {
           const marked = workerResultText.push(delta);
           if (!marked) continue;
           const parseResult = parseWorkerResult(marked);
-          if (!parseResult.success || !parseResult.workerResult) continue;
-          earlyWorkerResult = parseResult.workerResult;
-          return { reason: 'worker_result_found', terminateProcess: true };
+          if (parseResult.success && parseResult.workerResult) {
+            earlyWorkerResult = parseResult.workerResult;
+            return { reason: 'worker_result_found', terminateProcess: true };
+          }
+          if (invalidBlockError === null) {
+            invalidBlockError = parseResult.errors.join('; ') || 'WorkerResult block failed validation';
+          }
         }
         if (!event || (event.type !== 'agent_end' && event.type !== 'message_end')) return;
         const parseResult = self.extractWorkerResultFromEvent(event);
-        if (!parseResult.success || !parseResult.workerResult) return;
-        earlyWorkerResult = parseResult.workerResult;
-        return { reason: 'worker_result_found', terminateProcess: true };
+        if (parseResult.success && parseResult.workerResult) {
+          earlyWorkerResult = parseResult.workerResult;
+          return { reason: 'worker_result_found', terminateProcess: true };
+        }
+        // The model completed a message whose WorkerResult block is invalid and
+        // no valid block was found. Do not let the agent loop run until the
+        // worker timeout — terminate now and fail with the recorded error.
+        if (invalidBlockError !== null) {
+          return { reason: 'worker_result_invalid', terminateProcess: true };
+        }
       };
 
       const abortSignal = this.abortController?.signal;
@@ -1242,6 +1257,7 @@ export class PiRpcWorker {
         `Stdout length: ${stdoutLength} chars (captured ${result.stdout.length})`,
         `Stderr length: ${stderrLength} chars (captured ${result.stderr.length})`,
         `Provider usage: ${providerUsage ? JSON.stringify(providerUsage) : 'unavailable'}`,
+        ...(invalidBlockError !== null ? [`Invalid WorkerResult block seen: ${invalidBlockError}`] : []),
       ];
       this.appendLog(logOutput.join('\n'));
 
@@ -1270,7 +1286,10 @@ export class PiRpcWorker {
       if (parseResult.success) {
         this.appendLog('WorkerResult status: ' + parseResult.workerResult!.status);
       } else {
-        this.appendLog(`WorkerResult parsing failed: ${parseResult.errors.join('; ')}`);
+        const invalidDetail = invalidBlockError !== null
+          ? `; streamed invalid block: ${invalidBlockError}`
+          : '';
+        this.appendLog(`WorkerResult parsing failed: ${parseResult.errors.join('; ')}${invalidDetail}`);
         this.appendLog(`Stdout length: ${stdoutLength} chars`);
       }
 
@@ -1284,7 +1303,7 @@ export class PiRpcWorker {
         aborted: result.aborted,
         errorMessage: parseResult.success
           ? undefined
-          : `WorkerResult parsing failed: ${parseResult.errors.join('; ')}`,
+          : `WorkerResult parsing failed: ${parseResult.errors.join('; ')}${invalidBlockError !== null ? `; streamed invalid block: ${invalidBlockError}` : ''}`,
       };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);

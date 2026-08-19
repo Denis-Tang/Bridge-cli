@@ -128,21 +128,12 @@ export class CodexCliReviewer {
    * Review a git diff using the real Codex CLI.
    * @param diff - The git diff content (unused directly — we use --uncommitted on worktree)
    * @param taskId - The task ID being reviewed
+   * @param diagnosisContext - Optional context for no-change completions
+   *   (diagnose/report-only tasks with an empty diff): when provided with an
+   *   empty diff, the reviewer evaluates the worker's diagnosis instead of a
+   *   diff, so such tasks can still be reviewed rather than rejected outright.
    */
-  async reviewDiff(diff: string, taskId: string): Promise<ReviewResult> {
-    if (!diff || diff.trim().length === 0) {
-      return {
-        taskId,
-        status: 'rejected',
-        reviewSummary: '[reviewer: codex-cli] 审查失败：没有提供 diff 内容。',
-        findings: ['Diff 为空，无法审查'],
-        requiredRework: [],
-        qualityGateStatus: 'skipped',
-        mergeAllowed: false,
-        reviewer: 'codex-cli',
-      };
-    }
-
+  async reviewDiff(diff: string, taskId: string, diagnosisContext?: string): Promise<ReviewResult> {
     if (!this.config.allowRealReview) {
       return {
         taskId,
@@ -156,13 +147,29 @@ export class CodexCliReviewer {
       };
     }
 
+    if (!diff || diff.trim().length === 0) {
+      if (diagnosisContext && diagnosisContext.trim()) {
+        return this.runRealReview('', taskId, diagnosisContext);
+      }
+      return {
+        taskId,
+        status: 'rejected',
+        reviewSummary: '[reviewer: codex-cli] 审查失败：没有提供 diff 内容。',
+        findings: ['Diff 为空，无法审查'],
+        requiredRework: [],
+        qualityGateStatus: 'skipped',
+        mergeAllowed: false,
+        reviewer: 'codex-cli',
+      };
+    }
+
     return this.runRealReview(diff, taskId);
   }
 
   /**
    * Run the real Codex CLI review subprocess.
    */
-  private async runRealReview(diff: string, taskId: string): Promise<ReviewResult> {
+  private async runRealReview(diff: string, taskId: string, diagnosisContext?: string): Promise<ReviewResult> {
     // Ensure session dir exists
     mkdirSync(this.config.sessionDir, { recursive: true });
     const reviewLogPath = resolve(this.config.sessionDir, `${taskId}_codex-review.log`);
@@ -170,7 +177,10 @@ export class CodexCliReviewer {
     // Build a strict, structured review prompt. The parser accepts exactly one
     // BEGIN_REVIEW_RESULT_JSON / END_REVIEW_RESULT_JSON block and ignores all
     // text outside it, so the instructions make that contract explicit.
-    const reviewPrompt = `Review the following git diff for task ${taskId}.
+    const reviewTarget = diagnosisContext && diagnosisContext.trim()
+      ? `Review the following WORKER DIAGNOSIS for task ${taskId} (no code changes were made — this is a diagnose/report-only task). Verify the diagnosis against the repository and judge whether the task's goal and acceptance criteria were actually satisfied.\n\nWorker diagnosis:\n${diagnosisContext}`
+      : `Review the following git diff for task ${taskId}.`;
+    const reviewPrompt = `${reviewTarget}
 
 Respond with exactly one review result block. The block must consist of a line containing exactly BEGIN_REVIEW_RESULT_JSON, followed by a single JSON object, followed by a line containing exactly END_REVIEW_RESULT_JSON. Do not add any other BEGIN_REVIEW_RESULT_JSON or END_REVIEW_RESULT_JSON lines, and do not put anything else between the markers.
 
@@ -194,10 +204,12 @@ Semantic rules:
 - rework_required requires "qualityGateStatus": "failed", "mergeAllowed": false, and at least one non-empty item in "requiredRework".
 - rejected and needs_user_decision require "mergeAllowed": false.
 
-Diff to review:
+${diagnosisContext && diagnosisContext.trim()
+    ? '（该任务无代码改动，无 diff 可展示；请以 Worker 诊断为审查对象，可读取仓库代码核实。）'
+    : `Diff to review:
 \`\`\`diff
 ${diff}
-\`\`\`
+\`\`\``}
 `;
 
     // ── M4: Write estimate BEFORE calling external process ──

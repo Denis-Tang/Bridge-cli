@@ -172,6 +172,15 @@ export function classifyFailure(
     return { retriable: true, reason: 'worker_result_missing', category: FailureCategory.TRANSIENT };
   }
 
+  // ── 12b. Retriable: no-change completion evidence failures ────────
+  // The worker claimed a no-change completion but its worktree was dirty or the
+  // evidence could not be verified (e.g. it edited files without committing).
+  // A fresh bounded attempt can redo the task properly, so these are retriable.
+  if (reason.includes('worker_completed_worktree_dirty_without_diff')
+    || reason.includes('worker_completed_evidence_unverifiable')) {
+    return { retriable: true, reason: 'no_change_evidence_failed', category: FailureCategory.TRANSIENT };
+  }
+
   // ── 13. Retriable: exception (unhandled throw in execTask) ────────
   // Only explicit `exception:` prefix from catch block is retriable;
   // other unknown paths are fail-closed.

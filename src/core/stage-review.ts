@@ -139,6 +139,24 @@ export function buildStageReviewPrompt(input: StageReviewInput): string {
 }
 
 /**
+ * Build a diagnosis context for a stage with an empty aggregated diff: the
+ * stage's tasks completed without code changes (diagnose/report-only), so the
+ * reviewer evaluates the per-task summaries instead of a diff.
+ */
+function buildStageDiagnosisContext(input: StageReviewInput): string | undefined {
+  const gateSummary = input.qualityGateResults
+    .map((r) => `- ${r.taskId}: ${r.passed ? '✅' : '❌'} ${r.summary}`)
+    .join('\n');
+  if (!gateSummary.trim() && input.taskIds.length === 0) return undefined;
+  return [
+    '该阶段所有任务均为无代码改动完成（诊断/取证类），无聚合 diff 可审。',
+    `任务: ${input.taskIds.join(', ') || '(无)'}`,
+    gateSummary ? `任务结论:\n${gateSummary}` : '',
+    '请依据上述任务结论与仓库代码核实该阶段的诊断/取证是否正确、验收是否满足。',
+  ].filter(Boolean).join('\n');
+}
+
+/**
  * Run stage-level aggregated Codex review.
  * Checks cache first; falls back to fake review if not real.
  */
@@ -204,7 +222,13 @@ export async function runStageReview(
         invocationContext: config.invocationContext,
       },
     );
-    reviewResult = await reviewer.reviewDiff(input.aggregatedDiff, input.stageId);
+    // A stage whose tasks produced no diff (diagnose/report-only stage) has
+    // nothing to diff-review; give the reviewer the task-level evidence so the
+    // diagnosis is still verified instead of being rejected outright.
+    const stageDiagnosisContext = input.aggregatedDiff.trim()
+      ? undefined
+      : buildStageDiagnosisContext(input);
+    reviewResult = await reviewer.reviewDiff(input.aggregatedDiff, input.stageId, stageDiagnosisContext);
   } else {
     // Fake review for testing
     reviewResult = {

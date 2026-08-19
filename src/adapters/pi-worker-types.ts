@@ -104,7 +104,7 @@ export interface ProcessRunner {
  */
 export interface ProcessEarlyCompletion {
   /** Why the process should be terminated early */
-  reason: 'worker_result_found' | 'user_abort';
+  reason: 'worker_result_found' | 'worker_result_invalid' | 'user_abort';
   /** Whether to kill the child process */
   terminateProcess: boolean;
 }

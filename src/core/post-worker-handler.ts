@@ -24,6 +24,7 @@ import type {
 } from './stage-integration.js';
 import { postCheckBudget } from './token-budget.js';
 import { SqliteLedgerSink, type InvocationContext } from './token-telemetry.js';
+import { prepareIntWorktreeDeps } from './int-deps.js';
 
 function git(cwd: string, args: string[]): string {
   return execFileSync('git', args, {
@@ -31,6 +32,17 @@ function git(cwd: string, args: string[]): string {
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
+}
+
+/**
+ * The model may report a short hash (`git rev-parse --short HEAD`, 4–40 hex
+ * chars) instead of the full 40-char hash. Accept a genuine prefix of the
+ * actual HEAD; anything else (placeholder, random string, wrong commit) fails
+ * closed, preserving the anti-faking contract.
+ */
+function commitHashMatches(expected: string, actual: string): boolean {
+  if (expected === actual) return true;
+  return expected.length >= 4 && actual.startsWith(expected);
 }
 
 export interface PostWorkerConfig {
@@ -171,9 +183,47 @@ export class PostWorkerHandler {
   private async verifyCompletionEvidence(input: PostWorkerInput): Promise<boolean> {
     if (!this.config.allowRealWorker && !this.config.allowRealReviewer) return true;
 
-    // A completed result must carry a verifiable diff first; without changed
+    const completed = input.workerResult.status === 'completed';
+
+    // No-change completion: the plan may legitimately create diagnose/report-only
+    // tasks (e.g. "confirm the root cause without changing any files"). A
+    // completed result with NO diff is accepted only for REAL worker results
+    // (fake results carry no evidence) and only when it is provably a no-op:
+    // the worktree must be clean (no hidden/untracked changes) and the claimed
+    // commitHash (when present) must equal the actual worktree HEAD. The review
+    // then evaluates the diagnosis itself instead of a diff.
+    if (this.config.allowRealWorker && completed && input.changedFiles.length === 0) {
+      try {
+        const actualHead = git(input.worktreePath, ['rev-parse', 'HEAD']).trim();
+        const claimed = input.workerResult.commitHash?.trim() ?? '';
+        if (claimed && !commitHashMatches(claimed, actualHead)) {
+          await this.blockUnverifiableCompletion(input, 'worker_commit_hash_mismatch', {
+            expectedCommitHash: claimed,
+            worktreeHead: actualHead,
+            branchName: Boolean(input.branchName),
+          });
+          return false;
+        }
+        const dirty = git(input.worktreePath, ['status', '--porcelain']).trim();
+        if (dirty) {
+          await this.blockUnverifiableCompletion(input, 'worker_completed_worktree_dirty_without_diff', {
+            branchName: Boolean(input.branchName),
+            dirtyFileCount: dirty.split('\n').length,
+          });
+          return false;
+        }
+      } catch {
+        await this.blockUnverifiableCompletion(input, 'worker_completed_evidence_unverifiable', {
+          branchName: Boolean(input.branchName),
+        });
+        return false;
+      }
+      return true;
+    }
+
+    // A changed completion must carry a verifiable diff first; without changed
     // files there is nothing to review, so fail closed before commitHash checks.
-    if (input.workerResult.status === 'completed' && input.changedFiles.length === 0) {
+    if (completed && input.changedFiles.length === 0) {
       await this.blockUnverifiableCompletion(input, 'worker_completed_without_verifiable_diff', {
         branchName: Boolean(input.branchName),
         changedFileCount: 0,
@@ -184,7 +234,7 @@ export class PostWorkerHandler {
     // WorkerResult contract (pi-worker-prompt rule 6): for status=completed,
     // commitHash must equal the actual worktree HEAD. Fail closed on any
     // placeholder/random hash, matching what the prompt promises.
-    if (input.workerResult.status === 'completed') {
+    if (completed) {
       const expected = input.workerResult.commitHash?.trim();
       if (!expected) {
         await this.blockUnverifiableCompletion(input, 'worker_completed_without_commit_hash', {
@@ -195,7 +245,7 @@ export class PostWorkerHandler {
       }
       try {
         const actualHead = git(input.worktreePath, ['rev-parse', 'HEAD']).trim();
-        if (expected !== actualHead) {
+        if (!commitHashMatches(expected, actualHead)) {
           await this.blockUnverifiableCompletion(input, 'worker_commit_hash_mismatch', {
             expectedCommitHash: expected,
             worktreeHead: actualHead,
@@ -391,6 +441,19 @@ export class PostWorkerHandler {
     }
 
     const startedAt = Date.now();
+    // The task quality gate runs in the task worktree, which `git worktree add`
+    // created WITHOUT node_modules. Provision run-local deps (hardlink farm +
+    // junction, never the main repo's node_modules — same rule as the
+    // integration path) so the gate can execute immediately.
+    try {
+      prepareIntWorktreeDeps({
+        projectRoot: this.config.projectRoot,
+        runId: input.runId,
+        worktreePath: input.worktreePath,
+      });
+    } catch (err) {
+      console.warn('[Scheduler] Task worktree deps provisioning failed (gate may fail): ' + (err instanceof Error ? err.message : String(err)));
+    }
     const result = await new QualityGateRunner(input.worktreePath).runGates(gates, true);
     await this.store.createEvent({
       id: input.runId + '-ev-qg-' + Date.now(),
@@ -462,6 +525,28 @@ export class PostWorkerHandler {
     return 'rework_required';
   }
 
+  /**
+   * Build a review context for a no-change completion (diagnose/report-only
+   * task): the reviewer cannot see a diff, so it evaluates the worker's own
+   * diagnosis — the task goal, the result summary, and its checks — against
+   * the repository. Returns null when there is nothing reviewable.
+   */
+  private buildDiagnosisReviewContext(input: PostWorkerInput): string | undefined {
+    const wr = input.workerResult;
+    const summary = (wr.summary ?? '').trim();
+    const checks = (wr.checks ?? [])
+      .map((c) => (c && typeof c === 'object' ? `- [${c.status}] ${c.name}: ${c.summary}` : `- ${String(c)}`))
+      .join('\n');
+    const goal = (input.spec?.goal ?? '').trim();
+    if (!summary && !checks && !goal) return undefined;
+    return [
+      `任务目标: ${goal || '(未提供)'}`,
+      `Worker 结论摘要: ${summary || '(空)'}`,
+      checks ? `Worker 自查项:\n${checks}` : '',
+      '该任务为无代码改动完成（诊断/取证类），无 diff 可审。请依据上述结论与仓库代码核实其正确性。',
+    ].filter(Boolean).join('\n');
+  }
+
   private async runReview(input: PostWorkerInput): Promise<void> {
     if (await this.hooks.stopIfCanceled(
       input.runId,
@@ -504,14 +589,22 @@ export class PostWorkerHandler {
     }
 
     let result: ReviewResult;
-    if (this.config.allowRealReviewer && (!diff || diff.trim().length === 0)) {
+    // No-change completion (diagnose/report-only task): there is no diff to
+    // review, so the reviewer evaluates the worker's diagnosis (goal + summary
+    // + checks) against the repository instead of rejecting outright.
+    const noChangeCompletion = input.workerResult.status === 'completed'
+      && (!diff || diff.trim().length === 0);
+    const diagnosisContext = noChangeCompletion
+      ? this.buildDiagnosisReviewContext(input)
+      : undefined;
+    if (this.config.allowRealReviewer && noChangeCompletion && !diagnosisContext) {
       await this.blockUnverifiableCompletion(input, 'real_reviewer_empty_diff');
       await this.store.updateReviewResult(review.id, {
         status: 'failed',
         reviewJson: JSON.stringify({
           taskId: input.taskId,
           status: 'rejected',
-          reviewSummary: 'real reviewer blocked: empty diff',
+          reviewSummary: 'real reviewer blocked: empty diff without diagnosis context',
           findings: ['real_reviewer_empty_diff'],
           requiredRework: [],
           qualityGateStatus: 'not_run',
@@ -615,7 +708,7 @@ export class PostWorkerHandler {
             signal: this.hooks.getAbortSignal(),
           },
           { processRunner: this.config.codexProcessRunner, ledgerSink, invocationContext },
-        ).reviewDiff(diff, input.taskId);
+        ).reviewDiff(diff, input.taskId, diagnosisContext);
       } finally {
         stopCostReservationHeartbeat(reviewHeartbeat);
         if (reservationId && this.store.finalizeCostReservation) {

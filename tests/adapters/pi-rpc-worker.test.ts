@@ -484,6 +484,121 @@ describe('PiRpcWorker', () => {
       expect(result.workerResult!.commitHash).toBe('def0123');
     });
 
+    it('accepts the realistic failed-run shape (string checks + "minimal" tokenUsage) via streaming (regression)', async () => {
+      // The exact shape DeepSeek V4-Flash emitted in the A/B impl turn that hung
+      // 40 minutes: `checks` as plain strings and `tokenUsage: "minimal"`.
+      const realistic = {
+        taskId: 'test-task-001',
+        status: 'completed',
+        summary: 'Confirmed root cause via inspection and repro',
+        filesChanged: [],
+        commitHash: 'abc1234',
+        checks: [
+          'Root cause confirmed: map uses `this`, undefined after destructuring',
+          'Fix approach identified: replace `this` with the `generator` closure',
+        ],
+        scopeViolations: [],
+        risks: ['Existing tests never destructure map, so the bug was uncovered.'],
+        unresolvedQuestions: [],
+        productDecisionRequired: false,
+        tokenUsage: 'minimal',
+      };
+
+      class RealisticShapeRunner implements ProcessRunner {
+        sawTerminate = false;
+
+        async run(input: ProcessRunInput): Promise<ProcessRunResult> {
+          const marked = 'BEGIN_WORKER_RESULT_JSON\n' + JSON.stringify(realistic) + '\nEND_WORKER_RESULT_JSON';
+          let stdout = '';
+          const chunks = [
+            JSON.stringify({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: marked.slice(0, 30) } }) + '\n',
+            JSON.stringify({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: marked.slice(30) } }) + '\n',
+            JSON.stringify({ type: 'message_end', message: { role: 'assistant', id: 'm1', content: [{ type: 'text', text: marked }] } }) + '\n',
+          ];
+          for (const chunk of chunks) {
+            stdout += chunk;
+            const signal = input.onStdoutChunk?.(chunk, stdout);
+            if (signal?.terminateProcess) {
+              this.sawTerminate = true;
+              break;
+            }
+          }
+          return {
+            pid: 55501, exitCode: this.sawTerminate ? null : 0, stdout, stderr: '',
+            timedOut: false, aborted: false, terminatedAfterWorkerResult: this.sawTerminate, durationMs: 10,
+          };
+        }
+      }
+
+      const runner = new RealisticShapeRunner();
+      const worker = new PiRpcWorker(createWorkerConfig({ allowRealPiExecution: true }), runner);
+      const result = await worker.executeTask(createTaskInput());
+
+      expect(runner.sawTerminate).toBe(true);
+      expect(result.workerResult).not.toBeNull();
+      expect(result.workerResult!.status).toBe('completed');
+      expect(result.workerResult!.checks).toEqual([
+        { name: realistic.checks[0], status: 'info', summary: realistic.checks[0] },
+        { name: realistic.checks[1], status: 'info', summary: realistic.checks[1] },
+      ]);
+      expect(result.workerResult!.tokenUsage).toEqual({ inputTokens: 0, outputTokens: 0, cacheHitTokens: 0 });
+      expect(result.timedOut).toBe(false);
+    });
+
+    it('fails fast (terminates) when a complete but structurally invalid block is followed by message_end', async () => {
+      // A block that is complete yet still invalid AFTER shape normalization
+      // (completed with changed files but an empty commitHash) must terminate
+      // the process at the next message boundary instead of letting the agent
+      // loop run to timeout.
+      const invalidBlock = {
+        taskId: 'test-task-001',
+        status: 'completed',
+        summary: 'changed files but no commit',
+        filesChanged: ['src/a.ts'],
+        checks: ['x'],
+        scopeViolations: [],
+        risks: [],
+        unresolvedQuestions: [],
+        productDecisionRequired: false,
+        tokenUsage: 'minimal',
+        commitHash: '',
+      };
+
+      class InvalidBlockRunner implements ProcessRunner {
+        signals: string[] = [];
+
+        async run(input: ProcessRunInput): Promise<ProcessRunResult> {
+          const marked = 'BEGIN_WORKER_RESULT_JSON\n' + JSON.stringify(invalidBlock) + '\nEND_WORKER_RESULT_JSON';
+          let stdout = '';
+          const chunks = [
+            JSON.stringify({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: marked } }) + '\n',
+            JSON.stringify({ type: 'message_end', message: { role: 'assistant', id: 'm1', content: [{ type: 'text', text: marked }] } }) + '\n',
+          ];
+          for (const chunk of chunks) {
+            stdout += chunk;
+            const signal = input.onStdoutChunk?.(chunk, stdout);
+            if (signal?.terminateProcess) {
+              this.signals.push(signal.reason);
+              break;
+            }
+          }
+          return {
+            pid: 55502, exitCode: this.signals.length > 0 ? null : 0, stdout, stderr: '',
+            timedOut: false, aborted: false, terminatedAfterWorkerResult: this.signals.length > 0, durationMs: 10,
+          };
+        }
+      }
+
+      const runner = new InvalidBlockRunner();
+      const worker = new PiRpcWorker(createWorkerConfig({ allowRealPiExecution: true }), runner);
+      const result = await worker.executeTask(createTaskInput());
+
+      expect(runner.signals).toEqual(['worker_result_invalid']);
+      expect(result.workerResult).toBeNull();
+      expect(result.errorMessage).toContain('streamed invalid block');
+      expect(result.errorMessage).toContain('commitHash');
+    });
+
     it('returns WorkerResult even when timedOut but result was parsed', async () => {
       const fakeRunner = new FakeProcessRunner();
       const agentEndEvent = JSON.stringify({

@@ -182,6 +182,20 @@ describe('Pi 95% clarification protocol', () => {
     expect(isReadyToImplement({ ...parsed!, categories: ['scope'] })).toBe(false);
   });
 
+  it('parses clarification markers wrapped in backticks (model quotes the prompt instruction)', () => {
+    const body: PiClarificationResult = {
+      taskId: task.taskId,
+      understandingSummary: '只修改授权文档并运行精确测试',
+      confidencePercent: 97,
+      questions: [],
+      categories: ['technical'],
+    };
+    const text = '`BEGIN_CLARIFICATION_JSON`\n' + JSON.stringify(body) + '\n`END_CLARIFICATION_JSON`';
+    const parsed = parsePiClarification(text, task.taskId);
+    expect(parsed?.confidencePercent).toBe(97);
+    expect(isReadyToImplement(parsed!)).toBe(true);
+  });
+
   it('rejects a Codex answer that disguises protected decisions as auto-answered', () => {
     const invalid = [
       'BEGIN_CODEX_CLARIFICATION_JSON',

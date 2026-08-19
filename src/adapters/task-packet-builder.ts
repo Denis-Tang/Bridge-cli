@@ -196,6 +196,9 @@ export function buildMinimalPacketPrompt(packet: MinimalTaskPacket): string {
     '必须输出 `BEGIN_WORKER_RESULT_JSON` … `END_WORKER_RESULT_JSON` 标记块。',
     `taskId 必须为 "${packet.taskId}"。`,
     '包含字段: taskId, status, summary, filesChanged, commitHash, checks, scopeViolations, risks, unresolvedQuestions, productDecisionRequired, tokenUsage',
+    '字段形状: checks 是对象数组，每项形如 `{"name":"…","status":"passed","summary":"…"}`（不要用字符串数组）；',
+    'tokenUsage 是对象 `{"inputTokens":0,"outputTokens":0,"cacheHitTokens":0}`（填 0 即可，真实用量由系统统计，不要写字符串）。',
+    'status=completed 时 commitHash 必须是 `git rev-parse HEAD` 的完整 40 位 hash（不要用短 hash 或占位符）；若无代码改动（诊断/取证类任务），filesChanged 写空数组且 commitHash 可为空字符串。',
   ].join('\n');
 }
 
@@ -237,5 +240,8 @@ export function buildRetryPacketPrompt(packet: RetryPacket): string {
     '必须输出 `BEGIN_WORKER_RESULT_JSON` … `END_WORKER_RESULT_JSON` 标记块。',
     `taskId 必须为 "${packet.originalTaskId}"。`,
     '必须包含 taskId, status, summary, filesChanged, commitHash, checks, scopeViolations, risks, unresolvedQuestions, productDecisionRequired, tokenUsage。',
+    '字段形状: checks 是对象数组，每项形如 `{"name":"…","status":"passed","summary":"…"}`（不要用字符串数组）；',
+    'tokenUsage 是对象 `{"inputTokens":0,"outputTokens":0,"cacheHitTokens":0}`（填 0 即可，真实用量由系统统计，不要写字符串）。',
+    'status=completed 时 commitHash 必须是 `git rev-parse HEAD` 的完整 40 位 hash（不要用短 hash 或占位符）；若无代码改动（诊断/取证类任务），filesChanged 写空数组且 commitHash 可为空字符串。',
   ].join('\n');
 }
